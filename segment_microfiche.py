@@ -1,0 +1,657 @@
+#!/usr/bin/env python3
+"""
+Microfiche page segmentation using Otsu thresholding.
+Converts gigapixel JPG to 1-bit TIFF, finds page bounding boxes.
+Supports both reading orders:
+  - 'columns': left-to-right columns, top-to-bottom within each column
+  - 'rows': top-to-bottom rows, left-to-right within each row
+"""
+
+import pyvips
+import cv2
+import numpy as np
+from pathlib import Path
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+
+# === CONFIGURATION ===
+INPUT_FILE = "your_gigapixel_file.jpg"  # Change this or use --input
+OUTPUT_DIR = Path("segmented")
+
+# Reading order: 'columns' or 'rows'
+READING_ORDER = 'columns'
+
+# Skip header region (fraction of image height from top)
+HEADER_SKIP_RATIO = 0.08  # Skip top 8% for yellow header
+
+# Minimum page size (as fraction of image dimensions) to filter noise
+MIN_PAGE_WIDTH_RATIO = 0.02
+MIN_PAGE_HEIGHT_RATIO = 0.02
+
+# Maximum grid size for validation
+MAX_COLUMNS = 16
+MAX_ROWS = 13
+
+# Padding around detected pages (pixels) - added when extracting
+PADDING = 0
+
+
+def compute_otsu_threshold(gray_image, sample_scale=0.01):
+    """Compute Otsu threshold from a thumbnail sample."""
+    thumb = gray_image.resize(sample_scale)
+    thumb_np = np.ndarray(
+        buffer=thumb.write_to_memory(),
+        dtype=np.uint8,
+        shape=[thumb.height, thumb.width]
+    )
+    thresh, _ = cv2.threshold(thumb_np, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return thresh
+
+
+def sort_boxes_by_columns(boxes, tolerance_ratio=0.5):
+    """Sort boxes: left-to-right by column, top-to-bottom within each column."""
+    if not boxes:
+        return []
+
+    # Sort by x first
+    boxes_sorted = sorted(boxes, key=lambda b: b[0])
+
+    # Group into columns based on x overlap
+    avg_width = np.mean([b[2] for b in boxes])
+    tolerance = avg_width * tolerance_ratio
+
+    columns = []
+    current_column = [boxes_sorted[0]]
+
+    for box in boxes_sorted[1:]:
+        # Check if this box is in the same column as previous
+        prev_x = current_column[-1][0]
+        if abs(box[0] - prev_x) < tolerance:
+            current_column.append(box)
+        else:
+            # New column
+            columns.append(sorted(current_column, key=lambda b: b[1]))  # Sort by y
+            current_column = [box]
+
+    columns.append(sorted(current_column, key=lambda b: b[1]))
+
+    # Flatten
+    result = []
+    for col in columns:
+        result.extend(col)
+
+    return result
+
+
+def sort_boxes_by_rows(boxes, tolerance_ratio=0.5):
+    """Sort boxes: top-to-bottom by row, left-to-right within each row."""
+    if not boxes:
+        return []
+
+    # Sort by y first
+    boxes_sorted = sorted(boxes, key=lambda b: b[1])
+
+    # Group into rows based on y overlap
+    avg_height = np.mean([b[3] for b in boxes])
+    tolerance = avg_height * tolerance_ratio
+
+    rows = []
+    current_row = [boxes_sorted[0]]
+
+    for box in boxes_sorted[1:]:
+        # Check if this box is in the same row as previous
+        prev_y = current_row[-1][1]
+        if abs(box[1] - prev_y) < tolerance:
+            current_row.append(box)
+        else:
+            # New row
+            rows.append(sorted(current_row, key=lambda b: b[0]))  # Sort by x
+            current_row = [box]
+
+    rows.append(sorted(current_row, key=lambda b: b[0]))
+
+    # Flatten
+    result = []
+    for row in rows:
+        result.extend(row)
+
+    return result
+
+
+def compute_card_quality(boxes, contours):
+    """Compute card-level quality score (0-100) for segmentation results.
+
+    Components:
+    - Size consistency (30%): How uniform page sizes are
+    - Grid alignment (40%): How well pages align to a grid
+    - Spacing regularity (20%): How uniform gaps between pages are
+    - Shape regularity (10%): How rectangular the detections are
+    """
+    if len(boxes) < 2:
+        return {'total': 100.0, 'size': 100.0, 'alignment': 100.0,
+                'spacing': 100.0, 'shape': 100.0}
+
+    widths = np.array([b[2] for b in boxes])
+    heights = np.array([b[3] for b in boxes])
+    xs = np.array([b[0] for b in boxes])
+    ys = np.array([b[1] for b in boxes])
+
+    # --- 1. Size consistency (30%) ---
+    w_median = np.median(widths)
+    h_median = np.median(heights)
+    w_cv = np.std(widths) / w_median if w_median > 0 else 0
+    h_cv = np.std(heights) / h_median if h_median > 0 else 0
+    size_score = max(0.0, 100.0 * (1.0 - (w_cv + h_cv) * 2.0))
+
+    # --- 2. Grid alignment (40%) ---
+    avg_width = np.mean(widths)
+    col_tolerance = avg_width * 0.5
+
+    sorted_by_x = sorted(range(len(boxes)), key=lambda i: xs[i])
+    columns = [[sorted_by_x[0]]]
+    for idx in sorted_by_x[1:]:
+        if abs(xs[idx] - xs[columns[-1][-1]]) < col_tolerance:
+            columns[-1].append(idx)
+        else:
+            columns.append([idx])
+
+    avg_height = np.mean(heights)
+    row_tolerance = avg_height * 0.5
+
+    sorted_by_y = sorted(range(len(boxes)), key=lambda i: ys[i])
+    rows = [[sorted_by_y[0]]]
+    for idx in sorted_by_y[1:]:
+        if abs(ys[idx] - ys[rows[-1][-1]]) < row_tolerance:
+            rows[-1].append(idx)
+        else:
+            rows.append([idx])
+
+    col_spreads = []
+    for col in columns:
+        if len(col) > 1:
+            spread = np.std(xs[col]) / avg_width if avg_width > 0 else 0
+            col_spreads.append(spread)
+
+    row_spreads = []
+    for row in rows:
+        if len(row) > 1:
+            spread = np.std(ys[row]) / avg_height if avg_height > 0 else 0
+            row_spreads.append(spread)
+
+    avg_col_spread = np.mean(col_spreads) if col_spreads else 0
+    avg_row_spread = np.mean(row_spreads) if row_spreads else 0
+    alignment_score = max(0.0, 100.0 * (1.0 - (avg_col_spread + avg_row_spread) * 5.0))
+
+    # --- 3. Spacing regularity (20%) ---
+    col_centers = sorted(np.mean(xs[col]) for col in columns)
+    col_gaps = np.diff(col_centers) if len(col_centers) > 1 else np.array([])
+
+    row_centers = sorted(np.mean(ys[row]) for row in rows)
+    row_gaps = np.diff(row_centers) if len(row_centers) > 1 else np.array([])
+
+    gap_scores = []
+    if len(col_gaps) > 1:
+        col_gap_cv = np.std(col_gaps) / np.mean(col_gaps) if np.mean(col_gaps) > 0 else 0
+        gap_scores.append(max(0.0, 100.0 * (1.0 - col_gap_cv * 3.0)))
+    else:
+        gap_scores.append(100.0)
+    if len(row_gaps) > 1:
+        row_gap_cv = np.std(row_gaps) / np.mean(row_gaps) if np.mean(row_gaps) > 0 else 0
+        gap_scores.append(max(0.0, 100.0 * (1.0 - row_gap_cv * 3.0)))
+    else:
+        gap_scores.append(100.0)
+    spacing_score = float(np.mean(gap_scores))
+
+    # --- 4. Shape regularity (10%) ---
+    if contours is not None and len(contours) > 0:
+        rects = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            _, _, cw, ch = cv2.boundingRect(c)
+            rect_area = cw * ch
+            if rect_area > 0:
+                rects.append(area / rect_area)
+        shape_score = float(np.mean(rects)) * 100.0 if rects else 100.0
+    else:
+        shape_score = 100.0
+
+    total = (size_score * 0.30 + alignment_score * 0.40 +
+             spacing_score * 0.20 + shape_score * 0.10)
+
+    return {
+        'total': round(total, 1),
+        'size': round(size_score, 1),
+        'alignment': round(alignment_score, 1),
+        'spacing': round(spacing_score, 1),
+        'shape': round(shape_score, 1),
+        'grid': f"{len(columns)}x{len(rows)}",
+    }
+
+
+def refine_box_local(input_file, box, otsu_thresh, orig_w, orig_h,
+                     invert=False, header_skip_px=0):
+    """Refine a bounding box by re-detecting the page at higher local resolution.
+
+    Extracts a padded region around the approximate box (capturing edges of
+    neighboring pages), applies threshold + contour detection at ~20% of full-res,
+    and picks the contour closest to center as the precise page boundary.
+    """
+    x, y, w, h = box
+
+    # Padding to include edges of neighboring pages
+    pad_x = int(w * 0.45)
+    pad_y = int(h * 0.45)
+
+    rx = max(0, x - pad_x)
+    ry = max(0, y - pad_y)
+    rw = min(w + 2 * pad_x, orig_w - rx)
+    rh = min(h + 2 * pad_y, orig_h - ry)
+
+    # Load region (pyvips reads only the needed tiles)
+    img = pyvips.Image.new_from_file(input_file, access='random')
+    region = img.crop(rx, ry, rw, rh)
+    if region.bands > 1:
+        region = region.colourspace('b-w')
+
+    # Downsample locally — 20% of full-res gives ~660×500 per region, fast for OpenCV
+    local_scale = 0.2
+    region_small = region.resize(local_scale)
+
+    region_np = np.ndarray(
+        buffer=region_small.write_to_memory(),
+        dtype=np.uint8,
+        shape=[region_small.height, region_small.width]
+    )
+
+    # Threshold (same Otsu value as global pass)
+    binary = (region_np >= otsu_thresh).astype(np.uint8) * 255
+    if invert:
+        binary = cv2.bitwise_not(binary)
+
+    # Mask out header region (same as global pass)
+    if header_skip_px > 0 and ry < header_skip_px:
+        mask_rows = int((header_skip_px - ry) * local_scale)
+        if mask_rows > 0:
+            binary[:mask_rows, :] = 0
+
+    # Focus mask: black out everything beyond ~110% of expected page size
+    # This prevents bright empty-neighbor areas from merging with the page
+    # 5% per side ≈ half the typical inter-page gap
+    margin = 1.1
+    exp_left = int((x - rx - w * (margin - 1) / 2) * local_scale)
+    exp_top = int((y - ry - h * (margin - 1) / 2) * local_scale)
+    exp_right = int(exp_left + w * margin * local_scale)
+    exp_bottom = int(exp_top + h * margin * local_scale)
+    exp_left = max(0, exp_left)
+    exp_top = max(0, exp_top)
+    exp_right = min(binary.shape[1], exp_right)
+    exp_bottom = min(binary.shape[0], exp_bottom)
+    mask = np.zeros_like(binary)
+    mask[exp_top:exp_bottom, exp_left:exp_right] = 255
+    binary = cv2.bitwise_and(binary, mask)
+
+    # Morphological close to fill text/image holes within pages
+    close_kernel = np.ones((5, 5), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+
+    # Light erosion to ensure neighboring pages stay separated
+    erode_kernel = np.ones((3, 3), np.uint8)
+    binary = cv2.erode(binary, erode_kernel, iterations=2)
+
+    contours_local, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Pick contour closest to center that's large enough to be a page
+    center_x = rw * local_scale / 2
+    center_y = rh * local_scale / 2
+    min_area = w * h * local_scale * local_scale * 0.2
+
+    best = None
+    best_dist = float('inf')
+
+    for c in contours_local:
+        bx, by, bw, bh = cv2.boundingRect(c)
+        if bw * bh < min_area:
+            continue
+        dist = abs(bx + bw / 2 - center_x) + abs(by + bh / 2 - center_y)
+        if dist < best_dist:
+            best_dist = dist
+            best = (bx, by, bw, bh)
+
+    if best is None:
+        return box  # fallback
+
+    bx, by, bw, bh = best
+    sb = 1.0 / local_scale
+    refined = (
+        rx + int(bx * sb),
+        ry + int(by * sb),
+        int(bw * sb),
+        int(bh * sb),
+    )
+
+    # Sanity check: reject if center shifted >20% or size changed >20%
+    ref_cx = refined[0] + refined[2] / 2
+    ref_cy = refined[1] + refined[3] / 2
+    orig_cx = x + w / 2
+    orig_cy = y + h / 2
+    if (abs(ref_cx - orig_cx) > w * 0.2 or abs(ref_cy - orig_cy) > h * 0.2
+            or refined[2] < w * 0.8 or refined[2] > w * 1.2
+            or refined[3] < h * 0.8 or refined[3] > h * 1.2):
+        return box  # fallback
+
+    return refined
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Segment microfiche pages')
+    parser.add_argument('--input', '-i', default=INPUT_FILE, help='Input image file')
+    parser.add_argument('--order', '-o', choices=['columns', 'rows'], default=READING_ORDER,
+                        help='Reading order: columns (down then right) or rows (right then down)')
+    parser.add_argument('--header-skip', '-hs', type=float, default=HEADER_SKIP_RATIO,
+                        help='Fraction of image height to skip at top (for header)')
+    parser.add_argument('--invert', action='store_true',
+                        help='Invert binary image (if pages are dark on light background)')
+    parser.add_argument('--padding', '-p', type=float, default=None,
+                        help='Padding around detected pages (pixels, or percent if 0-1). Default: 5%%')
+    parser.add_argument('--skip-extraction', action='store_true',
+                        help='Only output coordinates, do not extract pages')
+    parser.add_argument('--refine', action='store_true',
+                        help='Refine page positions using local high-res re-detection')
+    parser.add_argument('--output', '-O', default=None,
+                        help='Output directory (default: segmented/<card_name>/ next to input)')
+    args = parser.parse_args()
+
+    input_file = args.input
+    input_path = Path(input_file)
+
+    # Output directory: next to input file, per-card subfolder
+    if args.output:
+        out_dir = Path(args.output)
+    else:
+        out_dir = input_path.parent / "segmented" / input_path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pages_dir = out_dir / "pages"
+    temp_tiff = out_dir / "temp_binary.tif"
+    csv_path = out_dir / "page_coordinates.csv"
+    viz_path = out_dir / "visualization.jpg"
+
+    # === STEP 1: Load image and convert to binary TIFF ===
+    print(f"Loading {input_file} with libvips...")
+    image = pyvips.Image.new_from_file(input_file, access='random')
+
+    original_width = image.width
+    original_height = image.height
+    print(f"Image size: {original_width} x {original_height}")
+
+    # Convert to grayscale if needed
+    if image.bands > 1:
+        gray = image.colourspace('b-w')
+    else:
+        gray = image
+
+    # Compute Otsu threshold from thumbnail
+    print("Computing Otsu threshold from thumbnail...")
+    otsu_thresh = compute_otsu_threshold(gray)
+    print(f"Otsu threshold: {otsu_thresh}")
+
+    # Apply threshold to full image
+    print("Applying threshold to full image...")
+    binary = gray >= otsu_thresh
+
+    # Downsample for contour detection (OpenCV has pixel limits)
+    # Use 10% scale for detection, then scale coordinates back
+    detect_scale = 0.1
+    print(f"Downsampling to {detect_scale*100:.0f}% for contour detection...")
+    binary_small = binary.resize(detect_scale)
+
+    # Convert to numpy for OpenCV
+    binary_img = np.ndarray(
+        buffer=binary_small.write_to_memory(),
+        dtype=np.uint8,
+        shape=[binary_small.height, binary_small.width]
+    )
+    # Convert boolean (0/1) to grayscale (0/255)
+    binary_img = (binary_img * 255).astype(np.uint8)
+
+    # Save full-res binary TIFF for reference (optional)
+    print(f"Saving 1-bit TIFF to {temp_tiff}...")
+    binary.write_to_file(str(temp_tiff), compression='lzw', bigtiff=True)
+
+    # Free memory
+    del image, gray, binary, binary_small
+
+    # === STEP 2: Find contours in the binary image ===
+    print("Finding contours on downsampled image...")
+
+    # Invert if needed
+    if args.invert:
+        print("Inverting binary image...")
+        binary_img = cv2.bitwise_not(binary_img)
+
+    # Calculate header skip in pixels (on downsampled image)
+    header_skip_px_small = int(original_height * detect_scale * args.header_skip)
+    print(f"Skipping top {header_skip_px_small} pixels in downsampled image (header region)")
+
+    # Mask out header region
+    if header_skip_px_small > 0:
+        binary_img[:header_skip_px_small, :] = 0
+
+    # Apply erosion to separate touching pages
+    # Kernel size depends on gap between pages (at 10% scale, ~5-10 pixels)
+    erode_kernel_size = 7
+    print(f"Applying erosion (kernel={erode_kernel_size}) to separate pages...")
+    kernel = np.ones((erode_kernel_size, erode_kernel_size), np.uint8)
+    binary_img = cv2.erode(binary_img, kernel, iterations=2)
+
+    print("Finding contours...")
+    contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # === STEP 3: Filter and sort bounding boxes ===
+    # Min sizes on downsampled image
+    min_w = int(original_width * detect_scale * MIN_PAGE_WIDTH_RATIO)
+    min_h = int(original_height * detect_scale * MIN_PAGE_HEIGHT_RATIO)
+
+    boxes = []
+    filtered_contours = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if w >= min_w and h >= min_h:
+            boxes.append((x, y, w, h))
+            filtered_contours.append(c)
+
+    print(f"Found {len(boxes)} potential pages")
+
+    # === Compute card quality score ===
+    quality = compute_card_quality(boxes, filtered_contours)
+
+    # Validate against max grid size
+    max_pages = MAX_COLUMNS * MAX_ROWS
+    if len(boxes) > max_pages:
+        print(f"Warning: Found {len(boxes)} pages, exceeds max grid {MAX_COLUMNS}x{MAX_ROWS}={max_pages}")
+        print("Consider adjusting MIN_PAGE_WIDTH_RATIO or MIN_PAGE_HEIGHT_RATIO")
+
+    # Sort based on reading order
+    if args.order == 'columns':
+        print("Sorting by columns (left-to-right, then top-to-bottom within each column)")
+        boxes_sorted = sort_boxes_by_columns(boxes)
+    else:
+        print("Sorting by rows (top-to-bottom, then left-to-right within each row)")
+        boxes_sorted = sort_boxes_by_rows(boxes)
+
+    # === STEP 4: Scale coordinates back to original size ===
+    scale_back = 1.0 / detect_scale
+    boxes_fullres = []
+    for (x, y, w, h) in boxes_sorted:
+        boxes_fullres.append((
+            int(x * scale_back),
+            int(y * scale_back),
+            int(w * scale_back),
+            int(h * scale_back)
+        ))
+
+    # === STEP 4b: Optionally refine positions at higher local resolution ===
+    if args.refine:
+        print("\n=== REFINING PAGE POSITIONS ===")
+        print("Re-detecting each page locally at 20% resolution...")
+
+        header_skip_fullres = int(original_height * args.header_skip)
+
+        def _refine_one(box):
+            return refine_box_local(
+                input_file, box, otsu_thresh,
+                original_width, original_height,
+                invert=args.invert, header_skip_px=header_skip_fullres)
+
+        refined = [None] * len(boxes_fullres)
+        refine_done = 0
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(_refine_one, b): i
+                       for i, b in enumerate(boxes_fullres)}
+            for future in as_completed(futures):
+                idx = futures[future]
+                refined[idx] = future.result()
+                refine_done += 1
+                if refine_done % 20 == 0 or refine_done == len(boxes_fullres):
+                    print(f"  Progress: {refine_done}/{len(boxes_fullres)}")
+
+        # Report how much positions shifted
+        shifts_x = [abs(r[0] - o[0]) for r, o in zip(refined, boxes_fullres)]
+        shifts_y = [abs(r[1] - o[1]) for r, o in zip(refined, boxes_fullres)]
+        print(f"  Avg shift: {np.mean(shifts_x):.0f}px x, {np.mean(shifts_y):.0f}px y")
+        print(f"  Max shift: {max(shifts_x):.0f}px x, {max(shifts_y):.0f}px y")
+
+        boxes_fullres = refined
+
+    # Output coordinates
+    print("\n=== PAGE COORDINATES (full resolution) ===")
+    print("Page#, X, Y, Width, Height")
+    for i, (x, y, w, h) in enumerate(boxes_fullres, 1):
+        print(f"{i:3d}, {x}, {y}, {w}, {h}")
+
+    # Print card quality score
+    q = quality['total']
+    grade = "GOOD" if q > 80 else ("FAIR" if q >= 60 else "POOR")
+    print(f"\n{'=' * 42}")
+    print(f"  Card Quality: {q}/100  ({grade})")
+    print(f"  Detected grid: {quality['grid']}")
+    print(f"{'=' * 42}")
+    print(f"  Size consistency .. {quality['size']:5.1f}  (30%)")
+    print(f"  Grid alignment ... {quality['alignment']:5.1f}  (40%)")
+    print(f"  Spacing regularity {quality['spacing']:5.1f}  (20%)")
+    print(f"  Shape regularity . {quality['shape']:5.1f}  (10%)")
+    print(f"{'=' * 42}")
+
+    # Save to CSV
+    with open(csv_path, 'w') as f:
+        f.write(f"# Card Quality: {quality['total']}/100 ({grade})"
+                f" | grid={quality['grid']}"
+                f" | size={quality['size']}"
+                f" | align={quality['alignment']}"
+                f" | spacing={quality['spacing']}"
+                f" | shape={quality['shape']}\n")
+        f.write("page,x,y,width,height\n")
+        for i, (x, y, w, h) in enumerate(boxes_fullres, 1):
+            f.write(f"{i},{x},{y},{w},{h}\n")
+    print(f"\nCoordinates saved to {csv_path}")
+
+    # === STEP 5: Create visualization ===
+    print("Creating visualization...")
+    # binary_img is already downsampled, resize further if needed
+    detect_height, detect_width = binary_img.shape[:2]
+    viz_scale = min(1.0, 2000 / max(detect_width, detect_height))
+    viz = cv2.resize(binary_img, None, fx=viz_scale, fy=viz_scale)
+    viz = cv2.cvtColor(viz, cv2.COLOR_GRAY2BGR)
+
+    # Use full-res boxes (possibly refined) scaled down to viz coordinates
+    fullres_to_viz = detect_scale * viz_scale
+    for i, (x, y, w, h) in enumerate(boxes_fullres, 1):
+        sx, sy = int(x * fullres_to_viz), int(y * fullres_to_viz)
+        sw, sh = int(w * fullres_to_viz), int(h * fullres_to_viz)
+        cv2.rectangle(viz, (sx, sy), (sx + sw, sy + sh), (0, 255, 0), 2)
+        cv2.putText(viz, str(i), (sx + 5, sy + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+    # Add quality score banner at the top
+    q = quality['total']
+    if q > 80:
+        banner_color = (0, 180, 0)     # green
+    elif q >= 60:
+        banner_color = (0, 200, 220)   # yellow (BGR)
+    else:
+        banner_color = (0, 0, 200)     # red
+    banner_h = 32
+    banner = np.zeros((banner_h, viz.shape[1], 3), dtype=np.uint8)
+    banner[:] = (30, 30, 30)
+    label = f"Card Quality: {q}/100 ({grade})  |  {quality['grid']}  |  size={quality['size']}  align={quality['alignment']}  spacing={quality['spacing']}  shape={quality['shape']}"
+    cv2.putText(banner, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, banner_color, 2)
+    viz = np.vstack([banner, viz])
+
+    cv2.imwrite(str(viz_path), viz)
+    print(f"Saved {viz_path}")
+
+    # === STEP 6: Extract pages (optional) ===
+    if not args.skip_extraction:
+        print("\n=== EXTRACTING PAGES (parallel) ===")
+        pages_dir.mkdir(exist_ok=True)
+
+        # Number of parallel workers
+        num_workers = 5
+        print(f"Using {num_workers} parallel workers")
+
+        # Compute padding: default 2% of median page size (thin gutter strip)
+        if args.padding is None:
+            median_w = int(np.median([b[2] for b in boxes_fullres]))
+            median_h = int(np.median([b[3] for b in boxes_fullres]))
+            pad_x = int(median_w * 0.02)
+            pad_y = int(median_h * 0.02)
+        elif args.padding <= 1.0:
+            median_w = int(np.median([b[2] for b in boxes_fullres]))
+            median_h = int(np.median([b[3] for b in boxes_fullres]))
+            pad_x = int(median_w * args.padding)
+            pad_y = int(median_h * args.padding)
+        else:
+            pad_x = pad_y = int(args.padding)
+        print(f"Crop margin: {pad_x}px x {pad_y}px")
+
+        def extract_page(task):
+            """Extract a single page from the source image."""
+            i, x, y, w, h, src_file, out_dir, orig_w, orig_h = task
+
+            img = pyvips.Image.new_from_file(src_file, access='random')
+
+            # Apply margin
+            px = max(0, x - pad_x)
+            py = max(0, y - pad_y)
+            pw = min(w + 2 * pad_x, orig_w - px)
+            ph = min(h + 2 * pad_y, orig_h - py)
+
+            page = img.crop(px, py, pw, ph)
+
+            output_path = out_dir / f"page_{i:03d}.jpg"
+            page.write_to_file(str(output_path), Q=95)
+            return i, output_path
+
+        # Prepare tasks
+        tasks = [
+            (i, x, y, w, h, input_file, pages_dir, original_width, original_height)
+            for i, (x, y, w, h) in enumerate(boxes_fullres, 1)
+        ]
+
+        # Execute in parallel
+        completed = 0
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(extract_page, task): task[0] for task in tasks}
+            for future in as_completed(futures):
+                i, path = future.result()
+                completed += 1
+                if completed % 20 == 0 or completed == len(tasks):
+                    print(f"  Progress: {completed}/{len(tasks)} pages extracted")
+
+        print(f"\nExtracted {len(boxes_fullres)} pages to {pages_dir}/")
+
+    print("\nDone!")
+
+
+if __name__ == '__main__':
+    main()
