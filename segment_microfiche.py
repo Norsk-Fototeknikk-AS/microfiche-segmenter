@@ -356,6 +356,12 @@ def main():
                         help='Padding around detected pages (pixels, or percent if 0-1). Default: 5%%')
     parser.add_argument('--skip-extraction', action='store_true',
                         help='Only output coordinates, do not extract pages')
+    parser.add_argument('--format', choices=['tif', 'jpg'], default='tif',
+                        help='Page crop format. Default tif (LZW): the decided '
+                             'workflow is TIFF end-to-end until final packaging '
+                             '— a JPG crop here would re-encode already-stitched '
+                             'pixels and the archival TIFF downstream would '
+                             'inherit the artifacts.')
     parser.add_argument('--refine', action='store_true',
                         help='Refine page positions using local high-res re-detection')
     parser.add_argument('--output', '-O', default=None,
@@ -628,8 +634,12 @@ def main():
 
             page = img.crop(px, py, pw, ph)
 
-            output_path = out_dir / f"page_{i:03d}.jpg"
-            page.write_to_file(str(output_path), Q=95)
+            if args.format == 'jpg':
+                output_path = out_dir / f"page_{i:03d}.jpg"
+                page.write_to_file(str(output_path), Q=95)
+            else:
+                output_path = out_dir / f"page_{i:03d}.tif"
+                page.write_to_file(str(output_path), compression='lzw')
             return i, output_path
 
         # Prepare tasks
@@ -649,6 +659,12 @@ def main():
                     print(f"  Progress: {completed}/{len(tasks)} pages extracted")
 
         print(f"\nExtracted {len(boxes_fullres)} pages to {pages_dir}/")
+
+        # Sentinel written LAST, after every page is on disk: the OCR app's
+        # watch+confirm list treats its presence as "fully written" and only
+        # then offers the card for import (without it the app falls back to a
+        # 120 s quiet-period heuristic).
+        (out_dir / "_done").touch()
 
     print("\nDone!")
 
