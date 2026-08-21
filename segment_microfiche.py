@@ -14,6 +14,8 @@ from pathlib import Path
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+import shutil
+import sys
 
 # === CONFIGURATION ===
 INPUT_FILE = "your_gigapixel_file.jpg"  # Change this or use --input
@@ -35,6 +37,90 @@ MAX_ROWS = 13
 
 # Padding around detected pages (pixels) - added when extracting
 PADDING = 0
+
+# Erosion used to separate touching pages. Both passes shrink every blob by a
+# known amount, which is added back to the boxes so they land on the true page
+# edge rather than inside it.
+DETECT_ERODE_KERNEL = 7      # global pass, at detect_scale
+DETECT_ERODE_ITERATIONS = 2
+REFINE_ERODE_KERNEL = 3      # local re-detection, at local_scale
+REFINE_ERODE_ITERATIONS = 2
+
+# Default crop margin, as a fraction of median page size. With the erosion bias
+# compensated this is real safety headroom, not a correction.
+DEFAULT_PADDING_RATIO = 0.01
+
+
+# Sentinel the OCR app's watcher polls: its presence means "fully written, safe
+# to import". Everything about how it is written matters to that contract.
+DONE_SENTINEL = "_done"
+
+# Exit codes, so an app-driven run can tell failure modes apart
+EXIT_NO_PAGES = 2
+
+
+def prepare_card_dir(out_dir):
+    """Clear a card folder so a re-run cannot be mistaken for a finished one.
+
+    Removes the sentinel FIRST — while it exists the OCR app considers the card
+    importable, so it must not survive into the rewrite — then empties pages/ so
+    leftovers from a longer previous run cannot be imported as real pages.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sentinel = out_dir / DONE_SENTINEL
+    if sentinel.exists():
+        sentinel.unlink()
+
+    pages_dir = out_dir / "pages"
+    if pages_dir.is_dir():
+        for stale in pages_dir.iterdir():
+            if stale.is_file():
+                stale.unlink()
+
+
+def write_done_sentinel(out_dir):
+    """Publish the sentinel atomically, via temp file + rename."""
+    out_dir = Path(out_dir)
+    tmp = out_dir / f".{DONE_SENTINEL}.tmp"
+    tmp.touch()
+    os.replace(tmp, out_dir / DONE_SENTINEL)
+
+
+def move_to_error_dir(src, error_dir):
+    """Move a failed source scan aside, without overwriting an earlier failure."""
+    src = Path(src)
+    error_dir = Path(error_dir)
+    error_dir.mkdir(parents=True, exist_ok=True)
+
+    dest = error_dir / src.name
+    n = 1
+    while dest.exists():
+        dest = error_dir / f"{src.stem}_{n}{src.suffix}"
+        n += 1
+
+    return Path(shutil.move(str(src), str(dest)))
+
+
+def erosion_radius(kernel_size, iterations):
+    """Pixels eaten from each side of a blob by cv2.erode with this kernel."""
+    return (kernel_size // 2) * iterations
+
+
+def expand_boxes(boxes, radius, max_width, max_height):
+    """Grow each (x, y, w, h) box by radius per side, clamped to image bounds."""
+    if radius == 0:
+        return list(boxes)
+
+    expanded = []
+    for x, y, w, h in boxes:
+        left = max(0, x - radius)
+        top = max(0, y - radius)
+        right = min(max_width, x + w + radius)
+        bottom = min(max_height, y + h + radius)
+        expanded.append((left, top, right - left, bottom - top))
+    return expanded
 
 
 def compute_otsu_threshold(gray_image, sample_scale=0.01):
@@ -129,8 +215,10 @@ def compute_card_quality(boxes, contours):
     - Shape regularity (10%): How rectangular the detections are
     """
     if len(boxes) < 2:
+        # 'grid' included even here: callers print it unconditionally.
         return {'total': 100.0, 'size': 100.0, 'alignment': 100.0,
-                'spacing': 100.0, 'shape': 100.0}
+                'spacing': 100.0, 'shape': 100.0,
+                'grid': f"{len(boxes)}x{len(boxes)}"}
 
     widths = np.array([b[2] for b in boxes])
     heights = np.array([b[3] for b in boxes])
@@ -296,8 +384,8 @@ def refine_box_local(input_file, box, otsu_thresh, orig_w, orig_h,
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_kernel, iterations=2)
 
     # Light erosion to ensure neighboring pages stay separated
-    erode_kernel = np.ones((3, 3), np.uint8)
-    binary = cv2.erode(binary, erode_kernel, iterations=2)
+    erode_kernel = np.ones((REFINE_ERODE_KERNEL, REFINE_ERODE_KERNEL), np.uint8)
+    binary = cv2.erode(binary, erode_kernel, iterations=REFINE_ERODE_ITERATIONS)
 
     contours_local, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -321,7 +409,11 @@ def refine_box_local(input_file, box, otsu_thresh, orig_w, orig_h,
     if best is None:
         return box  # fallback
 
-    bx, by, bw, bh = best
+    # Undo this pass's erosion shrink before scaling back, matching the global pass
+    refine_radius = erosion_radius(REFINE_ERODE_KERNEL, REFINE_ERODE_ITERATIONS)
+    (bx, by, bw, bh) = expand_boxes(
+        [best], refine_radius, binary.shape[1], binary.shape[0])[0]
+
     sb = 1.0 / local_scale
     refined = (
         rx + int(bx * sb),
@@ -353,7 +445,7 @@ def main():
     parser.add_argument('--invert', action='store_true',
                         help='Invert binary image (if pages are dark on light background)')
     parser.add_argument('--padding', '-p', type=float, default=None,
-                        help='Padding around detected pages (pixels, or percent if 0-1). Default: 5%%')
+                        help='Padding around detected pages (pixels, or percent if 0-1). Default: 1%%')
     parser.add_argument('--skip-extraction', action='store_true',
                         help='Only output coordinates, do not extract pages')
     parser.add_argument('--format', choices=['tif', 'jpg'], default='tif',
@@ -366,6 +458,10 @@ def main():
                         help='Refine page positions using local high-res re-detection')
     parser.add_argument('--output', '-O', default=None,
                         help='Output directory (default: segmented/<card_name>/ next to input)')
+    parser.add_argument('--debug', action='store_true',
+                        help='Also write the binary TIFF and box overlay to <card>/_debug/. '
+                             'Off by default: the OCR app reads loose image files in the '
+                             'card folder as pages.')
     args = parser.parse_args()
 
     input_file = args.input
@@ -376,12 +472,26 @@ def main():
         out_dir = Path(args.output)
     else:
         out_dir = input_path.parent / "segmented" / input_path.stem
-    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.skip_extraction:
+        # Inspection mode writes coordinates only. Clearing here would delete a
+        # finished card's pages and retract a sentinel that is still accurate.
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        # Clear any previous run before writing: a stale _done would tell the
+        # OCR app this card is importable while we are still rewriting it.
+        prepare_card_dir(out_dir)
 
     pages_dir = out_dir / "pages"
-    temp_tiff = out_dir / "temp_binary.tif"
     csv_path = out_dir / "page_coordinates.csv"
-    viz_path = out_dir / "visualization.jpg"
+
+    # Debug artifacts stay out of the card folder unless asked for — the OCR
+    # app treats loose image files there as pages.
+    debug_dir = out_dir / "_debug"
+    if args.debug:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+    temp_tiff = debug_dir / "temp_binary.tif"
+    viz_path = debug_dir / "visualization.jpg"
 
     # === STEP 1: Load image and convert to binary TIFF ===
     print(f"Loading {input_file} with libvips...")
@@ -422,8 +532,9 @@ def main():
     binary_img = (binary_img * 255).astype(np.uint8)
 
     # Save full-res binary TIFF for reference (optional)
-    print(f"Saving 1-bit TIFF to {temp_tiff}...")
-    binary.write_to_file(str(temp_tiff), compression='lzw', bigtiff=True)
+    if args.debug:
+        print(f"Saving 1-bit TIFF to {temp_tiff}...")
+        binary.write_to_file(str(temp_tiff), compression='lzw', bigtiff=True)
 
     # Free memory
     del image, gray, binary, binary_small
@@ -446,10 +557,9 @@ def main():
 
     # Apply erosion to separate touching pages
     # Kernel size depends on gap between pages (at 10% scale, ~5-10 pixels)
-    erode_kernel_size = 7
-    print(f"Applying erosion (kernel={erode_kernel_size}) to separate pages...")
-    kernel = np.ones((erode_kernel_size, erode_kernel_size), np.uint8)
-    binary_img = cv2.erode(binary_img, kernel, iterations=2)
+    print(f"Applying erosion (kernel={DETECT_ERODE_KERNEL}) to separate pages...")
+    kernel = np.ones((DETECT_ERODE_KERNEL, DETECT_ERODE_KERNEL), np.uint8)
+    binary_img = cv2.erode(binary_img, kernel, iterations=DETECT_ERODE_ITERATIONS)
 
     print("Finding contours...")
     contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -468,6 +578,34 @@ def main():
             filtered_contours.append(c)
 
     print(f"Found {len(boxes)} potential pages")
+
+    # Fail loudly on a total detection failure. Writing an empty card folder
+    # would be worse than useless: the OCR app skips empty folders silently, so
+    # the card would vanish from the queue with no error anywhere.
+    if not boxes:
+        print(f"\nERROR: no pages detected in {input_file}", file=sys.stderr)
+        print("  No _done sentinel written — this card will not be offered for import.",
+              file=sys.stderr)
+        if not args.skip_extraction:
+            moved = move_to_error_dir(input_path, input_path.parent / "error")
+            print(f"  Source scan moved to {moved}", file=sys.stderr)
+            # Leave no empty card folder cluttering the watch root
+            try:
+                out_dir.rmdir()
+            except OSError:
+                pass  # not empty (e.g. --debug artifacts) — leave it for inspection
+        else:
+            print("  Source left in place (--skip-extraction is inspection-only).",
+                  file=sys.stderr)
+        return EXIT_NO_PAGES
+
+    # Undo the erosion shrink so boxes sit on the true page edge. Erosion of a
+    # rectangle removes exactly this many pixels per side, so the recovery is
+    # exact rather than a fudge factor.
+    detect_radius = erosion_radius(DETECT_ERODE_KERNEL, DETECT_ERODE_ITERATIONS)
+    boxes = expand_boxes(boxes, detect_radius, binary_img.shape[1], binary_img.shape[0])
+    print(f"Compensating erosion: +{detect_radius}px per side "
+          f"(+{int(detect_radius / detect_scale)}px at full resolution)")
 
     # === Compute card quality score ===
     quality = compute_card_quality(boxes, filtered_contours)
@@ -593,8 +731,9 @@ def main():
     cv2.putText(banner, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, banner_color, 2)
     viz = np.vstack([banner, viz])
 
-    cv2.imwrite(str(viz_path), viz)
-    print(f"Saved {viz_path}")
+    if args.debug:
+        cv2.imwrite(str(viz_path), viz)
+        print(f"Saved {viz_path}")
 
     # === STEP 6: Extract pages (optional) ===
     if not args.skip_extraction:
@@ -605,12 +744,12 @@ def main():
         num_workers = 5
         print(f"Using {num_workers} parallel workers")
 
-        # Compute padding: default 2% of median page size (thin gutter strip)
+        # Compute padding: default 1% of median page size (hairline safety margin)
         if args.padding is None:
             median_w = int(np.median([b[2] for b in boxes_fullres]))
             median_h = int(np.median([b[3] for b in boxes_fullres]))
-            pad_x = int(median_w * 0.02)
-            pad_y = int(median_h * 0.02)
+            pad_x = int(median_w * DEFAULT_PADDING_RATIO)
+            pad_y = int(median_h * DEFAULT_PADDING_RATIO)
         elif args.padding <= 1.0:
             median_w = int(np.median([b[2] for b in boxes_fullres]))
             median_h = int(np.median([b[3] for b in boxes_fullres]))
@@ -660,14 +799,15 @@ def main():
 
         print(f"\nExtracted {len(boxes_fullres)} pages to {pages_dir}/")
 
-        # Sentinel written LAST, after every page is on disk: the OCR app's
-        # watch+confirm list treats its presence as "fully written" and only
-        # then offers the card for import (without it the app falls back to a
-        # 120 s quiet-period heuristic).
-        (out_dir / "_done").touch()
+        # Sentinel written LAST, after every page is on disk, and atomically:
+        # the OCR app's watch+confirm list treats its presence as "fully
+        # written" and only then offers the card for import (without it the app
+        # falls back to a 120 s quiet-period heuristic).
+        write_done_sentinel(out_dir)
 
     print("\nDone!")
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
