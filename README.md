@@ -1,0 +1,186 @@
+# microfiche-segmenter
+
+Cuts a stitched microfiche panorama into one image file per page.
+
+Input is a gigapixel panorama produced by the PTGui runner (one physical fiche
+card = one panorama, stitched from 16 tiles). Output is a *card folder* that the
+OCR-Pipeline app watches and imports on operator command.
+
+```
+segment_microfiche.py  --input <panorama> --output <card folder>
+```
+
+The whole job is: threshold the card, find the page rectangles, write one crop
+per page plus their coordinates, then mark the folder finished.
+
+---
+
+## Contracts — DO NOT BREAK THESE
+
+Everything in this section is depended on by another program, by an agreement
+made outside this repo, or by physics of the image pipeline. **The test suite
+passing is not sufficient evidence that a change here is safe.** These rules
+cannot be re-derived from the code, and several of them look like dead weight
+until you know why they exist. If you are tempted to simplify one of them,
+read the reason first.
+
+### C1. Erosion must be compensated
+
+Detection runs on a 10 % downscale and erodes the binary image (7×7 kernel,
+2 iterations) to pull touching pages apart. Erosion shrinks every blob by
+`(kernel // 2) * iterations` = **6 px at detect scale = 60 px at full
+resolution, on all four sides**.
+
+`expand_boxes()` adds exactly that back. Delete it and every page silently
+loses ~60 px of its own edge — text at the page margin gets cut. Nothing in the
+output looks wrong: the crops are still page-shaped, the quality score still
+reads GOOD, and the tests that don't measure geometry still pass. This bug
+shipped once already and was only found by measuring crops against the source.
+
+`refine_box_local()` has its own erosion (3×3, 2 iterations, at 20 % local
+scale = 10 px full-res) and its own compensation. Both must stay, or the two
+detection passes disagree by ~50 px.
+
+### C2. `_done` is the import signal, and its ordering is load-bearing
+
+The OCR app treats the presence of `_done` in a card folder as "fully written,
+safe to import".
+
+- Written **last**, after every page file is on disk.
+- Written **atomically** (temp file + `os.replace`), never built in place.
+- Deleted **first** at startup, *before* `pages/` is cleared.
+
+That last ordering matters: while `_done` exists the app considers the card
+importable, so it must be gone before anything starts rewriting the folder. A
+re-run that clears pages while a stale `_done` sits there will hand the app a
+half-written card. This was measured happening — the sentinel stayed visible for
+the full 10 s of a rewrite.
+
+Without `_done` the app falls back to "120 s with no file changes", which is
+fragile. Always write it on success.
+
+### C3. Stale pages must be purged at startup
+
+`pages/` is emptied before a run writes to it. If a previous run found 147 pages
+and this one finds 140, `page_141..147` would otherwise survive and be imported
+as real pages of the journal. Same-name overwriting is not enough.
+
+### C4. `--skip-extraction` must never destroy anything
+
+It is inspection mode: it writes coordinates only. It must not clear `pages/`
+and must not remove `_done`, because the card on disk may be a finished, valid
+card. Running it must be safe on any folder at any time.
+
+### C5. The card folder contains no loose image files
+
+A card folder holds exactly:
+
+```
+<card>/
+    _done
+    page_coordinates.csv
+    pages/page_001.tif …
+```
+
+The OCR app has a fallback that reads image files sitting *directly* in the card
+folder as pages, used when `pages/` is missing. Anything else image-shaped left
+at that level can therefore be imported as a page. Debug artifacts
+(`temp_binary.tif`, the box overlay) go to `<card>/_debug/` and only with
+`--debug`.
+
+### C6. Output naming is the system boundary
+
+- The card folder name is the **input file stem, verbatim**. We do not rename.
+- It must match `^(\d{12})(?:\D|$)` — 12-digit fanearkID, then a non-digit or
+  end of string. A 13th digit makes the app skip the folder *silently*.
+- The first integer *after* the 12 digits is the card's order within a journal.
+  One journal can span several cards; PTGui names them from the last tile, so
+  card 1 = `<fid>_00016`, card 2 = `<fid>_00032`.
+- Page order is the **last integer in the filename stem**, sorted naturally.
+  `page_%03d` zero-padding is safe and wanted.
+
+### C7. TIFF end to end
+
+Page crops are TIFF (LZW). Decided 2026-08-12: the workflow stays TIFF until
+final packaging, because a JPG crop here re-encodes already-stitched pixels and
+the archival TIFF downstream inherits the artifacts. `--format jpg` exists but
+must not be used for pipeline output.
+
+### C8. First CSV line carries the quality score
+
+`page_coordinates.csv` line 1 must contain `Card Quality: N/100`. The app
+parses it for its quality panel; the worst card's score represents the journal.
+If the line or the file is missing the app degrades silently — no error, just a
+missing number.
+
+### C9. Failure must be loud
+
+A card that detects zero pages must **not** produce a card folder. The app
+ignores empty folders silently, so an empty folder is invisible, not an error
+signal. On zero detections: no `_done`, message on stderr, the source panorama
+is moved to `<input dir>/error/`, the empty card folder is removed, exit 2.
+
+### C10. Exit codes
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | unhandled exception (traceback on stderr) |
+| 2 | no pages detected; source moved to `error/` |
+
+`-O` / `--output` names the **card folder**, not the watch root. A caller that
+wants `<root>/<fid>/` must pass `-O <root>/<fid>` itself.
+
+---
+
+## Running it
+
+```bash
+.venv/bin/python -u segment_microfiche.py \
+    -i /Volumes/NB02/NHA/Panoramas/612130000012_00016.tif \
+    -O /Volumes/NB02/NHA/Microfiche/612130000012_00016
+```
+
+Use `python -u`. There is no explicit flushing, so piped stdout is block
+buffered and a progress panel would otherwise receive everything in one lump at
+the end.
+
+### Flags
+
+| flag | default | notes |
+|---|---|---|
+| `-i, --input` | — | panorama; anything libvips can open |
+| `-O, --output` | `<input dir>/segmented/<stem>/` | the card folder |
+| `-o, --order` | `columns` | `columns` = down then right; `rows` = right then down |
+| `-hs, --header-skip` | `0.08` | fraction of height masked at top (card header) |
+| `-p, --padding` | `0.01` | crop margin; ≤1 = fraction of median page, >1 = pixels |
+| `--refine` | off | re-detect each page locally at 20 %; slower, slightly looser |
+| `--format` | `tif` | see C7 |
+| `--invert` | off | for cards that are dark-on-light |
+| `--skip-extraction` | off | coordinates only; non-destructive (C4) |
+| `--debug` | off | write binary TIFF + box overlay to `<card>/_debug/` |
+
+## How detection works
+
+1. Otsu threshold from a 1 % thumbnail, applied to the full image.
+2. Downscale to 10 % and erode to separate touching pages.
+3. Contours → bounding boxes, filtered by minimum page size.
+4. **Expand boxes by the erosion radius** (C1).
+5. Sort into reading order, scale back to full resolution.
+6. Optionally refine each box by re-detecting locally at 20 %.
+7. Score the card (size consistency, grid alignment, spacing, shape).
+8. Crop each page with the margin and write TIFFs in parallel (5 workers).
+9. Write `_done` (C2).
+
+## Tests
+
+```bash
+.venv/bin/python -m pytest test_segment.py -q
+```
+
+Unit tests cover the geometry and the folder lifecycle. Four end-to-end tests
+drive the real CLI against a small generated card, so the folder contract is
+verified in about a second without needing a gigapixel scan.
+
+See `HANDOFF.md` for measured numbers, what is still unproven, and how to
+verify a change with no network access.
