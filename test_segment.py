@@ -214,6 +214,12 @@ def run_segmenter(*args):
                           capture_output=True, text=True, cwd=str(REPO))
 
 
+def real_pages(out):
+    """Page files excluding the header prepage (page zero)."""
+    from segment_microfiche import HEADER_PAGE_STEM as _h
+    return [p for p in (out / "pages").glob("page_*.tif") if p.stem != _h]
+
+
 def test_end_to_end_writes_the_card_contract(tmp_path):
     src = tmp_path / "612130000012_00016.jpg"
     n = make_card(src)
@@ -224,7 +230,7 @@ def test_end_to_end_writes_the_card_contract(tmp_path):
 
     assert sorted(p.name for p in out.iterdir()) == [
         DONE_SENTINEL, "page_coordinates.csv", "pages"]
-    assert len(list((out / "pages").glob("page_*.tif"))) == n
+    assert len(real_pages(out)) == n
     assert "Card Quality:" in (out / "page_coordinates.csv").read_text().splitlines()[0]
 
 
@@ -239,7 +245,7 @@ def test_rerun_clears_stale_pages_end_to_end(tmp_path):
 
     assert run_segmenter("-i", str(src), "-O", str(out)).returncode == 0
     assert not stale.exists()
-    assert len(list((out / "pages").glob("page_*.tif"))) == n
+    assert len(real_pages(out)) == n
 
 
 def test_skip_extraction_does_not_destroy_existing_pages(tmp_path):
@@ -249,11 +255,11 @@ def test_skip_extraction_does_not_destroy_existing_pages(tmp_path):
     out = tmp_path / "card"
 
     assert run_segmenter("-i", str(src), "-O", str(out)).returncode == 0
-    assert len(list((out / "pages").glob("page_*.tif"))) == n
+    assert len(real_pages(out)) == n
 
     proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
     assert proc.returncode == 0, proc.stderr
-    assert len(list((out / "pages").glob("page_*.tif"))) == n, "pages were deleted"
+    assert len(real_pages(out)) == n, "pages were deleted"
     assert (out / DONE_SENTINEL).exists(), "sentinel removed from a still-valid card"
 
 
@@ -266,3 +272,131 @@ def test_debug_artifacts_stay_out_of_the_card_folder(tmp_path):
     assert (out / "_debug" / "visualization.jpg").exists()
     loose = [p.name for p in out.iterdir() if p.suffix.lower() in ('.jpg', '.tif', '.tiff')]
     assert loose == [], f"image files loose in the card folder: {loose}"
+
+
+# --- Size-outlier rejection -------------------------------------------------
+# Stitching can leave a bright band along a card edge. It survives the
+# minimum-size filter (it is huge, not small) and lands in the page list as a
+# blank strip, shifting every later page number by one.
+
+from segment_microfiche import SIZE_TOLERANCE_RATIO, drop_size_outliers
+
+
+def _grid(n=20, w=2040, h=1630):
+    return [(100 + (i % 5) * 2100, 200 + (i // 5) * 1700, w, h) for i in range(n)]
+
+
+def test_drops_a_wide_flat_edge_strip():
+    """The real case: 33208 x 732 against a 2040 x 1630 median."""
+    boxes = _grid() + [(1110, 24770, 33208, 732)]
+    kept, _, dropped = drop_size_outliers(boxes, None, SIZE_TOLERANCE_RATIO)
+    assert dropped == [(1110, 24770, 33208, 732)]
+    assert len(kept) == 20
+
+
+def test_keeps_normally_varying_pages():
+    boxes = [(100 + i * 2100, 200, 2040 + (i % 7) * 12, 1630 - (i % 5) * 9)
+             for i in range(20)]
+    kept, _, dropped = drop_size_outliers(boxes, None, SIZE_TOLERANCE_RATIO)
+    assert dropped == []
+    assert kept == boxes
+
+
+def test_drops_a_too_short_box_even_when_width_is_normal():
+    boxes = _grid() + [(500, 900, 2040, 700)]
+    kept, _, dropped = drop_size_outliers(boxes, None, SIZE_TOLERANCE_RATIO)
+    assert dropped == [(500, 900, 2040, 700)]
+
+
+def test_keeps_contours_aligned_with_kept_boxes():
+    boxes = _grid(6) + [(0, 0, 33208, 732)]
+    contours = [f"c{i}" for i in range(7)]
+    kept, kept_contours, dropped = drop_size_outliers(boxes, contours, SIZE_TOLERANCE_RATIO)
+    assert len(kept) == len(kept_contours) == 6
+    assert kept_contours == [f"c{i}" for i in range(6)]
+    assert len(dropped) == 1
+
+
+def test_does_not_filter_when_the_median_is_untrustworthy():
+    """If most boxes would be dropped, the median is junk — keep everything.
+
+    Nothing here agrees with anything else, so the median describes no real
+    page. Discarding "outliers" would throw away most of the card.
+    """
+    boxes = [(0, 0, 100, 100), (0, 0, 1000, 1000),
+             (0, 0, 5000, 5000), (0, 0, 9000, 9000)]
+    kept, _, dropped = drop_size_outliers(boxes, None, SIZE_TOLERANCE_RATIO)
+    assert dropped == []
+    assert kept == boxes
+
+
+def test_too_few_boxes_to_judge_are_left_alone():
+    boxes = [(0, 0, 2040, 1630), (0, 0, 33208, 732)]
+    kept, _, dropped = drop_size_outliers(boxes, None, SIZE_TOLERANCE_RATIO)
+    assert dropped == []
+    assert kept == boxes
+
+
+# --- Header prepage ---------------------------------------------------------
+# The masked header band carries the card's only identifying metadata (title,
+# part number, date, and "N of M" card index). It is kept as page zero: sorts
+# ahead of page_001, scaled right down, and easy to drop downstream.
+
+from segment_microfiche import HEADER_PAGE_STEM, HEADER_PROXY_SCALE
+
+
+def test_writes_the_header_as_page_zero(tmp_path):
+    src = tmp_path / "612130000012_00016.jpg"
+    n = make_card(src)
+    out = tmp_path / "card"
+
+    assert run_segmenter("-i", str(src), "-O", str(out), "--header-page").returncode == 0
+
+    header = out / "pages" / f"{HEADER_PAGE_STEM}.tif"
+    assert header.exists(), "header prepage not written"
+    assert len(real_pages(out)) == n
+
+
+def test_header_prepage_is_scaled_right_down(tmp_path):
+    src = tmp_path / "612130000012_00016.jpg"
+    make_card(src)
+    out = tmp_path / "card"
+    run_segmenter("-i", str(src), "-O", str(out), "--header-page")
+
+    header = pyvips.Image.new_from_file(str(out / "pages" / f"{HEADER_PAGE_STEM}.tif"))
+    page = pyvips.Image.new_from_file(str(out / "pages" / "page_001.tif"))
+    # Source card is 2000px wide; the band spans full width before scaling.
+    assert header.width == int(2000 * HEADER_PROXY_SCALE)
+    assert header.width < page.width
+
+
+def test_header_prepage_sorts_before_the_first_page():
+    """The OCR app orders pages by the last integer in the stem."""
+    import re
+    stems = [f"{HEADER_PAGE_STEM}", "page_001", "page_002", "page_010"]
+    keys = [int(re.findall(r"\d+", s)[-1]) for s in stems]
+    assert keys == sorted(keys)
+    assert keys[0] == 0
+
+
+def test_no_header_prepage_when_header_skip_is_zero(tmp_path):
+    src = tmp_path / "612130000012_00016.jpg"
+    n = make_card(src)
+    out = tmp_path / "card"
+
+    assert run_segmenter("-i", str(src), "-O", str(out), "--header-page",
+                         "--header-skip", "0").returncode == 0
+    assert not (out / "pages" / f"{HEADER_PAGE_STEM}.tif").exists()
+    assert len(real_pages(out)) == n
+
+
+def test_header_prepage_is_off_by_default(tmp_path):
+    """This round ships 147 files per card; page zero is opt-in until the
+    import side is ready to handle it."""
+    src = tmp_path / "612130000012_00016.jpg"
+    n = make_card(src)
+    out = tmp_path / "card"
+
+    assert run_segmenter("-i", str(src), "-O", str(out)).returncode == 0
+    assert not (out / "pages" / f"{HEADER_PAGE_STEM}.tif").exists()
+    assert len(list((out / "pages").glob("page_*.tif"))) == n

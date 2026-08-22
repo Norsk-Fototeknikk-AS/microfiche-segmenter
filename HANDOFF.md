@@ -1,15 +1,16 @@
-# Handoff — state as of 2026-08-21
+# Handoff — state as of 2026-08-22
 
 Written before the machine goes offline for production. Read `README.md` first;
 its "Contracts" section is the part that must not be broken. This file records
 what was measured, what is still unproven, and how to check your work with no
 network and no access to the conversations that produced this code.
 
-Everything below was measured on this machine on 2026-08-21, not estimated.
+Everything below was measured on this machine, not estimated. Dates are given
+where they matter.
 
 ---
 
-## What changed today
+## What changed 2026-08-21
 
 ### The erosion bug (the important one)
 
@@ -67,6 +68,75 @@ card vanished with no error anywhere. Now: no `_done`, source moved to
 
 ---
 
+## What changed 2026-08-22
+
+### The header is no longer thrown away
+
+`--header-skip` masks the top of the card so the header is not detected as a
+page. It was then discarded entirely — the card's only identifying text, gone on
+every run. It can now be written as `pages/page_000.tif` at 1/16 scale via
+`--header-page`. See contract C11 in the README for why the name, the scale, and
+the boundary at `header.json` are all fixed points rather than preferences.
+
+**The flag is off by default for now** — Trond deferred the header to the next
+round so the import side can be finished and tested against a card that has no
+`page_000` first. Downstream deliberately supports both shapes, because a
+half-finished handover can contain cards from either side of the change, and
+that kind of transition is what breaks quietly. Turn it on when the import side
+is ready.
+
+What the header is for, decided the same day: it is OCR'd with a field-oriented
+prompt (a card header is fields, not prose), the text is stored per card, and the
+image is then carried as a sidecar rather than deleted — on a name or national ID
+conflict with the pages, **the header wins**, and the discrepancy is flagged for
+review with the header image shown next to the disputed field.
+
+### Non-page-shaped detections are rejected
+
+`drop_size_outliers()`, contract C12. Added after both production cards came out
+as 148 pages / POOR because of a light table band along the bottom edge.
+
+## Proven since first writing
+
+### Multi-card journals work (2026-08-22)
+
+Two cards of one journal, same fanearkID, distinguished only by the suffix:
+`612130000012_00016` and `612130000012_00032`. This is the case where a bare
+`<fid>` name would have made card 2 delete card 1's pages in the startup
+cleanup.
+
+Measured, not assumed: card 1's folder was snapshotted (151 files, sizes,
+mtimes, inodes) before card 2 ran, and compared after. Nothing missing, nothing
+added, nothing modified, and `_done` kept the same inode — it was not even
+rewritten. The only diff was `.DS_Store`, which Finder touches and we never
+write.
+
+The startup purge was also confirmed in production the same day: a stale
+`page_148.tif` left by an earlier run was gone after the next run.
+
+### The 16x slowdown was not real
+
+Two runs took 2 min 10 s where the same work had taken 8.2 s, and it was briefly
+blamed on the input TIFF's layout. That was wrong twice over — the files are
+identical in encoding (`AdobeDeflate`, Rows/Strip 128, striped) and pure decode
+cost matches to within 0.01 s. The full matrix:
+
+| input | output | wall | user CPU |
+|---|---|---|---|
+| yesterday's file | NB02 | 8.2 s | 29 s |
+| today's file | NB02 | 2 m 13 | 547 s |
+| yesterday's file | local disk | 8.18 s | 29.3 s |
+| today's file | local disk | 8.16 s | 29.1 s |
+
+Only the combination was slow, and re-running it later gave 8.15 s — it does not
+reproduce. The slow runs coincided with PTGui stitching and compressing on the
+same volume (217 s per panorama). Contention, not code.
+
+**Real cost is ~8 s per card.** Do not build timeouts or estimates on the
+2-minute figure. Beware of "isolating" a variable while changing two: the first
+attempt here swapped the input file *and* the output destination, and produced a
+confident wrong conclusion.
+
 ## Measured numbers
 
 ### Production card `612130000012_00016`
@@ -90,6 +160,20 @@ Crop accuracy, every page measured against its true edge by scanline:
 34354 × 25548, 147 pages, 16×13, quality 87.2, otsu 112, ~10 s. Same physical
 card as the production one, shot earlier under the wrong fanearkID.
 
+### Cards segmented 2026-08-22 (with the size filter)
+
+```
+612130000012_00016   147 pages   Card Quality 91.8/100 GOOD   grid 16x13
+612130000012_00032   147 pages   Card Quality 92.7/100 GOOD   grid 16x13
+```
+
+Both initially came out as 148 pages / POOR (58.8 and 59.7) because of a light
+table band along the bottom edge — 33190 x 720 and 33180 x 720. With
+`drop_size_outliers()` both land at 147 pages and GOOD. Size consistency went
+from 0.0 to 98.5 / 98.6.
+
+Both predate the header prepage, so neither has a `page_000.tif`.
+
 ### Constants that matter
 
 | thing | value | full-res equivalent |
@@ -99,7 +183,15 @@ card as the production one, shot earlier under the wrong fanearkID.
 | refine local scale | 0.2 | — |
 | refine erosion | 3×3, 2 iterations | 2 px → **10 px** per side |
 | default margin | 1 % of median page | 20 × 16 px on the production card |
+| size tolerance | 40 % from median page | rejects stitch edge bands (C12) |
+| header scale | 1/16 | 34298 × 2038 band → 2144 × 127, 424 kB |
 | extraction workers | 5 | — |
+
+The header scale is pinned by a downstream constraint, not by taste: the OCR
+pipeline's packaging step caps page width at 2480 px, so 2144 px passes through
+untouched while anything larger is scaled back down immediately. If header OCR
+of small print turns out unreliable, the fix is likely to make the header an
+exception to that cap rather than to raise this number in isolation.
 
 `--refine` on the production-grade card reports avg shift 6 px x / 11 px y from
 the global pass, i.e. the two passes now agree. Before the erosion fix they
@@ -108,7 +200,8 @@ disagreed by ~50 px. Refine is slightly *looser* than the default path
 
 ### Tests
 
-22 tests, ~1.6 s. Unit tests for box geometry and folder lifecycle; four
+32 tests, ~2.6 s. Unit tests for box geometry, folder lifecycle and size
+filtering; end-to-end tests
 end-to-end tests drive the real CLI against a generated 4×3 card.
 
 ---
@@ -117,10 +210,7 @@ end-to-end tests drive the real CLI against a generated 4×3 card.
 
 Do not assume any of this works. None of it has been exercised.
 
-- **Multi-card journals.** No journal has ever spanned two cards here. The
-  `<fid>_00032` naming for card 2 is agreed but has never been produced,
-  segmented, or imported. Grouping and ordering of two cards under one
-  fanearkID is untested end to end.
+- ~~**Multi-card journals.**~~ **PROVEN 2026-08-22** — see below.
 - **Real archival material.** Every run so far has been on *one* physical test
   card containing a Yamaha RD500LC service manual. Never run on real patient
   journals. Page density, contrast, and layout of real cards may differ.
@@ -134,13 +224,20 @@ Do not assume any of this works. None of it has been exercised.
 - **The `error/` folder location.** We write to `<input dir>/error/`, i.e.
   `Panoramas/error/`. There is also a separate `/Volumes/NB02/NHA/Error/` used
   by other stages. These are not the same folder and nobody has reconciled them.
-- **Output root.** `/Volumes/NB02/NHA/Microfiche/` was chosen by inference —
-  it was empty, purpose-named, and created alongside `Error/`.
-  `~/.ocr-pipeline-config.json` does not exist, so `segmenterWatchRoot` is still
-  `""` and there was no authoritative value to read. **Confirm this before
-  trusting it.** If it is wrong the fix is a folder move, not a re-run.
-- **header.json / header_proxy.** We do not produce them. They are optional
-  downstream, but if they ever become required, nothing here writes them.
+- ~~**Output root.**~~ Confirmed 2026-08-22: `/Volumes/NB02/NHA/Microfiche/` is
+  set as `segmenterWatchRoot` in `~/.ocr-pipeline-config.json`. It was originally
+  chosen by inference, before that config file existed, and turned out right.
+- **header.json.** We deliberately do not produce it, and that boundary is
+  agreed: this repo produces the header *image*, the OCR pipeline interprets the
+  text. Do not invent a schema for it.
+- **Header OCR quality.** Nobody has yet OCR'd `page_000.tif`. The plan is to
+  read name and national ID from it — printed far larger there than on the pages
+  — store the text, drop the image, and let the header win on conflict with a
+  flag for review. Whether 1/16 scale is enough for reliable ID digits is
+  untested.
+- **The "N of M" mismatch check.** The header's card index is the only known way
+  to catch an operator forgetting to chain a second card, which otherwise files
+  it under the wrong patient undetectably. Nothing checks it yet.
 
 ---
 
@@ -153,6 +250,9 @@ Do not assume any of this works. None of it has been exercised.
   `python -u` or `PYTHONUNBUFFERED=1` if anything parses progress output.
 - **`-O` is the card folder, not the root.** Easy to get wrong; produces a
   correct-looking folder in the wrong place.
+- **`pages/` holds one more file than the reported page count.** The count comes
+  from detected boxes; the folder also holds the header as page zero. 147
+  reported, 148 files. This is intentional — see C11.
 - **The quality score is information, not a gate.** A card scoring 30/100 is
   processed exactly like one scoring 95/100. Only *zero pages* fails.
 - **Detection never sees a barcode.** fanearkIDs come from the Capture One
@@ -169,7 +269,7 @@ No network needed for any of this.
 **1. Run the suite.**
 
 ```bash
-.venv/bin/python -m pytest test_segment.py -q      # expect 22 passed
+.venv/bin/python -m pytest test_segment.py -q      # expect 32 passed
 ```
 
 **2. Run against a real card and check the folder contract.**
@@ -209,12 +309,16 @@ ls /tmp/check/pages/page_999.tif   # must be gone
 
 ## Open items
 
-- Nothing in this repo was committed today. `segment_microfiche.py`,
-  `requirements.txt`, `README.md`, `HANDOFF.md` and the new `test_segment.py`
-  are all uncommitted working-tree changes.
+- The header prepage is implemented but **off by default** pending Trond's "next
+  round". Enable with `--header-page` when the import side is ready.
+- The OCR-Pipeline app now runs segmentation itself, so this repo may not need to
+  be invoked manually at all. Coordinate before writing into the watch root.
 - The pre-fix output folder on the Desktop
   (`~/Desktop/NHA Mikrofiche/Output/segmented/612130000333_0000736115 Panorama/`)
   still holds coordinates from before the erosion fix, plus a `_done` that the
   OCR app may act on. It was left alone deliberately — unknown whether the app
   already consumed it.
-- Confirm the output root (see UNPROVEN).
+- The output root `/Volumes/NB02/NHA/Microfiche/` is **confirmed**: it is now set
+  as `segmenterWatchRoot` in `~/.ocr-pipeline-config.json`.
+- `main` may be ahead of `origin/main` and unpushed. Check before assuming the
+  remote has this work.

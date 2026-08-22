@@ -103,6 +103,61 @@ def move_to_error_dir(src, error_dir):
     return Path(shutil.move(str(src), str(dest)))
 
 
+# The masked header band is the card's only identifying metadata — title, part
+# number, date, and the "N of M" card index. It is kept as page zero: it sorts
+# ahead of page_001 (the OCR app orders on the last integer in the stem) and is
+# trivial to drop downstream. Scaled right down; at 1/16 the text is still
+# legible while the file is a fraction of a real page.
+HEADER_PAGE_STEM = "page_000"
+HEADER_PROXY_SCALE = 0.0625
+
+
+# A page box may differ from the card's median page by this much before it is
+# treated as something other than a page. Real cards run 97-98% size
+# consistency, so this is deliberately loose — it exists to catch stitch
+# artefacts (edge bands), not to police normal variation.
+SIZE_TOLERANCE_RATIO = 0.4
+
+
+def drop_size_outliers(boxes, contours, tolerance):
+    """Reject detections whose size is nothing like the card's median page.
+
+    The minimum-size filter only catches specks. A bright band along a stitched
+    card edge is the opposite problem: far too wide and too flat to be a page,
+    but far too big to be filtered as noise. Left in, it becomes a blank page in
+    the middle of the sequence and shifts every later page number by one.
+
+    Returns (kept_boxes, kept_contours, dropped_boxes).
+    """
+    if len(boxes) < 4:
+        # Too few to establish what "normal" looks like on this card.
+        return list(boxes), contours, []
+
+    median_w = np.median([b[2] for b in boxes])
+    median_h = np.median([b[3] for b in boxes])
+    if median_w <= 0 or median_h <= 0:
+        return list(boxes), contours, []
+
+    def is_page(box):
+        _, _, w, h = box
+        return (abs(w - median_w) / median_w <= tolerance
+                and abs(h - median_h) / median_h <= tolerance)
+
+    keep = [i for i, b in enumerate(boxes) if is_page(b)]
+
+    # If most boxes look wrong, the median itself is junk — trust nothing and
+    # change nothing, rather than silently discarding most of the card.
+    if len(keep) < len(boxes) / 2:
+        return list(boxes), contours, []
+
+    keep_set = set(keep)
+    kept_boxes = [boxes[i] for i in keep]
+    kept_contours = ([contours[i] for i in keep]
+                     if contours is not None else contours)
+    dropped = [b for i, b in enumerate(boxes) if i not in keep_set]
+    return kept_boxes, kept_contours, dropped
+
+
 def erosion_radius(kernel_size, iterations):
     """Pixels eaten from each side of a blob by cv2.erode with this kernel."""
     return (kernel_size // 2) * iterations
@@ -458,6 +513,11 @@ def main():
                         help='Refine page positions using local high-res re-detection')
     parser.add_argument('--output', '-O', default=None,
                         help='Output directory (default: segmented/<card_name>/ next to input)')
+    parser.add_argument('--header-page', action='store_true',
+                        help='Write the masked header band as pages/page_000.tif '
+                             '(contract C11). Off by default: the import side is '
+                             'still being built, so this round ships 147 files per '
+                             'card, not 148.')
     parser.add_argument('--debug', action='store_true',
                         help='Also write the binary TIFF and box overlay to <card>/_debug/. '
                              'Off by default: the OCR app reads loose image files in the '
@@ -606,6 +666,17 @@ def main():
     boxes = expand_boxes(boxes, detect_radius, binary_img.shape[1], binary_img.shape[0])
     print(f"Compensating erosion: +{detect_radius}px per side "
           f"(+{int(detect_radius / detect_scale)}px at full resolution)")
+
+    # Reject anything that is not page-shaped for this card (stitch edge bands)
+    boxes, filtered_contours, dropped = drop_size_outliers(
+        boxes, filtered_contours, SIZE_TOLERANCE_RATIO)
+    if dropped:
+        scale_up = 1.0 / detect_scale
+        print(f"Rejected {len(dropped)} detection(s) unlike this card's median page:")
+        for (x, y, w, h) in dropped:
+            print(f"  at ({int(x * scale_up)}, {int(y * scale_up)}) "
+                  f"size {int(w * scale_up)} x {int(h * scale_up)} full-res")
+        print(f"{len(boxes)} pages remain")
 
     # === Compute card quality score ===
     quality = compute_card_quality(boxes, filtered_contours)
@@ -798,6 +869,19 @@ def main():
                     print(f"  Progress: {completed}/{len(tasks)} pages extracted")
 
         print(f"\nExtracted {len(boxes_fullres)} pages to {pages_dir}/")
+
+        # Keep the header band as page zero. Everything above the first page row
+        # is masked during detection, and it carries the only text identifying
+        # the card, so throwing it away loses the card's identity.
+        header_px = int(original_height * args.header_skip)
+        if args.header_page and header_px > 0:
+            src = pyvips.Image.new_from_file(input_file, access='random')
+            header = src.crop(0, 0, original_width, header_px).resize(HEADER_PROXY_SCALE)
+            header_path = pages_dir / f"{HEADER_PAGE_STEM}.tif"
+            header.write_to_file(str(header_path), compression='lzw')
+            print(f"Header kept as {header_path.name} "
+                  f"({header.width} x {header.height}, "
+                  f"{HEADER_PROXY_SCALE:.4g} scale of the masked band)")
 
         # Sentinel written LAST, after every page is on disk, and atomically:
         # the OCR app's watch+confirm list treats its presence as "fully

@@ -80,6 +80,7 @@ A card folder holds exactly:
     _done
     page_coordinates.csv
     pages/page_001.tif …
+    pages/page_000.tif    ← only with --header-page (see C11)
 ```
 
 The OCR app has a fallback that reads image files sitting *directly* in the card
@@ -131,6 +132,63 @@ is moved to `<input dir>/error/`, the empty card folder is removed, exit 2.
 `-O` / `--output` names the **card folder**, not the watch root. A caller that
 wants `<root>/<fid>/` must pass `-O <root>/<fid>` itself.
 
+### C11. The header band is kept as page zero
+
+`--header-skip` masks the top of the card during detection so the header is not
+found as a page. That band can be written out as `pages/page_000.tif` with
+`--header-page`.
+
+**Currently off by default.** Trond's call on 2026-08-22: "vi tar header i neste
+runde" — the import side is still being built, so this round ships 147 files per
+card, not 148. The flag exists so turning it on next round is a one-word change
+and cannot happen by accident in between. Nothing about the design below is
+provisional; only the default is.
+
+It carries the card's only identifying text — title, part number, date, and an
+**"N of M" card index**. That index is an independent witness to which card of a
+journal this is. If the operator forgets to chain a second card it receives its
+own fanearkID, and two valid 16-tile cards are indistinguishable downstream;
+the header saying "2 of 2" is the only known way to catch it. It is also printed
+far larger than the same details on the pages themselves, so it is the better
+OCR source, and downstream treats it as authoritative on conflict.
+
+Fixed points:
+
+- **Name `page_000`.** The OCR app sorts pages on the last integer in the stem,
+  so page zero sorts ahead of page 1 with no special casing.
+- **Scale 1/16** (`HEADER_PROXY_SCALE`). Not arbitrary: the downstream packaging
+  step caps page width at 2480 px, and 2144 px passes through untouched. Larger
+  would be scaled back down immediately. All fields stay legible at this size.
+- We do **not** write `header.json`. Producing the image is this repo's job;
+  interpreting the text is the OCR pipeline's. Do not blur that line.
+
+Consequence when enabled, and it is intentional: `pages/` holds one more file
+than the page count we report. `page_coordinates.csv` and the log count
+**detected pages**; the file count is **pages + header**. 147 reported, 148
+files. Downstream must handle both shapes, since cards segmented before and
+after the switch can appear in the same handover.
+
+### C12. Detections that are not page-shaped are rejected
+
+`drop_size_outliers()` discards boxes deviating more than
+`SIZE_TOLERANCE_RATIO` (40 %) from the card's median page in width or height.
+
+The minimum-size filter only catches specks. The opposite failure is a bright
+band along a card edge — far too wide and flat to be a page, far too big to be
+noise. Left in, it becomes a blank page mid-sequence and shifts every later page
+number by one. Observed for real: a 33190 × 720 strip against a 2040 × 1630
+median, which dropped a card from 91.8 GOOD to 58.8 POOR.
+
+Median-relative, so it adapts to any card format. If more than half the boxes
+would be dropped the median itself is untrustworthy, so nothing is dropped.
+Every rejection is logged — never discard silently.
+
+**This treats a symptom.** The band was real photographed content from the light
+table, caused by framing at the copy stand, not by a stitching fault. The filter
+is a robustness invariant worth having regardless, but if edge bands start
+appearing, the camera framing is where to look — not this code and not the
+stitcher.
+
 ---
 
 ## Running it
@@ -152,7 +210,8 @@ the end.
 | `-i, --input` | — | panorama; anything libvips can open |
 | `-O, --output` | `<input dir>/segmented/<stem>/` | the card folder |
 | `-o, --order` | `columns` | `columns` = down then right; `rows` = right then down |
-| `-hs, --header-skip` | `0.08` | fraction of height masked at top (card header) |
+| `-hs, --header-skip` | `0.08` | fraction of height masked at top; the band `--header-page` saves (C11) |
+| `--header-page` | off | write the header band as `pages/page_000.tif` (C11) |
 | `-p, --padding` | `0.01` | crop margin; ≤1 = fraction of median page, >1 = pixels |
 | `--refine` | off | re-detect each page locally at 20 %; slower, slightly looser |
 | `--format` | `tif` | see C7 |
@@ -166,11 +225,13 @@ the end.
 2. Downscale to 10 % and erode to separate touching pages.
 3. Contours → bounding boxes, filtered by minimum page size.
 4. **Expand boxes by the erosion radius** (C1).
-5. Sort into reading order, scale back to full resolution.
-6. Optionally refine each box by re-detecting locally at 20 %.
-7. Score the card (size consistency, grid alignment, spacing, shape).
-8. Crop each page with the margin and write TIFFs in parallel (5 workers).
-9. Write `_done` (C2).
+5. **Reject detections that are not page-shaped** (C12).
+6. Sort into reading order, scale back to full resolution.
+7. Optionally refine each box by re-detecting locally at 20 %.
+8. Score the card (size consistency, grid alignment, spacing, shape).
+9. Crop each page with the margin and write TIFFs in parallel (5 workers).
+10. With `--header-page`, write the header band as `page_000.tif` (C11).
+11. Write `_done` (C2).
 
 ## Tests
 
