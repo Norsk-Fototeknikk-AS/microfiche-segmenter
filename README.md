@@ -223,8 +223,8 @@ which way.
 
 ```bash
 .venv/bin/python -u segment_microfiche.py \
-    -i /Volumes/NB02/NHA/Panoramas/612130000012_00016.tif \
-    -O /Volumes/NB02/NHA/Microfiche/612130000012_00016
+    -i /Users/m4-studio/NHA/Panoramas/612130000012_00016.tif \
+    -O /Users/m4-studio/NHA/Microfiche/612130000012_00016
 ```
 
 Use `python -u`. There is no explicit flushing, so piped stdout is block

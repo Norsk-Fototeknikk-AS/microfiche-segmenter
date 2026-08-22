@@ -10,6 +10,38 @@ where they matter.
 
 ---
 
+## Where the work happens
+
+As of 2026-08-22 the live workflow runs on the **system disk**, not NB02:
+
+```
+/Users/m4-studio/NHA/Panoramas/     panoramas arrive here (our input)
+/Users/m4-studio/NHA/Microfiche/    card folders are written here (our output)
+/Users/m4-studio/NHA/Output/        Capture One's TIFF export
+/Users/m4-studio/NHA/Error/
+/Volumes/NB02/NHA/                  archive; RAW stays there, finished journals move there
+```
+
+`segmenterWatchRoot` in `~/.ocr-pipeline-config.json` points at
+`/Users/m4-studio/NHA/Microfiche`.
+
+Nothing in this repo stores a path — input and output both come from the command
+line, verified by grep, so the move needed no code change. Paths in this document
+are examples and historical records, not configuration.
+
+The move was for **isolation, not speed**. Measured bandwidth differs by only
+2.6-2.9x (NB02 2332 MB/s write, 1771 MB/s random read; internal 6669 and
+2749), but *concurrent* use cost 16x — see "The 16x slowdown was not real".
+Random read is what this tool does when pulling 147 crops out of a gigapixel
+panorama, and NB02 was nearly as good at it. The disk was never the problem;
+the neighbours were.
+
+**Capacity note:** the system disk has ~480 GB free against NB02's ~7.4 TB, and
+each panorama is ~1.14 GB. Archiving panoramas locally (C13's default) fills it
+after roughly 420 cards. Point `--archive-dir` at NB02 if the run is larger.
+
+---
+
 ## What changed 2026-08-21
 
 ### The erosion bug (the important one)
@@ -150,9 +182,9 @@ confident wrong conclusion.
 ### Production card `612130000012_00016`
 
 ```
-input    /Volumes/NB02/NHA/Panoramas/612130000012_00016.tif
+input    Panoramas/612130000012_00016.tif   (on NB02, before the move)
          34354 × 25533 (877 MP), 1.14 GB, 3 bands
-output   /Volumes/NB02/NHA/Microfiche/612130000012_00016/
+output   Microfiche/612130000012_00016/
          147 pages, 730 MB, grid 16×13
 quality  88.1/100 GOOD  (size 98.2, align 76.1, spacing 96.6, shape 88.9)
 runtime  8.2 s wall, ~380 % CPU
@@ -230,11 +262,13 @@ Do not assume any of this works. None of it has been exercised.
   card, never on a real bad scan. Note the failure path *moves the operator's
   source file* — that behaviour has only ever run against throwaway inputs.
 - **The `error/` folder location.** We write to `<input dir>/error/`, i.e.
-  `Panoramas/error/`. There is also a separate `/Volumes/NB02/NHA/Error/` used
-  by other stages. These are not the same folder and nobody has reconciled them.
-- ~~**Output root.**~~ Confirmed 2026-08-22: `/Volumes/NB02/NHA/Microfiche/` is
-  set as `segmenterWatchRoot` in `~/.ocr-pipeline-config.json`. It was originally
-  chosen by inference, before that config file existed, and turned out right.
+  `Panoramas/error/`. There is also a separate `NHA/Error/` used by other stages,
+  and C13's archive sits beside the input rather than inside it. None of these
+  three agree and nobody has reconciled them.
+- ~~**Output root.**~~ Confirmed 2026-08-22: `segmenterWatchRoot` is
+  `/Users/m4-studio/NHA/Microfiche` in `~/.ocr-pipeline-config.json`. It was
+  first chosen by inference as the NB02 equivalent, before that config file
+  existed, and turned out right; it then moved with the rest of the workflow.
 - **header.json.** We deliberately do not produce it, and that boundary is
   agreed: this repo produces the header *image*, the OCR pipeline interprets the
   text. Do not invent a schema for it.
@@ -326,7 +360,8 @@ ls /tmp/check/pages/page_999.tif   # must be gone
   still holds coordinates from before the erosion fix, plus a `_done` that the
   OCR app may act on. It was left alone deliberately — unknown whether the app
   already consumed it.
-- The output root `/Volumes/NB02/NHA/Microfiche/` is **confirmed**: it is now set
-  as `segmenterWatchRoot` in `~/.ocr-pipeline-config.json`.
+- Where the archive should live is **undecided**: C13 defaults to
+  `PanoramaArchive/` beside the input, which is now the system disk. NB02 is the
+  designated archive volume and has 7.4 TB against the system disk's 480 GB.
 - `main` may be ahead of `origin/main` and unpushed. Check before assuming the
   remote has this work.
