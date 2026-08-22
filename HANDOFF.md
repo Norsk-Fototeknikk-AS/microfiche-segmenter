@@ -36,9 +36,24 @@ Random read is what this tool does when pulling 147 crops out of a gigapixel
 panorama, and NB02 was nearly as good at it. The disk was never the problem;
 the neighbours were.
 
-**Capacity note:** the system disk has ~480 GB free against NB02's ~7.4 TB, and
-each panorama is ~1.14 GB. Archiving panoramas locally (C13's default) fills it
-after roughly 420 cards. Point `--archive-dir` at NB02 if the run is larger.
+**Capacity, resolved:** the system disk has ~480 GB free and each panorama is
+~1.14 GB, so archiving locally forever would fill it after ~420 cards. It does
+not accumulate: panoramas are deleted at *journal end*, by the mover that copies
+a finished journal to NB02. Only journals in flight hold one — roughly 24 at a
+time, so about 55 GB. C13's default (`PanoramaArchive/` beside the input) is
+correct as it stands.
+
+Deliberately **not** deleted at segmentation. The panorama was needed again twice
+on 2026-08-22 — once when a light table band became a false page 6, once when the
+size filter went in — and both times `_done` was present and the card looked
+finished. The quality score was the only hint, and it is information, not a gate.
+PTGui deletes its tiles, so the way back from a lost panorama is re-stitching
+from RAW, not a copy.
+
+RAW does land on `/Volumes/NB02/NHA/Capture` (verified 2026-08-22: 32 `.iiq`,
+4.1 GB, two fanearkIDs) — but that is the *current* round only, not a complete
+historical archive, and earlier shoots went to the Capture One session Trash.
+Do not treat RAW as a general safety net for anything already segmented.
 
 ---
 
