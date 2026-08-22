@@ -50,10 +50,18 @@ finished. The quality score was the only hint, and it is information, not a gate
 PTGui deletes its tiles, so the way back from a lost panorama is re-stitching
 from RAW, not a copy.
 
-RAW does land on `/Volumes/NB02/NHA/Capture` (verified 2026-08-22: 32 `.iiq`,
-4.1 GB, two fanearkIDs) — but that is the *current* round only, not a complete
-historical archive, and earlier shoots went to the Capture One session Trash.
-Do not treat RAW as a general safety net for anything already segmented.
+RAW is **not** currently written to `/Volumes/NB02/NHA/Capture` at capture time.
+On 2026-08-22 that folder held 32 `.iiq` (4.1 GB), but their mtimes were 07:41
+while their ctimes were 10:26 — they were shot elsewhere and moved in by hand
+hours later. Until Capture One writes there during capture, RAW safety depends on
+someone remembering to move files. It also covers the current round only; earlier
+shoots went to the Capture One session Trash. Do not treat RAW as a general
+safety net for anything already segmented.
+
+(That mtime/ctime distinction cost a wrong conclusion here: a move preserves
+mtime, so mtime answers "when was this shot", not "when did this arrive". Reading
+one as the other is the same failure as the two-variable benchmark above — a true
+number answering a different question.)
 
 ---
 
