@@ -324,6 +324,13 @@ Do not assume any of this works. None of it has been exercised.
   AppleScript chain (`~/Projects/CaptureOneNamer`, counter over `names.txt`),
   not from anything on the card. If IDs look wrong, the cause is upstream —
   no rule applied to filenames here can recover a correct ID.
+- **Do not add fanearkID validation here.** This tool sees one finished
+  panorama, never the 16 tiles it was stitched from, so it cannot tell a card
+  whose tiles carried mixed or unissued IDs from a clean one — it just inherits
+  the name verbatim (C6). The OCR pipeline's preflight runs before stitching,
+  sees the tiles, and fails on both mixed prefixes and IDs absent from the
+  register. That is the right place for it; duplicating it here would only be
+  able to guess.
 
 ---
 
