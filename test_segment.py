@@ -89,7 +89,7 @@ def test_expand_with_zero_radius_is_identity():
 
 from segment_microfiche import (
     DONE_SENTINEL,
-    move_to_error_dir,
+    move_without_clobber,
     prepare_card_dir,
     write_done_sentinel,
 )
@@ -140,23 +140,23 @@ def test_write_done_sentinel_is_repeatable(tmp_path):
     assert (tmp_path / DONE_SENTINEL).is_file()
 
 
-def test_move_to_error_dir_relocates_the_source(tmp_path):
+def test_error_move_relocates_the_source(tmp_path):
     src = tmp_path / "612130000333_0000736115 Panorama.jpg"
     src.write_bytes(b"scan")
-    dest = move_to_error_dir(src, tmp_path / "error")
+    dest = move_without_clobber(src, tmp_path / "error")
     assert not src.exists()
     assert dest.read_bytes() == b"scan"
     assert dest.parent.name == "error"
 
 
-def test_move_to_error_dir_does_not_clobber_an_earlier_failure(tmp_path):
+def test_error_move_does_not_clobber_an_earlier_failure(tmp_path):
     err = tmp_path / "error"
     err.mkdir()
     (err / "card.jpg").write_bytes(b"first failure")
 
     src = tmp_path / "card.jpg"
     src.write_bytes(b"second failure")
-    dest = move_to_error_dir(src, err)
+    dest = move_without_clobber(src, err)
 
     assert (err / "card.jpg").read_bytes() == b"first failure"
     assert dest.read_bytes() == b"second failure"
@@ -239,11 +239,12 @@ def test_rerun_clears_stale_pages_end_to_end(tmp_path):
     n = make_card(src)
     out = tmp_path / "card"
 
-    assert run_segmenter("-i", str(src), "-O", str(out)).returncode == 0
+    # --no-archive: re-running needs the panorama to stay put.
+    assert run_segmenter("-i", str(src), "-O", str(out), "--no-archive").returncode == 0
     stale = out / "pages" / "page_099.tif"
     stale.write_bytes(b"leftover")
 
-    assert run_segmenter("-i", str(src), "-O", str(out)).returncode == 0
+    assert run_segmenter("-i", str(src), "-O", str(out), "--no-archive").returncode == 0
     assert not stale.exists()
     assert len(real_pages(out)) == n
 
@@ -254,7 +255,7 @@ def test_skip_extraction_does_not_destroy_existing_pages(tmp_path):
     n = make_card(src)
     out = tmp_path / "card"
 
-    assert run_segmenter("-i", str(src), "-O", str(out)).returncode == 0
+    assert run_segmenter("-i", str(src), "-O", str(out), "--no-archive").returncode == 0
     assert len(real_pages(out)) == n
 
     proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
@@ -400,3 +401,88 @@ def test_header_prepage_is_off_by_default(tmp_path):
     assert run_segmenter("-i", str(src), "-O", str(out)).returncode == 0
     assert not (out / "pages" / f"{HEADER_PAGE_STEM}.tif").exists()
     assert len(list((out / "pages").glob("page_*.tif"))) == n
+
+
+# --- Archiving the source panorama -----------------------------------------
+# Panoramas/ is a work queue: once a card is segmented its panorama moves to
+# PanoramaArchive/ so what remains in Panoramas/ is what still needs doing.
+
+from segment_microfiche import ARCHIVE_DIR_NAME, move_without_clobber
+
+
+def test_move_without_clobber_relocates(tmp_path):
+    src = tmp_path / "612130000012_00016.tif"
+    src.write_bytes(b"panorama")
+    dest = move_without_clobber(src, tmp_path / ARCHIVE_DIR_NAME)
+    assert not src.exists()
+    assert dest.read_bytes() == b"panorama"
+    assert dest.parent.name == ARCHIVE_DIR_NAME
+
+
+def test_move_without_clobber_keeps_an_existing_file(tmp_path):
+    dest_dir = tmp_path / ARCHIVE_DIR_NAME
+    dest_dir.mkdir()
+    (dest_dir / "card.tif").write_bytes(b"earlier")
+
+    src = tmp_path / "card.tif"
+    src.write_bytes(b"later")
+    dest = move_without_clobber(src, dest_dir)
+
+    assert (dest_dir / "card.tif").read_bytes() == b"earlier"
+    assert dest.read_bytes() == b"later"
+    assert dest.name != "card.tif"
+
+
+def test_panorama_is_archived_after_a_successful_run(tmp_path):
+    panoramas = tmp_path / "Panoramas"
+    panoramas.mkdir()
+    src = panoramas / "612130000012_00016.jpg"
+    make_card(src)
+    out = tmp_path / "card"
+
+    assert run_segmenter("-i", str(src), "-O", str(out)).returncode == 0
+
+    assert not src.exists(), "panorama left in the work queue"
+    archived = tmp_path / ARCHIVE_DIR_NAME / "612130000012_00016.jpg"
+    assert archived.exists(), "panorama not in the archive"
+    assert (out / DONE_SENTINEL).exists()
+
+
+def test_archiving_can_be_turned_off(tmp_path):
+    panoramas = tmp_path / "Panoramas"
+    panoramas.mkdir()
+    src = panoramas / "612130000012_00016.jpg"
+    make_card(src)
+
+    assert run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--no-archive").returncode == 0
+    assert src.exists(), "panorama archived despite --no-archive"
+
+
+def test_skip_extraction_never_archives(tmp_path):
+    """Inspection mode must not move the operator's source."""
+    panoramas = tmp_path / "Panoramas"
+    panoramas.mkdir()
+    src = panoramas / "612130000012_00016.jpg"
+    make_card(src)
+
+    assert run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction").returncode == 0
+    assert src.exists(), "inspection mode moved the source"
+
+
+def test_a_failed_card_goes_to_error_not_the_archive(tmp_path):
+    panoramas = tmp_path / "Panoramas"
+    panoramas.mkdir()
+    src = panoramas / "612130000999_00016.jpg"
+    # Specks only: blobs exist but none survive the minimum-page-size filter.
+    a = np.zeros((1500, 2000), 'uint8')
+    for yy in range(100, 1400, 300):
+        for xx in range(100, 1900, 400):
+            a[yy:yy + 12, xx:xx + 12] = 255
+    pyvips.Image.new_from_memory(a.tobytes(), 2000, 1500, 1, 'uchar').write_to_file(str(src))
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert (panoramas / "error" / src.name).exists(), "not moved to error/"
+    assert not (tmp_path / ARCHIVE_DIR_NAME).exists(), "failed card was archived"

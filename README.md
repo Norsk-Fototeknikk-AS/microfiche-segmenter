@@ -189,6 +189,34 @@ is a robustness invariant worth having regardless, but if edge bands start
 appearing, the camera framing is where to look — not this code and not the
 stitcher.
 
+### C13. A segmented panorama leaves the queue
+
+`Panoramas/` is a work queue. After a card is successfully segmented, its
+panorama is moved to `PanoramaArchive/` **beside** that folder, so what remains
+in `Panoramas/` is exactly what still needs doing.
+
+Ordering is deliberate: the move happens **after** `_done`, never before. If the
+move fails the card is still complete and importable and only needs filing by
+hand; the reverse would leave a published card whose source had vanished
+mid-write.
+
+- Only on success. A card that detects no pages goes to `error/` instead (C9) and
+  is never archived.
+- Never under `--skip-extraction`. Inspection must not move the operator's
+  source (C4).
+- Never overwrites. A name collision means two different scans share a name, so
+  the incoming file gets a numeric suffix instead of destroying the resident one.
+- `--no-archive` leaves it in place; `--archive-dir` overrides the location.
+
+**Consequence for re-runs:** re-running a card is no longer just re-running the
+same command — the panorama has moved, so point at the archived copy or pass
+`--no-archive` on the first run. C3 still guarantees the *card folder* is safe to
+rewrite; it is the input that is no longer where it was.
+
+Known wart: failed scans go to `error/` *inside* the input folder, while the
+archive sits *beside* it. Those two should probably agree. Nobody has decided
+which way.
+
 ---
 
 ## Running it
@@ -212,6 +240,8 @@ the end.
 | `-o, --order` | `columns` | `columns` = down then right; `rows` = right then down |
 | `-hs, --header-skip` | `0.08` | fraction of height masked at top; the band `--header-page` saves (C11) |
 | `--header-page` | off | write the header band as `pages/page_000.tif` (C11) |
+| `--no-archive` | off | leave the panorama in place instead of archiving (C13) |
+| `--archive-dir` | `../PanoramaArchive` | where an archived panorama goes |
 | `-p, --padding` | `0.01` | crop margin; ≤1 = fraction of median page, >1 = pixels |
 | `--refine` | off | re-detect each page locally at 20 %; slower, slightly looser |
 | `--format` | `tif` | see C7 |
@@ -232,6 +262,7 @@ the end.
 9. Crop each page with the margin and write TIFFs in parallel (5 workers).
 10. With `--header-page`, write the header band as `page_000.tif` (C11).
 11. Write `_done` (C2).
+12. Move the panorama to `PanoramaArchive/` (C13).
 
 ## Tests
 

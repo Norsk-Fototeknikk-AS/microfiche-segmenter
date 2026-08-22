@@ -88,16 +88,26 @@ def write_done_sentinel(out_dir):
     os.replace(tmp, out_dir / DONE_SENTINEL)
 
 
-def move_to_error_dir(src, error_dir):
-    """Move a failed source scan aside, without overwriting an earlier failure."""
-    src = Path(src)
-    error_dir = Path(error_dir)
-    error_dir.mkdir(parents=True, exist_ok=True)
+# Panoramas/ is a work queue: a segmented card's panorama is moved out of it so
+# what remains is what still needs doing. Sits alongside Panoramas/, not inside.
+ARCHIVE_DIR_NAME = "PanoramaArchive"
 
-    dest = error_dir / src.name
+
+def move_without_clobber(src, dest_dir):
+    """Move a file into dest_dir, never overwriting something already there.
+
+    Used both for archiving a finished panorama and for setting a failed scan
+    aside. A collision means two different scans share a name, so the incoming
+    one gets a numeric suffix rather than destroying the resident file.
+    """
+    src = Path(src)
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    dest = dest_dir / src.name
     n = 1
     while dest.exists():
-        dest = error_dir / f"{src.stem}_{n}{src.suffix}"
+        dest = dest_dir / f"{src.stem}_{n}{src.suffix}"
         n += 1
 
     return Path(shutil.move(str(src), str(dest)))
@@ -513,6 +523,14 @@ def main():
                         help='Refine page positions using local high-res re-detection')
     parser.add_argument('--output', '-O', default=None,
                         help='Output directory (default: segmented/<card_name>/ next to input)')
+    parser.add_argument('--no-archive', action='store_true',
+                        help='Leave the source panorama in place. By default a '
+                             'successfully segmented panorama is moved to '
+                             f'../{ARCHIVE_DIR_NAME}/ so Panoramas/ holds only '
+                             'what still needs doing.')
+    parser.add_argument('--archive-dir', default=None,
+                        help=f'Where to archive the panorama (default: '
+                             f'{ARCHIVE_DIR_NAME}/ beside the input folder)')
     parser.add_argument('--header-page', action='store_true',
                         help='Write the masked header band as pages/page_000.tif '
                              '(contract C11). Off by default: the import side is '
@@ -647,7 +665,7 @@ def main():
         print("  No _done sentinel written — this card will not be offered for import.",
               file=sys.stderr)
         if not args.skip_extraction:
-            moved = move_to_error_dir(input_path, input_path.parent / "error")
+            moved = move_without_clobber(input_path, input_path.parent / "error")
             print(f"  Source scan moved to {moved}", file=sys.stderr)
             # Leave no empty card folder cluttering the watch root
             try:
@@ -888,6 +906,19 @@ def main():
         # written" and only then offers the card for import (without it the app
         # falls back to a 120 s quiet-period heuristic).
         write_done_sentinel(out_dir)
+
+        # Card is complete and published; take the panorama out of the queue.
+        # After the sentinel, never before: if this move fails the card is still
+        # valid and importable, it just needs filing by hand.
+        if not args.no_archive:
+            archive_dir = (Path(args.archive_dir) if args.archive_dir
+                           else input_path.parent.parent / ARCHIVE_DIR_NAME)
+            try:
+                archived = move_without_clobber(input_path, archive_dir)
+                print(f"Panorama archived to {archived}")
+            except OSError as exc:
+                print(f"WARNING: could not archive {input_path}: {exc}",
+                      file=sys.stderr)
 
     print("\nDone!")
     return 0

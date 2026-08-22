@@ -91,6 +91,14 @@ image is then carried as a sidecar rather than deleted — on a name or national
 conflict with the pages, **the header wins**, and the discrepancy is flagged for
 review with the header image shown next to the disputed field.
 
+### Segmented panoramas leave the work queue
+
+Contract C13: on success the panorama moves to `PanoramaArchive/` beside
+`Panoramas/`, after `_done`. Watch the re-run consequence — the input is no
+longer where it was, so re-running a card means pointing at the archived copy or
+having passed `--no-archive`. Two existing tests had to opt out of archiving for
+exactly this reason, which is a fair warning about how it changes habits.
+
 ### Non-page-shaped detections are rejected
 
 `drop_size_outliers()`, contract C12. Added after both production cards came out
