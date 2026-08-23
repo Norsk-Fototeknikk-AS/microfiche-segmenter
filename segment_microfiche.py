@@ -531,11 +531,14 @@ def main():
     parser.add_argument('--archive-dir', default=None,
                         help=f'Where to archive the panorama (default: '
                              f'{ARCHIVE_DIR_NAME}/ beside the input folder)')
+    parser.add_argument('--no-header-page', action='store_true',
+                        help='Do not write the masked header band as '
+                             'pages/page_000.tif (contract C11).')
     parser.add_argument('--header-page', action='store_true',
-                        help='Write the masked header band as pages/page_000.tif '
-                             '(contract C11). Off by default: the import side is '
-                             'still being built, so this round ships 147 files per '
-                             'card, not 148.')
+                        help='Deprecated no-op: writing the header is the default '
+                             'as of 2026-08-23. Still accepted so existing callers '
+                             'do not fail — argparse exits 2 on an unknown flag, '
+                             'which collides with EXIT_NO_PAGES.')
     parser.add_argument('--debug', action='store_true',
                         help='Also write the binary TIFF and box overlay to <card>/_debug/. '
                              'Off by default: the OCR app reads loose image files in the '
@@ -892,7 +895,7 @@ def main():
         # is masked during detection, and it carries the only text identifying
         # the card, so throwing it away loses the card's identity.
         header_px = int(original_height * args.header_skip)
-        if args.header_page and header_px > 0:
+        if not args.no_header_page and header_px > 0:
             src = pyvips.Image.new_from_file(input_file, access='random')
             header = src.crop(0, 0, original_width, header_px).resize(HEADER_PROXY_SCALE)
             header_path = pages_dir / f"{HEADER_PAGE_STEM}.tif"

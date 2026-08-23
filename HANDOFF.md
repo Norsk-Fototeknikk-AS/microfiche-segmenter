@@ -133,12 +133,16 @@ every run. It can now be written as `pages/page_000.tif` at 1/16 scale via
 `--header-page`. See contract C11 in the README for why the name, the scale, and
 the boundary at `header.json` are all fixed points rather than preferences.
 
-**The flag is off by default for now** — Trond deferred the header to the next
-round so the import side can be finished and tested against a card that has no
-`page_000` first. Downstream deliberately supports both shapes, because a
-half-finished handover can contain cards from either side of the change, and
-that kind of transition is what breaks quietly. Turn it on when the import side
-is ready.
+**On by default since 2026-08-23.** It shipped off for one day while the import
+side was built, then was switched on once that side proved it handles page zero:
+294 journal pages counted from 296 files across two cards, with both headers
+carried as sidecars. Downstream deliberately supports both shapes, because a
+half-finished handover can contain cards from either side of the change, and that
+kind of transition is what breaks quietly.
+
+`--no-header-page` suppresses it. `--header-page` survives as a no-op: argparse
+exits 2 on an unknown flag, and 2 is EXIT_NO_PAGES, so a caller passing the old
+flag would look exactly like a card that detected nothing.
 
 What the header is for, decided the same day: it is OCR'd with a field-oriented
 prompt (a card header is fields, not prose), the text is stored per card, and the
@@ -381,8 +385,11 @@ ls /tmp/check/pages/page_999.tif   # must be gone
 
 ## Open items
 
-- The header prepage is implemented but **off by default** pending Trond's "next
-  round". Enable with `--header-page` when the import side is ready.
+- The two cards under `Microfiche/612130000029_*` were segmented **before** the
+  header default flipped, so they have no `page_000`. Their journals were mid-
+  pipeline at the time; re-segmenting a card mid-run purges `pages/` and would
+  break it. If headers are wanted for them, do it after those journals finish and
+  before the mover deletes their panoramas from `PanoramaArchive/`.
 - The OCR-Pipeline app now runs segmentation itself, so this repo may not need to
   be invoked manually at all. Coordinate before writing into the watch root.
 - The pre-fix output folder on the Desktop

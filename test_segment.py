@@ -391,16 +391,38 @@ def test_no_header_prepage_when_header_skip_is_zero(tmp_path):
     assert len(real_pages(out)) == n
 
 
-def test_header_prepage_is_off_by_default(tmp_path):
-    """This round ships 147 files per card; page zero is opt-in until the
-    import side is ready to handle it."""
+def test_header_prepage_is_on_by_default(tmp_path):
+    """The import side handles page zero as of 2026-08-23, so it ships."""
     src = tmp_path / "612130000012_00016.jpg"
     n = make_card(src)
     out = tmp_path / "card"
 
     assert run_segmenter("-i", str(src), "-O", str(out)).returncode == 0
+    assert (out / "pages" / f"{HEADER_PAGE_STEM}.tif").exists()
+    assert len(list((out / "pages").glob("page_*.tif"))) == n + 1
+
+
+def test_header_prepage_can_be_suppressed(tmp_path):
+    src = tmp_path / "612130000012_00016.jpg"
+    n = make_card(src)
+    out = tmp_path / "card"
+
+    assert run_segmenter("-i", str(src), "-O", str(out),
+                         "--no-header-page").returncode == 0
     assert not (out / "pages" / f"{HEADER_PAGE_STEM}.tif").exists()
     assert len(list((out / "pages").glob("page_*.tif"))) == n
+
+
+def test_header_page_flag_still_accepted(tmp_path):
+    """The app may already pass --header-page. It must not become an error:
+    argparse exits 2 on an unknown flag, which collides with EXIT_NO_PAGES."""
+    src = tmp_path / "612130000012_00016.jpg"
+    make_card(src)
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--header-page")
+    assert proc.returncode == 0, proc.stderr
+    assert (out / "pages" / f"{HEADER_PAGE_STEM}.tif").exists()
 
 
 # --- Archiving the source panorama -----------------------------------------

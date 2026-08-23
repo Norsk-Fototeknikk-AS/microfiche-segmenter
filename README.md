@@ -79,8 +79,8 @@ A card folder holds exactly:
 <card>/
     _done
     page_coordinates.csv
+    pages/page_000.tif    ← the card header (C11)
     pages/page_001.tif …
-    pages/page_000.tif    ← only with --header-page (see C11)
 ```
 
 The OCR app has a fallback that reads image files sitting *directly* in the card
@@ -135,14 +135,15 @@ wants `<root>/<fid>/` must pass `-O <root>/<fid>` itself.
 ### C11. The header band is kept as page zero
 
 `--header-skip` masks the top of the card during detection so the header is not
-found as a page. That band can be written out as `pages/page_000.tif` with
-`--header-page`.
+found as a page. That band is written out as `pages/page_000.tif`.
 
-**Currently off by default.** Trond's call on 2026-08-22: "vi tar header i neste
-runde" — the import side is still being built, so this round ships 147 files per
-card, not 148. The flag exists so turning it on next round is a one-word change
-and cannot happen by accident in between. Nothing about the design below is
-provisional; only the default is.
+**On by default since 2026-08-23**, once the import side could handle it:
+`split_scan_dump._journal_pages` separates page zero from the page sequence and
+carries it as a sidecar in `00_header/` named after the card, and step 03 reads
+it with a field-oriented prompt. `--no-header-page` suppresses it.
+`--header-page` is still accepted as a no-op so callers written during the
+opt-in period do not break — argparse exits 2 on an unknown flag, which would be
+indistinguishable from EXIT_NO_PAGES.
 
 It carries the card's only identifying text — title, part number, date, and an
 **"N of M" card index**. That index is an independent witness to which card of a
@@ -238,8 +239,8 @@ the end.
 | `-i, --input` | — | panorama; anything libvips can open |
 | `-O, --output` | `<input dir>/segmented/<stem>/` | the card folder |
 | `-o, --order` | `columns` | `columns` = down then right; `rows` = right then down |
-| `-hs, --header-skip` | `0.08` | fraction of height masked at top; the band `--header-page` saves (C11) |
-| `--header-page` | off | write the header band as `pages/page_000.tif` (C11) |
+| `-hs, --header-skip` | `0.08` | fraction of height masked at top; this band becomes `page_000.tif` (C11). `0` disables both |
+| `--no-header-page` | off | suppress the header band `pages/page_000.tif` (C11) |
 | `--no-archive` | off | leave the panorama in place instead of archiving (C13) |
 | `--archive-dir` | `../PanoramaArchive` | where an archived panorama goes |
 | `-p, --padding` | `0.01` | crop margin; ≤1 = fraction of median page, >1 = pixels |
@@ -260,7 +261,7 @@ the end.
 7. Optionally refine each box by re-detecting locally at 20 %.
 8. Score the card (size consistency, grid alignment, spacing, shape).
 9. Crop each page with the margin and write TIFFs in parallel (5 workers).
-10. With `--header-page`, write the header band as `page_000.tif` (C11).
+10. Write the header band as `page_000.tif` (C11).
 11. Write `_done` (C2).
 12. Move the panorama to `PanoramaArchive/` (C13).
 
