@@ -156,7 +156,14 @@ OCR source, and downstream treats it as authoritative on conflict.
 Fixed points:
 
 - **Name `page_000`.** The OCR app sorts pages on the last integer in the stem,
-  so page zero sorts ahead of page 1 with no special casing.
+  so page zero sorts ahead of page 1 with no special casing. This name is
+  load-bearing, not cosmetic: the import step recognises the header *by its
+  natural index being 0* and diverts it to a `00_header/` sidecar. Rename it —
+  to `header.tif` or anything without a trailing 0 — and it stops being
+  recognised, flows on as an ordinary page, and the packaging step numbers it
+  from 1 without inspecting what it is. The header would then be delivered in a
+  patient's record as page 00001. Packaging has no guard of its own; the name is
+  the whole mechanism.
 - **Scale 1/16** (`HEADER_PROXY_SCALE`). Not arbitrary: the downstream packaging
   step caps page width at 2480 px, and 2144 px passes through untouched. Larger
   would be scaled back down immediately. All fields stay legible at this size.
