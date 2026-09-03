@@ -448,6 +448,54 @@ def test_drops_a_tall_narrow_strip():
     assert dropped == [(50, 100, 600, 24000)]
 
 
+def test_keeps_a_merged_row_of_pages():
+    """Weak page edges can fuse a whole row into one detection: 3-4 pages wide
+    but FULL page height. That is merged content, not a stitch band - dropping
+    it silently loses every page in the row (reported by Trond 2026-09-03).
+    A real band is a thin sliver (documented: 720 high vs 1630 median, 0.44x);
+    width cannot discriminate, since a full-width band and a fully merged
+    16-page row are equally wide. Height is the tell."""
+    merged_row = (100, 200, 3 * 2040 + 2 * 60, 1630)
+    boxes = _grid() + [merged_row]
+    kept, _, dropped = drop_band_detections(boxes, None, BAND_RATIO)
+    assert dropped == []
+    assert merged_row in kept
+
+
+def test_still_drops_a_sliver_band_at_page_multiple_width():
+    """The discriminator must be thinness, not width: a sliver exactly as wide
+    as 3 pages is still a band, because no page is 0.4x the median height."""
+    sliver = (100, 24770, 3 * 2040 + 2 * 60, 700)
+    boxes = _grid() + [sliver]
+    kept, _, dropped = drop_band_detections(boxes, None, BAND_RATIO)
+    assert dropped == [sliver]
+
+
+def test_a_merged_row_is_kept_and_warned_about_end_to_end(tmp_path):
+    """Weak edges fuse a row at detect scale. The row must survive as ONE
+    detection (content present, inspectable in the viz) and the log must warn
+    loudly, so inspection mode shows the problem without squinting at boxes."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.zeros((1500, 2000), 'uint8')
+    for r in range(3):
+        for c in range(4):
+            y, x = 200 + r * 420, 60 + c * 480
+            a[y:y + 340, x:x + 400] = 255
+    # Top row: bridge the gaps so thresholding fuses it into one blob.
+    a[200:540, 60:60 + 3 * 480 + 400] = 255
+    pyvips.Image.new_from_memory(a.tobytes(), 2000, 1500, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
+    assert proc.returncode == 0, proc.stderr
+    rows = [line for line in (out / "page_coordinates.csv").read_text().splitlines()
+            if line and not line.startswith(("#", "page"))]
+    assert len(rows) == 9, rows  # 8 single pages + the fused row, nothing dropped
+    # NB: tmp_path contains "merged" (pytest names it after the test) and
+    # stdout prints paths, so match the warning phrase, not the bare word.
+    assert "suspected merged pages" in proc.stdout.lower()
+
+
 def test_keeps_contours_aligned_with_kept_boxes():
     boxes = _grid(6) + [(0, 0, 33208, 732)]
     contours = [f"c{i}" for i in range(7)]

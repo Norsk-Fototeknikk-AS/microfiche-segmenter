@@ -187,11 +187,21 @@ after the switch can appear in the same handover.
 ### C12. Detections that are not page-shaped are rejected
 
 `drop_band_detections()` discards boxes shaped like bands: more than
-`BAND_RATIO` (2.5×) the card's median page in one dimension while at or under
-the median in the other. Shape, not size (2026-09-03): real journals hold pages
-of genuinely different sizes, so mere deviation from the median — the old 40 %
-`SIZE_TOLERANCE_RATIO` rule — is not evidence against being a page, and losing
-a real page costs more than keeping a blank crop.
+`BAND_RATIO` (2.5×) the card's median page in one dimension while a thin
+*sliver* — at most `BAND_MAX_THICKNESS` (0.75×) of the median — in the other.
+Shape, not size (2026-09-03): real journals hold pages of genuinely different
+sizes, so mere deviation from the median — the old 40 % `SIZE_TOLERANCE_RATIO`
+rule — is not evidence against being a page, and losing a real page costs more
+than keeping a blank crop.
+
+The sliver criterion exists because weak page edges can fuse a whole **row**
+into one detection: several pages wide but full page height (reported on real
+material 2026-09-03). Width cannot tell a merged row from a band — a
+full-width band and a fully merged row are equally wide — but thinness can:
+the documented real band was 0.44× the median height, and no page is that
+flat. A merged row is kept and warned about (`suspected merged pages` in the
+log); splitting it is a known follow-up, pending a real failing card to
+verify against.
 
 The minimum-size filter only catches specks. The opposite failure is a bright
 band along a card edge — far too wide and flat to be a page, far too big to be

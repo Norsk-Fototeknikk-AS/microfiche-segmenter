@@ -129,10 +129,18 @@ HEADER_PROXY_SCALE = 0.0625
 
 
 # A detection this many times wider/taller than the median page, while the
-# other dimension is at or under the median, is a stitch band - not a page.
-# Deliberately a SHAPE test: size alone says nothing, because real journals
-# hold pages of genuinely different sizes.
+# other dimension is a thin SLIVER of the median, is a stitch band - not a
+# page. Deliberately a SHAPE test: size alone says nothing, because real
+# journals hold pages of genuinely different sizes.
 BAND_RATIO = 2.5
+
+# The sliver criterion (2026-09-03): weak page edges can fuse a whole ROW into
+# one detection - several pages wide but FULL page height. Width cannot tell a
+# merged row from a band (a full-width band and a fully merged row are equally
+# wide); thinness can. The documented real band was 0.44x the median height; no
+# real page is anywhere near that flat. Above this the box is merged content -
+# kept, never dropped, until splitting exists.
+BAND_MAX_THICKNESS = 0.75
 
 
 def drop_band_detections(boxes, contours, band_ratio):
@@ -163,8 +171,10 @@ def drop_band_detections(boxes, contours, band_ratio):
 
     def is_page(box):
         _, _, w, h = box
-        wide_band = w > median_w * band_ratio and h <= median_h
-        tall_band = h > median_h * band_ratio and w <= median_w
+        wide_band = (w > median_w * band_ratio
+                     and h <= median_h * BAND_MAX_THICKNESS)
+        tall_band = (h > median_h * band_ratio
+                     and w <= median_w * BAND_MAX_THICKNESS)
         return not (wide_band or tall_band)
 
     keep = [i for i, b in enumerate(boxes) if is_page(b)]
@@ -746,6 +756,21 @@ def main():
             print(f"  at ({int(x * scale_up)}, {int(y * scale_up)}) "
                   f"size {int(w * scale_up)} x {int(h * scale_up)} full-res")
         print(f"{len(boxes)} pages remain")
+
+    # Warn loudly about kept boxes that look like several pages fused into one
+    # (weak edges at detect scale). They are kept - dropping loses content -
+    # but the operator must see it in the log, not just as a wide box in the
+    # viz. Splitting is a known follow-up, pending a real failing card.
+    if len(boxes) >= 4:
+        med_w = np.median([b[2] for b in boxes])
+        med_h = np.median([b[3] for b in boxes])
+        scale_up = 1.0 / detect_scale
+        for (x, y, w, h) in boxes:
+            if w > med_w * 1.5 or h > med_h * 1.5:
+                print(f"WARNING: suspected merged pages "
+                      f"(~{max(round(w / med_w), round(h / med_h))} fused): "
+                      f"at ({int(x * scale_up)}, {int(y * scale_up)}) "
+                      f"size {int(w * scale_up)} x {int(h * scale_up)} full-res")
 
     # === Compute card quality score ===
     quality = compute_card_quality(boxes, filtered_contours)

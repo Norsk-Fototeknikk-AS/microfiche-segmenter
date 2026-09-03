@@ -250,7 +250,7 @@ Both predate the header prepage, so neither has a `page_000.tif`.
 | refine local scale | 0.2 | — |
 | refine erosion | 3×3, 2 iterations | 2 px → **10 px** per side |
 | default margin | 3 % of median page (1 % until 2026-09-03) | 61 × 49 px on the production card |
-| band ratio | 2.5× median in one dimension, ≤ median in the other (shape test since 2026-09-03; was a 40 % size tolerance) | rejects stitch edge bands (C12) |
+| band ratio | 2.5× median in one dimension, ≤ 0.75× median in the other (sliver test since 2026-09-03; was a 40 % size tolerance) | rejects stitch edge bands, keeps merged rows (C12) |
 | header scale | 1/16 | 34298 × 2038 band → 2144 × 127, 424 kB |
 | extraction workers | 5 | — |
 
@@ -267,7 +267,7 @@ disagreed by ~50 px. Refine is slightly *looser* than the default path
 
 ### Tests
 
-51 tests, ~6 s (was 32 when this was written). Unit tests for box
+54 tests, ~6 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 
