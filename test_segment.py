@@ -229,7 +229,7 @@ def test_end_to_end_writes_the_card_contract(tmp_path):
     assert proc.returncode == 0, proc.stderr
 
     assert sorted(p.name for p in out.iterdir()) == [
-        DONE_SENTINEL, "page_coordinates.csv", "pages"]
+        "_debug", DONE_SENTINEL, "page_coordinates.csv", "pages"]
     assert len(real_pages(out)) == n
     assert "Card Quality:" in (out / "page_coordinates.csv").read_text().splitlines()[0]
 
@@ -264,6 +264,36 @@ def test_skip_extraction_does_not_destroy_existing_pages(tmp_path):
     assert (out / DONE_SENTINEL).exists(), "sentinel removed from a still-valid card"
 
 
+def test_visualization_is_written_without_debug_flag(tmp_path):
+    """The operator's ground truth: one image showing what was found, in which
+    order - available on every run, offline, without re-running anything.
+    Heavy artifacts (the full-res binary) stay behind --debug."""
+    src = tmp_path / "612130000012_00012.jpg"
+    make_card(src)
+    out = tmp_path / "card"
+
+    assert run_segmenter("-i", str(src), "-O", str(out), "--no-archive").returncode == 0
+    assert (out / "_debug" / "visualization.jpg").exists()
+    assert not (out / "_debug" / "temp_binary.tif").exists()
+
+
+def test_failed_detection_leaves_the_visualization(tmp_path):
+    """A no-pages failure is exactly when the picture matters most."""
+    src = tmp_path / "612130000012_00012.jpg"
+    # Et kort med BARE header og ingen sider: den lyse massen overst gir Otsu
+    # en ekte terskel (et nesten-uniformt bilde gir terskel 0, som gjor ALT til
+    # forgrunn), men headermasken fjerner den - og da er det ingenting igjen.
+    a = np.zeros((1500, 2000), 'uint8')
+    a[0:90, :] = 255          # 6% < headerskippens 8%
+    pyvips.Image.new_from_memory(a.tobytes(), 2000, 1500, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--no-archive")
+    assert proc.returncode == 2, proc.stderr
+    assert (out / "_debug" / "visualization.jpg").exists()
+    assert not (out / DONE_SENTINEL).exists()
+
+
 def test_debug_artifacts_stay_out_of_the_card_folder(tmp_path):
     src = tmp_path / "612130000012_00016.jpg"
     make_card(src)
@@ -275,12 +305,54 @@ def test_debug_artifacts_stay_out_of_the_card_folder(tmp_path):
     assert loose == [], f"image files loose in the card folder: {loose}"
 
 
+# --- Reading order -----------------------------------------------------------
+# Journals are always read left-to-right, then top-to-bottom (like text).
+# Page numbering is the downstream contract: a wrong default scrambles every
+# multi-column card silently.
+
+from segment_microfiche import READING_ORDER
+
+
+def test_reading_order_defaults_to_rows():
+    assert READING_ORDER == 'rows'
+
+
+def test_default_numbering_walks_the_top_row_first(tmp_path):
+    """With 4 columns x 3 rows, pages 1-4 must share the top row."""
+    src = tmp_path / "612130000012_00012.jpg"
+    make_card(src, cols=4, rows=3)
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--no-archive")
+    assert proc.returncode == 0, proc.stderr
+
+    rows = [line.split(",") for line
+            in (out / "page_coordinates.csv").read_text().splitlines()
+            if line and not line.startswith(("#", "page"))]
+    ys = [int(r[2]) for r in rows[:4]]
+    assert max(ys) - min(ys) < 200, f"pages 1-4 are not one row: y={ys}"
+    xs = [int(r[1]) for r in rows[:4]]
+    assert xs == sorted(xs), "top row is not numbered left-to-right"
+
+
 # --- Size-outlier rejection -------------------------------------------------
 # Stitching can leave a bright band along a card edge. It survives the
 # minimum-size filter (it is huge, not small) and lands in the page list as a
 # blank strip, shifting every later page number by one.
+#
+# The filter targets SHAPE, not size (2026-09-03): real journals hold pages of
+# genuinely different sizes, and losing a page costs more than gaining a blank
+# crop. Only band-shaped detections are dropped - grossly oversized in one
+# dimension while at-or-under the median in the other.
 
-from segment_microfiche import SIZE_TOLERANCE_RATIO, drop_size_outliers
+from segment_microfiche import (BAND_RATIO, DEFAULT_PADDING_RATIO,
+                                drop_size_outliers)
+
+
+def test_default_crop_margin_is_generous():
+    """3% margin (2026-09-03): unclear edges on real journals should err
+    toward including a little card background, never toward cutting text."""
+    assert DEFAULT_PADDING_RATIO == 0.03
 
 
 def _grid(n=20, w=2040, h=1630):
@@ -290,7 +362,7 @@ def _grid(n=20, w=2040, h=1630):
 def test_drops_a_wide_flat_edge_strip():
     """The real case: 33208 x 732 against a 2040 x 1630 median."""
     boxes = _grid() + [(1110, 24770, 33208, 732)]
-    kept, _, dropped = drop_size_outliers(boxes, None, SIZE_TOLERANCE_RATIO)
+    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
     assert dropped == [(1110, 24770, 33208, 732)]
     assert len(kept) == 20
 
@@ -298,21 +370,43 @@ def test_drops_a_wide_flat_edge_strip():
 def test_keeps_normally_varying_pages():
     boxes = [(100 + i * 2100, 200, 2040 + (i % 7) * 12, 1630 - (i % 5) * 9)
              for i in range(20)]
-    kept, _, dropped = drop_size_outliers(boxes, None, SIZE_TOLERANCE_RATIO)
+    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
     assert dropped == []
     assert kept == boxes
 
 
-def test_drops_a_too_short_box_even_when_width_is_normal():
+def test_keeps_a_short_page_with_normal_width():
+    """A half-height page is a plausible journal page (receipts, notes).
+
+    Until 2026-09-03 this was dropped as an outlier. Real journals hold pages
+    of varying sizes; a wrongly kept blank costs one extra crop, a wrongly
+    dropped page silently loses journal content.
+    """
     boxes = _grid() + [(500, 900, 2040, 700)]
-    kept, _, dropped = drop_size_outliers(boxes, None, SIZE_TOLERANCE_RATIO)
-    assert dropped == [(500, 900, 2040, 700)]
+    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
+    assert dropped == []
+    assert (500, 900, 2040, 700) in kept
+
+
+def test_keeps_widely_varying_page_sizes():
+    """Half-size to median-size pages on one card, all kept."""
+    boxes = _grid() + [(500, 900, 1100, 900), (2700, 900, 1500, 1200)]
+    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
+    assert dropped == []
+    assert len(kept) == 22
+
+
+def test_drops_a_tall_narrow_strip():
+    """The vertical twin of the edge band."""
+    boxes = _grid() + [(50, 100, 600, 24000)]
+    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
+    assert dropped == [(50, 100, 600, 24000)]
 
 
 def test_keeps_contours_aligned_with_kept_boxes():
     boxes = _grid(6) + [(0, 0, 33208, 732)]
     contours = [f"c{i}" for i in range(7)]
-    kept, kept_contours, dropped = drop_size_outliers(boxes, contours, SIZE_TOLERANCE_RATIO)
+    kept, kept_contours, dropped = drop_size_outliers(boxes, contours, BAND_RATIO)
     assert len(kept) == len(kept_contours) == 6
     assert kept_contours == [f"c{i}" for i in range(6)]
     assert len(dropped) == 1
@@ -326,14 +420,14 @@ def test_does_not_filter_when_the_median_is_untrustworthy():
     """
     boxes = [(0, 0, 100, 100), (0, 0, 1000, 1000),
              (0, 0, 5000, 5000), (0, 0, 9000, 9000)]
-    kept, _, dropped = drop_size_outliers(boxes, None, SIZE_TOLERANCE_RATIO)
+    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
     assert dropped == []
     assert kept == boxes
 
 
 def test_too_few_boxes_to_judge_are_left_alone():
     boxes = [(0, 0, 2040, 1630), (0, 0, 33208, 732)]
-    kept, _, dropped = drop_size_outliers(boxes, None, SIZE_TOLERANCE_RATIO)
+    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
     assert dropped == []
     assert kept == boxes
 

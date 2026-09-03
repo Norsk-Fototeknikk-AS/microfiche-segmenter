@@ -21,8 +21,11 @@ import sys
 INPUT_FILE = "your_gigapixel_file.jpg"  # Change this or use --input
 OUTPUT_DIR = Path("segmented")
 
-# Reading order: 'columns' or 'rows'
-READING_ORDER = 'columns'
+# Reading order: 'columns' or 'rows'. Journals are always read like text -
+# left-to-right, then down - so 'rows' is the default (2026-09-03). Page
+# numbering is the downstream contract; a wrong order scrambles the journal
+# silently.
+READING_ORDER = 'rows'
 
 # Skip header region (fraction of image height from top)
 HEADER_SKIP_RATIO = 0.08  # Skip top 8% for yellow header
@@ -47,8 +50,10 @@ REFINE_ERODE_KERNEL = 3      # local re-detection, at local_scale
 REFINE_ERODE_ITERATIONS = 2
 
 # Default crop margin, as a fraction of median page size. With the erosion bias
-# compensated this is real safety headroom, not a correction.
-DEFAULT_PADDING_RATIO = 0.01
+# compensated this is real safety headroom, not a correction. Generous on
+# purpose (2026-09-03): real journals have unclear edges, and a sliver of card
+# background in the crop is free while a sliver of lost text is not.
+DEFAULT_PADDING_RATIO = 0.03
 
 
 # Sentinel the OCR app's watcher polls: its presence means "fully written, safe
@@ -126,16 +131,25 @@ HEADER_PROXY_SCALE = 0.0625
 # treated as something other than a page. Real cards run 97-98% size
 # consistency, so this is deliberately loose — it exists to catch stitch
 # artefacts (edge bands), not to police normal variation.
-SIZE_TOLERANCE_RATIO = 0.4
+# A detection this many times wider/taller than the median page, while the
+# other dimension is at or under the median, is a stitch band - not a page.
+BAND_RATIO = 2.5
 
 
-def drop_size_outliers(boxes, contours, tolerance):
-    """Reject detections whose size is nothing like the card's median page.
+def drop_size_outliers(boxes, contours, band_ratio):
+    """Reject band-shaped detections - never pages that are merely small.
 
     The minimum-size filter only catches specks. A bright band along a stitched
     card edge is the opposite problem: far too wide and too flat to be a page,
     but far too big to be filtered as noise. Left in, it becomes a blank page in
     the middle of the sequence and shifts every later page number by one.
+
+    Shape, not size (2026-09-03): real journals hold pages of genuinely
+    different sizes, so deviating from the median is not evidence against being
+    a page. A band is unmistakable - grossly oversized in ONE dimension while
+    at-or-under the median in the other. Everything else is kept: a wrongly
+    kept blank costs one extra crop, a wrongly dropped page silently loses
+    journal content.
 
     Returns (kept_boxes, kept_contours, dropped_boxes).
     """
@@ -150,8 +164,9 @@ def drop_size_outliers(boxes, contours, tolerance):
 
     def is_page(box):
         _, _, w, h = box
-        return (abs(w - median_w) / median_w <= tolerance
-                and abs(h - median_h) / median_h <= tolerance)
+        wide_band = w > median_w * band_ratio and h <= median_h
+        tall_band = h > median_h * band_ratio and w <= median_w
+        return not (wide_band or tall_band)
 
     keep = [i for i, b in enumerate(boxes) if is_page(b)]
 
@@ -566,11 +581,12 @@ def main():
     pages_dir = out_dir / "pages"
     csv_path = out_dir / "page_coordinates.csv"
 
-    # Debug artifacts stay out of the card folder unless asked for — the OCR
-    # app treats loose image files there as pages.
+    # The visualization is the operator's ground truth for what was detected,
+    # in which order - written on EVERY run (2026-09-03), inside _debug/ so the
+    # OCR app never mistakes it for a page. Heavy artifacts (the full-res
+    # binary) still hide behind --debug.
     debug_dir = out_dir / "_debug"
-    if args.debug:
-        debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir.mkdir(parents=True, exist_ok=True)
     temp_tiff = debug_dir / "temp_binary.tif"
     viz_path = debug_dir / "visualization.jpg"
 
@@ -667,14 +683,21 @@ def main():
         print(f"\nERROR: no pages detected in {input_file}", file=sys.stderr)
         print("  No _done sentinel written — this card will not be offered for import.",
               file=sys.stderr)
+        # A no-pages failure is exactly when the picture matters most: write
+        # the thresholded view so the operator can SEE what detection saw.
+        fail_scale = min(1.0, 2000 / max(binary_img.shape[1], binary_img.shape[0]))
+        fail_viz = cv2.resize(binary_img, None, fx=fail_scale, fy=fail_scale)
+        cv2.imwrite(str(viz_path), fail_viz)
+        print(f"  Detection view saved to {viz_path}", file=sys.stderr)
         if not args.skip_extraction:
             moved = move_without_clobber(input_path, input_path.parent / "error")
             print(f"  Source scan moved to {moved}", file=sys.stderr)
-            # Leave no empty card folder cluttering the watch root
+            # The card folder stays: it holds _debug/visualization.jpg and no
+            # sentinel, so the OCR app skips it while a human can inspect it.
             try:
                 out_dir.rmdir()
             except OSError:
-                pass  # not empty (e.g. --debug artifacts) — leave it for inspection
+                pass  # expected - _debug/ is in there
         else:
             print("  Source left in place (--skip-extraction is inspection-only).",
                   file=sys.stderr)
@@ -690,7 +713,7 @@ def main():
 
     # Reject anything that is not page-shaped for this card (stitch edge bands)
     boxes, filtered_contours, dropped = drop_size_outliers(
-        boxes, filtered_contours, SIZE_TOLERANCE_RATIO)
+        boxes, filtered_contours, BAND_RATIO)
     if dropped:
         scale_up = 1.0 / detect_scale
         print(f"Rejected {len(dropped)} detection(s) unlike this card's median page:")
@@ -823,9 +846,8 @@ def main():
     cv2.putText(banner, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, banner_color, 2)
     viz = np.vstack([banner, viz])
 
-    if args.debug:
-        cv2.imwrite(str(viz_path), viz)
-        print(f"Saved {viz_path}")
+    cv2.imwrite(str(viz_path), viz)
+    print(f"Saved {viz_path}")
 
     # === STEP 6: Extract pages (optional) ===
     if not args.skip_extraction:

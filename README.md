@@ -85,9 +85,10 @@ A card folder holds exactly:
 
 The OCR app has a fallback that reads image files sitting *directly* in the card
 folder as pages, used when `pages/` is missing. Anything else image-shaped left
-at that level can therefore be imported as a page. Debug artifacts
-(`temp_binary.tif`, the box overlay) go to `<card>/_debug/` and only with
-`--debug`.
+at that level can therefore be imported as a page. Debug artifacts live in
+`<card>/_debug/`, never at card level: the box overlay `visualization.jpg` is
+written there on every run (2026-09-03) as the operator's ground truth for what
+was detected and in which order; the full-res binary only with `--debug`.
 
 ### C6. Output naming is the system boundary
 
@@ -245,17 +246,17 @@ the end.
 |---|---|---|
 | `-i, --input` | — | panorama; anything libvips can open |
 | `-O, --output` | `<input dir>/segmented/<stem>/` | the card folder |
-| `-o, --order` | `columns` | `columns` = down then right; `rows` = right then down |
+| `-o, --order` | `rows` | `rows` = right then down (slik journaler leses); `columns` = down then right |
 | `-hs, --header-skip` | `0.08` | fraction of height masked at top; this band becomes `page_000.tif` (C11). `0` disables both |
 | `--no-header-page` | off | suppress the header band `pages/page_000.tif` (C11) |
 | `--no-archive` | off | leave the panorama in place instead of archiving (C13) |
 | `--archive-dir` | `../PanoramaArchive` | where an archived panorama goes |
-| `-p, --padding` | `0.01` | crop margin; ≤1 = fraction of median page, >1 = pixels |
+| `-p, --padding` | `0.03` | crop margin; ≤1 = fraction of median page, >1 = pixels |
 | `--refine` | off | re-detect each page locally at 20 %; slower, slightly looser |
 | `--format` | `tif` | see C7 |
 | `--invert` | off | for cards that are dark-on-light |
 | `--skip-extraction` | off | coordinates only; non-destructive (C4) |
-| `--debug` | off | write binary TIFF + box overlay to `<card>/_debug/` |
+| `--debug` | off | write full-res binary TIFF to `<card>/_debug/` (box-overlayen `visualization.jpg` skrives alltid) |
 
 ## How detection works
 
