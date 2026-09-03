@@ -160,7 +160,7 @@ exactly this reason, which is a fair warning about how it changes habits.
 
 ### Non-page-shaped detections are rejected
 
-`drop_size_outliers()`, contract C12. Added after both production cards came out
+`drop_band_detections()` (then `drop_size_outliers()`), contract C12. Added after both production cards came out
 as 148 pages / POOR because of a light table band along the bottom edge.
 
 ## Proven since first writing
@@ -236,7 +236,7 @@ card as the production one, shot earlier under the wrong fanearkID.
 
 Both initially came out as 148 pages / POOR (58.8 and 59.7) because of a light
 table band along the bottom edge — 33190 x 720 and 33180 x 720. With
-`drop_size_outliers()` both land at 147 pages and GOOD. Size consistency went
+the size filter (now `drop_band_detections()`) both land at 147 pages and GOOD. Size consistency went
 from 0.0 to 98.5 / 98.6.
 
 Both predate the header prepage, so neither has a `page_000.tif`.
@@ -249,8 +249,8 @@ Both predate the header prepage, so neither has a `page_000.tif`.
 | detect erosion | 7×7, 2 iterations | 6 px → **60 px** per side |
 | refine local scale | 0.2 | — |
 | refine erosion | 3×3, 2 iterations | 2 px → **10 px** per side |
-| default margin | 1 % of median page | 20 × 16 px on the production card |
-| size tolerance | 40 % from median page | rejects stitch edge bands (C12) |
+| default margin | 3 % of median page (1 % until 2026-09-03) | 61 × 49 px on the production card |
+| band ratio | 2.5× median in one dimension, ≤ median in the other (shape test since 2026-09-03; was a 40 % size tolerance) | rejects stitch edge bands (C12) |
 | header scale | 1/16 | 34298 × 2038 band → 2144 × 127, 424 kB |
 | extraction workers | 5 | — |
 
@@ -267,9 +267,9 @@ disagreed by ~50 px. Refine is slightly *looser* than the default path
 
 ### Tests
 
-32 tests, ~2.6 s. Unit tests for box geometry, folder lifecycle and size
-filtering; end-to-end tests
-end-to-end tests drive the real CLI against a generated 4×3 card.
+49 tests, ~5 s (was 32 when this was written). Unit tests for box
+geometry, folder lifecycle and band filtering; end-to-end tests drive the real
+CLI against a generated 4×3 card.
 
 ---
 
@@ -281,7 +281,9 @@ Do not assume any of this works. None of it has been exercised.
 - **Real archival material.** Every run so far has been on *one* physical test
   card containing a Yamaha RD500LC service manual. Never run on real patient
   journals. Page density, contrast, and layout of real cards may differ.
-- **`--order rows`.** Never used on real data. The test card is `columns`.
+- **`--order rows`.** Never used on real data; the test card is `columns`.
+  Sharper since 2026-09-03: `rows` is now the *default*, so every app-driven
+  run takes this unproven path unless `--order columns` is passed.
 - **`--invert`.** Never exercised at all.
 - **`--format jpg`.** Not run since today's changes. Forbidden for pipeline
   output anyway (contract C7), but the code path exists.

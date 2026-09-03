@@ -179,8 +179,12 @@ after the switch can appear in the same handover.
 
 ### C12. Detections that are not page-shaped are rejected
 
-`drop_size_outliers()` discards boxes deviating more than
-`SIZE_TOLERANCE_RATIO` (40 %) from the card's median page in width or height.
+`drop_band_detections()` discards boxes shaped like bands: more than
+`BAND_RATIO` (2.5×) the card's median page in one dimension while at or under
+the median in the other. Shape, not size (2026-09-03): real journals hold pages
+of genuinely different sizes, so mere deviation from the median — the old 40 %
+`SIZE_TOLERANCE_RATIO` rule — is not evidence against being a page, and losing
+a real page costs more than keeping a blank crop.
 
 The minimum-size filter only catches specks. The opposite failure is a bright
 band along a card edge — far too wide and flat to be a page, far too big to be
@@ -279,9 +283,9 @@ the end.
 .venv/bin/python -m pytest test_segment.py -q
 ```
 
-Unit tests cover the geometry and the folder lifecycle. Four end-to-end tests
-drive the real CLI against a small generated card, so the folder contract is
-verified in about a second without needing a gigapixel scan.
+Unit tests cover the geometry, the band filter and the folder lifecycle.
+The end-to-end tests drive the real CLI against a small generated card, so the
+folder contract is verified in seconds without needing a gigapixel scan.
 
 See `HANDOFF.md` for measured numbers, what is still unproven, and how to
 verify a change with no network access.

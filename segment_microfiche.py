@@ -2,9 +2,9 @@
 """
 Microfiche page segmentation using Otsu thresholding.
 Converts gigapixel JPG to 1-bit TIFF, finds page bounding boxes.
-Supports both reading orders:
+Reading order, --order:
+  - 'rows' (default): top-to-bottom rows, left-to-right within each row
   - 'columns': left-to-right columns, top-to-bottom within each column
-  - 'rows': top-to-bottom rows, left-to-right within each row
 """
 
 import pyvips
@@ -18,8 +18,6 @@ import shutil
 import sys
 
 # === CONFIGURATION ===
-INPUT_FILE = "your_gigapixel_file.jpg"  # Change this or use --input
-OUTPUT_DIR = Path("segmented")
 
 # Reading order: 'columns' or 'rows'. Journals are always read like text -
 # left-to-right, then down - so 'rows' is the default (2026-09-03). Page
@@ -37,9 +35,6 @@ MIN_PAGE_HEIGHT_RATIO = 0.02
 # Maximum grid size for validation
 MAX_COLUMNS = 16
 MAX_ROWS = 13
-
-# Padding around detected pages (pixels) - added when extracting
-PADDING = 0
 
 # Erosion used to separate touching pages. Both passes shrink every blob by a
 # known amount, which is added back to the boxes so they land on the true page
@@ -127,16 +122,14 @@ HEADER_PAGE_STEM = "page_000"
 HEADER_PROXY_SCALE = 0.0625
 
 
-# A page box may differ from the card's median page by this much before it is
-# treated as something other than a page. Real cards run 97-98% size
-# consistency, so this is deliberately loose — it exists to catch stitch
-# artefacts (edge bands), not to police normal variation.
 # A detection this many times wider/taller than the median page, while the
 # other dimension is at or under the median, is a stitch band - not a page.
+# Deliberately a SHAPE test: size alone says nothing, because real journals
+# hold pages of genuinely different sizes.
 BAND_RATIO = 2.5
 
 
-def drop_size_outliers(boxes, contours, band_ratio):
+def drop_band_detections(boxes, contours, band_ratio):
     """Reject band-shaped detections - never pages that are merely small.
 
     The minimum-size filter only catches specks. A bright band along a stitched
@@ -517,7 +510,9 @@ def refine_box_local(input_file, box, otsu_thresh, orig_w, orig_h,
 
 def main():
     parser = argparse.ArgumentParser(description='Segment microfiche pages')
-    parser.add_argument('--input', '-i', default=INPUT_FILE, help='Input image file')
+    # Not argparse-required: a missing input must exit 1 (generic failure),
+    # while argparse errors exit 2 and would collide with EXIT_NO_PAGES.
+    parser.add_argument('--input', '-i', default=None, help='Input image file')
     parser.add_argument('--order', '-o', choices=['columns', 'rows'], default=READING_ORDER,
                         help='Reading order: columns (down then right) or rows (right then down)')
     parser.add_argument('--header-skip', '-hs', type=float, default=HEADER_SKIP_RATIO,
@@ -525,7 +520,9 @@ def main():
     parser.add_argument('--invert', action='store_true',
                         help='Invert binary image (if pages are dark on light background)')
     parser.add_argument('--padding', '-p', type=float, default=None,
-                        help='Padding around detected pages (pixels, or percent if 0-1). Default: 1%%')
+                        help='Crop margin around detected pages (pixels, or fraction of '
+                             f'the median page if 0-1). Default: {DEFAULT_PADDING_RATIO} '
+                             'of the median page.')
     parser.add_argument('--skip-extraction', action='store_true',
                         help='Only output coordinates, do not extract pages')
     parser.add_argument('--format', choices=['tif', 'jpg'], default='tif',
@@ -559,6 +556,10 @@ def main():
                              'Off by default: the OCR app reads loose image files in the '
                              'card folder as pages.')
     args = parser.parse_args()
+
+    if not args.input:
+        print("ERROR: --input is required", file=sys.stderr)
+        return 1
 
     input_file = args.input
     input_path = Path(input_file)
@@ -712,11 +713,11 @@ def main():
           f"(+{int(detect_radius / detect_scale)}px at full resolution)")
 
     # Reject anything that is not page-shaped for this card (stitch edge bands)
-    boxes, filtered_contours, dropped = drop_size_outliers(
+    boxes, filtered_contours, dropped = drop_band_detections(
         boxes, filtered_contours, BAND_RATIO)
     if dropped:
         scale_up = 1.0 / detect_scale
-        print(f"Rejected {len(dropped)} detection(s) unlike this card's median page:")
+        print(f"Rejected {len(dropped)} band-shaped detection(s) (not pages):")
         for (x, y, w, h) in dropped:
             print(f"  at ({int(x * scale_up)}, {int(y * scale_up)}) "
                   f"size {int(w * scale_up)} x {int(h * scale_up)} full-res")
@@ -832,7 +833,6 @@ def main():
         cv2.putText(viz, str(i), (sx + 5, sy + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
     # Add quality score banner at the top
-    q = quality['total']
     if q > 80:
         banner_color = (0, 180, 0)     # green
     elif q >= 60:
@@ -858,7 +858,7 @@ def main():
         num_workers = 5
         print(f"Using {num_workers} parallel workers")
 
-        # Compute padding: default 1% of median page size (hairline safety margin)
+        # Crop margin: a fraction of the median page unless given in pixels
         if args.padding is None:
             median_w = int(np.median([b[2] for b in boxes_fullres]))
             median_h = int(np.median([b[3] for b in boxes_fullres]))

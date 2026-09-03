@@ -294,6 +294,15 @@ def test_failed_detection_leaves_the_visualization(tmp_path):
     assert not (out / DONE_SENTINEL).exists()
 
 
+def test_missing_input_exits_1_not_2(tmp_path):
+    """Exit codes are the app's contract: 2 means "no pages detected". A run
+    without --input must fail with the generic 1, so the app never mistakes an
+    operator mistake for an empty card."""
+    proc = run_segmenter()
+    assert proc.returncode == 1
+    assert "--input is required" in proc.stderr
+
+
 def test_debug_artifacts_stay_out_of_the_card_folder(tmp_path):
     src = tmp_path / "612130000012_00016.jpg"
     make_card(src)
@@ -346,7 +355,7 @@ def test_default_numbering_walks_the_top_row_first(tmp_path):
 # dimension while at-or-under the median in the other.
 
 from segment_microfiche import (BAND_RATIO, DEFAULT_PADDING_RATIO,
-                                drop_size_outliers)
+                                drop_band_detections)
 
 
 def test_default_crop_margin_is_generous():
@@ -362,7 +371,7 @@ def _grid(n=20, w=2040, h=1630):
 def test_drops_a_wide_flat_edge_strip():
     """The real case: 33208 x 732 against a 2040 x 1630 median."""
     boxes = _grid() + [(1110, 24770, 33208, 732)]
-    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
+    kept, _, dropped = drop_band_detections(boxes, None, BAND_RATIO)
     assert dropped == [(1110, 24770, 33208, 732)]
     assert len(kept) == 20
 
@@ -370,7 +379,7 @@ def test_drops_a_wide_flat_edge_strip():
 def test_keeps_normally_varying_pages():
     boxes = [(100 + i * 2100, 200, 2040 + (i % 7) * 12, 1630 - (i % 5) * 9)
              for i in range(20)]
-    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
+    kept, _, dropped = drop_band_detections(boxes, None, BAND_RATIO)
     assert dropped == []
     assert kept == boxes
 
@@ -383,7 +392,7 @@ def test_keeps_a_short_page_with_normal_width():
     dropped page silently loses journal content.
     """
     boxes = _grid() + [(500, 900, 2040, 700)]
-    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
+    kept, _, dropped = drop_band_detections(boxes, None, BAND_RATIO)
     assert dropped == []
     assert (500, 900, 2040, 700) in kept
 
@@ -391,7 +400,7 @@ def test_keeps_a_short_page_with_normal_width():
 def test_keeps_widely_varying_page_sizes():
     """Half-size to median-size pages on one card, all kept."""
     boxes = _grid() + [(500, 900, 1100, 900), (2700, 900, 1500, 1200)]
-    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
+    kept, _, dropped = drop_band_detections(boxes, None, BAND_RATIO)
     assert dropped == []
     assert len(kept) == 22
 
@@ -399,14 +408,14 @@ def test_keeps_widely_varying_page_sizes():
 def test_drops_a_tall_narrow_strip():
     """The vertical twin of the edge band."""
     boxes = _grid() + [(50, 100, 600, 24000)]
-    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
+    kept, _, dropped = drop_band_detections(boxes, None, BAND_RATIO)
     assert dropped == [(50, 100, 600, 24000)]
 
 
 def test_keeps_contours_aligned_with_kept_boxes():
     boxes = _grid(6) + [(0, 0, 33208, 732)]
     contours = [f"c{i}" for i in range(7)]
-    kept, kept_contours, dropped = drop_size_outliers(boxes, contours, BAND_RATIO)
+    kept, kept_contours, dropped = drop_band_detections(boxes, contours, BAND_RATIO)
     assert len(kept) == len(kept_contours) == 6
     assert kept_contours == [f"c{i}" for i in range(6)]
     assert len(dropped) == 1
@@ -420,14 +429,14 @@ def test_does_not_filter_when_the_median_is_untrustworthy():
     """
     boxes = [(0, 0, 100, 100), (0, 0, 1000, 1000),
              (0, 0, 5000, 5000), (0, 0, 9000, 9000)]
-    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
+    kept, _, dropped = drop_band_detections(boxes, None, BAND_RATIO)
     assert dropped == []
     assert kept == boxes
 
 
 def test_too_few_boxes_to_judge_are_left_alone():
     boxes = [(0, 0, 2040, 1630), (0, 0, 33208, 732)]
-    kept, _, dropped = drop_size_outliers(boxes, None, BAND_RATIO)
+    kept, _, dropped = drop_band_detections(boxes, None, BAND_RATIO)
     assert dropped == []
     assert kept == boxes
 
