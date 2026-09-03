@@ -303,6 +303,42 @@ def test_missing_input_exits_1_not_2(tmp_path):
     assert "--input is required" in proc.stderr
 
 
+def test_near_uniform_card_fails_loudly(tmp_path):
+    """Otsu on a (nearly) uniform surface returns threshold 0, so EVERYTHING
+    becomes foreground and the whole card comes out as one giant "page" -
+    something wrong that looks normal. That is not a card: fail exactly like
+    the no-pages case - exit 2, source to error/, viz written, never a _done."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.full((1500, 2000), 40, 'uint8')
+    pyvips.Image.new_from_memory(a.tobytes(), 2000, 1500, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--no-archive")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert not (out / DONE_SENTINEL).exists()
+    assert (out / "_debug" / "visualization.jpg").exists()
+    assert (tmp_path / "error" / src.name).exists()
+    assert not (out / "pages").exists() or not list((out / "pages").iterdir())
+
+
+def test_all_foreground_card_fails_loudly(tmp_path):
+    """A blank bright scan with a few dark specks gives Otsu a real threshold,
+    but ~everything lands above it: same one-giant-page failure as the uniform
+    case, just with a nonzero threshold. Foreground share near 100% is not a
+    card - pages always sit on visible card background."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.full((1500, 2000), 200, 'uint8')
+    a[700:720, 500:520] = 10
+    a[1200:1215, 1600:1620] = 10
+    pyvips.Image.new_from_memory(a.tobytes(), 2000, 1500, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--no-archive")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert not (out / DONE_SENTINEL).exists()
+    assert (tmp_path / "error" / src.name).exists()
+
+
 def test_debug_artifacts_stay_out_of_the_card_folder(tmp_path):
     src = tmp_path / "612130000012_00016.jpg"
     make_card(src)

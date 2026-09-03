@@ -58,6 +58,12 @@ DONE_SENTINEL = "_done"
 # Exit codes, so an app-driven run can tell failure modes apart
 EXIT_NO_PAGES = 2
 
+# A card is pages on visible card background, so foreground can never be
+# ~everything. Above this share the threshold split is meaningless (blank or
+# washed-out scan) and the run fails loudly instead of emitting one giant
+# "page". Real cards run well below this, even with narrow gaps.
+FOREGROUND_SANE_MAX = 0.97
+
 
 def prepare_card_dir(out_dir):
     """Clear a card folder so a re-run cannot be mistaken for a finished one.
@@ -610,6 +616,15 @@ def main():
     otsu_thresh = compute_otsu_threshold(gray)
     print(f"Otsu threshold: {otsu_thresh}")
 
+    # A (nearly) uniform surface gives Otsu threshold 0, which makes the ENTIRE
+    # image foreground and the whole card come back as one giant "page" -
+    # something wrong that looks normal. Not a card; fail like the no-pages
+    # case rather than guess around it.
+    degenerate = None
+    if otsu_thresh <= 0:
+        degenerate = (f"degenerate Otsu threshold {otsu_thresh} "
+                      "(near-uniform image, everything is foreground)")
+
     # Apply threshold to full image
     print("Applying threshold to full image...")
     binary = gray >= otsu_thresh
@@ -644,6 +659,14 @@ def main():
     if args.invert:
         print("Inverting binary image...")
         binary_img = cv2.bitwise_not(binary_img)
+
+    # Second degenerate-threshold symptom: a real Otsu value but ~everything
+    # above it (blank bright scan). Same one-giant-page failure as threshold 0.
+    foreground_share = float(np.count_nonzero(binary_img)) / binary_img.size
+    if degenerate is None and foreground_share > FOREGROUND_SANE_MAX:
+        degenerate = (f"foreground is {foreground_share:.1%} of the image "
+                      f"(sane maximum {FOREGROUND_SANE_MAX:.0%}; "
+                      "blank or washed-out scan, not a card)")
 
     # Calculate header skip in pixels (on downsampled image)
     header_skip_px_small = int(original_height * detect_scale * args.header_skip)
@@ -680,8 +703,9 @@ def main():
     # Fail loudly on a total detection failure. Writing an empty card folder
     # would be worse than useless: the OCR app skips empty folders silently, so
     # the card would vanish from the queue with no error anywhere.
-    if not boxes:
-        print(f"\nERROR: no pages detected in {input_file}", file=sys.stderr)
+    if degenerate or not boxes:
+        reason = degenerate or "no pages detected"
+        print(f"\nERROR: {reason} in {input_file}", file=sys.stderr)
         print("  No _done sentinel written — this card will not be offered for import.",
               file=sys.stderr)
         # A no-pages failure is exactly when the picture matters most: write

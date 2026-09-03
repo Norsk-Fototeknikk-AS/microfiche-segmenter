@@ -122,13 +122,20 @@ ignores empty folders silently, so an empty folder is invisible, not an error
 signal. On zero detections: no `_done`, message on stderr, the source panorama
 is moved to `<input dir>/error/`, the empty card folder is removed, exit 2.
 
+A degenerate threshold takes the same path (2026-09-03). A (nearly) uniform
+image gives Otsu threshold 0, and a blank bright scan gives a real threshold
+with ~everything above it (`FOREGROUND_SANE_MAX`, 97 %); both would otherwise
+emit the whole card as one giant "page" — something wrong that looks normal.
+No re-thresholding heuristics: no real panorama has failed this way yet, so
+the failure is reported, not guessed around.
+
 ### C10. Exit codes
 
 | code | meaning |
 |---|---|
 | 0 | success |
 | 1 | unhandled exception (traceback on stderr) |
-| 2 | no pages detected; source moved to `error/` |
+| 2 | no usable detection (zero pages, or degenerate threshold); source moved to `error/` |
 
 `-O` / `--output` names the **card folder**, not the watch root. A caller that
 wants `<root>/<fid>/` must pass `-O <root>/<fid>` itself.
