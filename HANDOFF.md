@@ -265,6 +265,18 @@ the global pass, i.e. the two passes now agree. Before the erosion fix they
 disagreed by ~50 px. Refine is slightly *looser* than the default path
 (−49 px vs −10 px on the left edge of page 1) — both safe, default is tighter.
 
+### The resize/threshold order duality
+
+The same gap gives two different answers depending on operation order, and the
+split pass exists in that difference (2026-09-04). The detect pass thresholds
+at FULL resolution, then downsamples the 0/255 map: a dirty gap (the real
+card's overlapping tapes, 45 % dark) classifies pixel-by-pixel as mostly page,
+so the neighbors merge. The split scan downsamples the gray FIRST, then
+thresholds: the same gap averages to a light value and reads as background —
+the valley. Neither order is "correct"; the detect order is robust for finding
+pages, the scan order is sensitive to gaps. Changing either order breaks the
+mechanism it serves.
+
 ### Tests
 
 82 tests, ~12 s (was 32 when this was written). Unit tests for box
@@ -276,6 +288,15 @@ CLI against a generated 4×3 card.
 ## What is UNPROVEN
 
 Do not assume any of this works. None of it has been exercised.
+
+- **A FULL journal card.** The sharpest open risk (2026-09-04). Structure-row
+  removal (`STRIPE_COVERAGE` 0.85) is validated on a *sparse* card whose page
+  rows sit at ~20 % coverage. On a full card, page rows can reach ~96 % —
+  everything then rests on the height rule (page-height runs are kept) and on
+  the stripe-to-row gaps actually dipping below the threshold between runs.
+  **Operator step until proven: the first FULL journal card goes through
+  `--skip-extraction` with a visual check of `_debug/visualization.jpg`
+  BEFORE any ordinary run.**
 
 - ~~**Multi-card journals.**~~ **PROVEN 2026-08-22** — see below.
 - **Real archival material.** Partly addressed 2026-09-04: a real journal
