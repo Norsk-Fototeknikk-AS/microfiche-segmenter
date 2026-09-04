@@ -536,6 +536,107 @@ def test_card_structure_touching_the_border_is_not_pages(tmp_path):
     assert len(rows) == n, proc.stdout
 
 
+# --- Polarity autodetection --------------------------------------------------
+# The app sends no flags, and the two known card types have opposite polarity
+# (Yamaha: bright pages on dark card; journals: dark pages on light jacket).
+# Border sampling cannot tell them apart - the dark mounting surround frames
+# BOTH types, so the border ring reads background either way (measured on the
+# real card 2026-09-04). What does discriminate is physics: no single page can
+# span ~the whole card, so the wrong polarity yields full-width row boxes and
+# the right one yields floating page-sized boxes.
+
+from segment_microfiche import autodetect_inversion, page_likeness_score
+
+
+def _binary_of(name):
+    img = pyvips.Image.new_from_file(str(REPO / "testdata" / name)).colourspace('b-w')
+    a = np.ndarray(buffer=img.write_to_memory(), dtype=np.uint8,
+                   shape=[img.height, img.width])
+    t, _ = cv2.threshold(a, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return ((a >= t) * 255).astype(np.uint8)
+
+
+def test_score_counts_page_sized_boxes_and_penalizes_row_sized():
+    W, H = 2000, 1500
+    pages = [(100, 100, 300, 250), (500, 100, 300, 250)]
+    rows = [(50, 500, 1900, 250)]                 # 95% of width: not a page
+    assert page_likeness_score(pages, W, H) == 2
+    assert page_likeness_score(pages + rows, W, H) == 1
+    assert page_likeness_score(rows, W, H) == -1
+
+
+def test_autodetect_inverts_the_real_journal_card():
+    b = _binary_of("real_card_10pct.jpg")
+    h, w = b.shape
+    invert = autodetect_inversion(b, int(h * 0.08), int(w * 0.02), int(h * 0.02))
+    assert invert is True
+
+
+def test_autodetect_keeps_normal_polarity_on_a_yamaha_type_card():
+    a = np.zeros((1500, 2000), 'uint8')
+    for r in range(3):
+        for c in range(4):
+            a[200 + r * 420:540 + r * 420, 60 + c * 480:460 + c * 480] = 255
+    invert = autodetect_inversion(a.copy(), 0, 40, 30)
+    assert invert is False
+
+
+def test_autodetect_prefers_nothing_over_impossible_boxes_on_the_blank():
+    """The blank jacket is not a tie: normal polarity reads the empty bright
+    rows as six full-width "pages" (score -6) - silent junk that would have
+    become a _done'd card. Inverted yields nothing (score 0), which downstream
+    turns into the loud no-pages exit. Choosing emptiness over impossible
+    boxes is the point of the penalty."""
+    b = _binary_of("real_card_blank_10pct.jpg")
+    h, w = b.shape
+    invert = autodetect_inversion(b, int(h * 0.08), int(w * 0.02), int(h * 0.02))
+    assert invert is True
+
+
+def test_autodetect_runs_end_to_end_without_flags(tmp_path):
+    """The app sends no polarity flag; an inverted journal-type card must come
+    out right anyway, and the log must SAY the polarity was auto-chosen - a
+    silent guess is the trap."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.full((12000, 16000), 230, 'uint8')
+    a[:800, :] = 20; a[-800:, :] = 20; a[:, :800] = 20; a[:, -800:] = 20
+    n = 0
+    for r in range(3):
+        y = 1000 + r * 2400
+        a[y:y + 200, :] = 30
+        for c in range(4):
+            x = 1000 + c * 3600
+            a[y + 300:y + 2100, x:x + 3000] = 25
+            n += 1
+    pyvips.Image.new_from_memory(a.tobytes(), 16000, 12000, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rows = [line for line in (out / "page_coordinates.csv").read_text().splitlines()
+            if line and not line.startswith(("#", "page"))]
+    assert len(rows) == n, proc.stdout
+    assert "Auto-detected polarity: INVERTING" in proc.stdout
+
+
+def test_no_invert_disables_autodetection(tmp_path):
+    """--no-invert is the manual override the other way: polarity is forced
+    normal and autodetection must not even run."""
+    src = tmp_path / "612130000012_00012.jpg"
+    make_inverted_card(src)
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out),
+                         "--skip-extraction", "--no-invert")
+    assert "Auto-detected" not in proc.stdout
+
+
+def test_invert_and_no_invert_together_exit_1():
+    proc = run_segmenter("-i", "whatever.jpg", "--invert", "--no-invert")
+    assert proc.returncode == 1
+    assert "mutually exclusive" in proc.stderr
+
+
 # --- Real journal card (committed at detect scale) --------------------------
 # testdata/ holds the first real journal card (2026-09-04, no patient info) at
 # 10% scale - exactly what the detect pass sees. Two variants: the jacket with

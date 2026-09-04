@@ -279,15 +279,25 @@ the end.
 | `-p, --padding` | `0.03` | crop margin; ≤1 = fraction of median page, >1 = pixels |
 | `--refine` | off | re-detect each page locally at 20 %; slower, slightly looser |
 | `--format` | `tif` | see C7 |
-| `--invert` | off | for cards that are dark-on-light |
+| `--invert` | auto | force inverted polarity (dark pages on light card) |
+| `--no-invert` | auto | force normal polarity, disabling auto-detection |
 | `--skip-extraction` | off | coordinates only; non-destructive (C4) |
 | `--debug` | off | write full-res binary TIFF to `<card>/_debug/` (box-overlayen `visualization.jpg` skrives alltid) |
 
 ## How detection works
 
 1. Otsu threshold from a 1 % thumbnail, applied to the full image.
-2. Downscale to 10 %. With `--invert` (dark pages on a light jacket — the real
-   journal card type, first seen 2026-09-04) the binary is inverted here.
+2. Downscale to 10 %. Polarity is **auto-detected** per card (2026-09-04,
+   decided cross-repo): the two known card types are opposite (Yamaha-type
+   bright-on-dark, journal jackets dark-on-light) and the app sends no flag.
+   Both polarities are tried through the cheap detect pass and scored on
+   page-likeness — impossible spans (a box over `PAGE_MAX_SPAN` = 60 % of the
+   image in either dimension) count *against* the polarity that produced
+   them, since the wrong polarity reads full rows as pages. Border sampling
+   cannot decide this: the dark mounting surround frames both card types, so
+   the border ring reads background either way (measured). Auto-inversion is
+   announced loudly in the log and in the viz banner; `--invert` /
+   `--no-invert` force it.
 3. **Remove card structure.** Full-width row-runs that are thinner than any
    possible page or touch the image boundary / header mask are stripes and
    edge bands — deleted (`remove_structure_rows`). Then erosion, then any

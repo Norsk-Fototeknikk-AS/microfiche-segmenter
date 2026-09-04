@@ -267,7 +267,7 @@ disagreed by ~50 px. Refine is slightly *looser* than the default path
 
 ### Tests
 
-63 tests, ~8 s (was 32 when this was written). Unit tests for box
+71 tests, ~10 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 
@@ -290,9 +290,11 @@ Do not assume any of this works. None of it has been exercised.
   run takes this unproven path unless `--order columns` is passed.
 - ~~**`--invert`.**~~ Exercised on the first real journal card 2026-09-04 —
   and it was **broken** (uint8 wrap made everything foreground; fixed same
-  day). The real journal cards are dark-pages-on-light-jacket, so production
-  runs on them REQUIRE `--invert`; the app does not pass it today. Open
-  cross-repo question.
+  day). The real journal cards are dark-pages-on-light-jacket. Resolved
+  cross-repo the same day: polarity is **auto-detected** per card (the app
+  stays flagless); `--invert` / `--no-invert` remain as manual overrides.
+  Pinned against all three ground truths (journal, Yamaha-type synthetic,
+  blank jacket).
 - **`--format jpg`.** Not run since today's changes. Forbidden for pipeline
   output anyway (contract C7), but the code path exists.
 - **Zero-page failure in production.** Verified with a synthetic specks-only

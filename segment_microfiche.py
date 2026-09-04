@@ -253,6 +253,87 @@ def clear_border_connected(binary_img):
     return 1.0 - np.count_nonzero(binary_img) / before
 
 
+def detect_page_boxes(binary_img, header_skip_px, min_w, min_h):
+    """The detect-scale pipeline: mask header, remove card structure, erode,
+    drop border-connected foreground, find and size-filter contours.
+
+    Mutates and returns binary_img (the processed view is what the
+    visualization shows). Returns (boxes, contours, binary_img, log_lines).
+    """
+    log_lines = []
+    if header_skip_px > 0:
+        binary_img[:header_skip_px, :] = 0
+
+    min_page_h = max(1, min_h)
+    removed_rows = remove_structure_rows(binary_img, min_page_h, header_skip_px)
+    if removed_rows:
+        log_lines.append(f"Removed {removed_rows} full-width structure "
+                         "row-run(s) (stripes / edge bands)")
+
+    kernel = np.ones((DETECT_ERODE_KERNEL, DETECT_ERODE_KERNEL), np.uint8)
+    binary_img = cv2.erode(binary_img, kernel, iterations=DETECT_ERODE_ITERATIONS)
+
+    removed = clear_border_connected(binary_img)
+    if removed > 0:
+        log_lines.append(f"Removed border-connected structure: "
+                         f"{removed:.1%} of foreground")
+
+    contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    kept_contours = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if w >= min_w and h >= min_h:
+            boxes.append((x, y, w, h))
+            kept_contours.append(c)
+    return boxes, kept_contours, binary_img, log_lines
+
+
+# No single microfiche page spans close to the whole card in either dimension
+# (real grids run 2-16 columns, 1-13 rows). A detection wider or taller than
+# this share of the image is a polarity artifact - a full row or column read
+# as foreground - not a page.
+PAGE_MAX_SPAN = 0.6
+
+
+def page_likeness_score(boxes, width, height):
+    """Score a detection result: +1 per plausible page, -1 per impossible one.
+
+    The right threshold polarity yields floating page-sized boxes; the wrong
+    one yields full-width rows (or nothing). Counting boxes alone cannot tell
+    those apart - six rows outnumber two pages - so impossible spans count
+    AGAINST the polarity that produced them.
+    """
+    score = 0
+    for _, _, w, h in boxes:
+        if w > width * PAGE_MAX_SPAN or h > height * PAGE_MAX_SPAN:
+            score -= 1
+        else:
+            score += 1
+    return score
+
+
+def autodetect_inversion(binary_img, header_skip_px, min_w, min_h):
+    """Decide threshold polarity by trying both and scoring page-likeness.
+
+    Border sampling cannot decide this: the dark mounting surround frames both
+    card types, so the border ring reads as background either way (measured on
+    the real journal card, 2026-09-04). Instead run the cheap detect-scale
+    pipeline on both polarities and keep the one producing page-like boxes.
+    Ties (e.g. a blank jacket) keep normal polarity - never guess, let the
+    no-pages failure speak.
+
+    binary_img is not modified; trials run on copies.
+    """
+    H, W = binary_img.shape
+    normal, _, _, _ = detect_page_boxes(
+        binary_img.copy(), header_skip_px, min_w, min_h)
+    inverted, _, _, _ = detect_page_boxes(
+        cv2.bitwise_not(binary_img), header_skip_px, min_w, min_h)
+    return page_likeness_score(inverted, W, H) > page_likeness_score(normal, W, H)
+
+
 def erosion_radius(kernel_size, iterations):
     """Pixels eaten from each side of a blob by cv2.erode with this kernel."""
     return (kernel_size // 2) * iterations
@@ -595,7 +676,11 @@ def main():
     parser.add_argument('--header-skip', '-hs', type=float, default=HEADER_SKIP_RATIO,
                         help='Fraction of image height to skip at top (for header)')
     parser.add_argument('--invert', action='store_true',
-                        help='Invert binary image (if pages are dark on light background)')
+                        help='Force inverted polarity (dark pages on light card). '
+                             'Default: auto-detected per card.')
+    parser.add_argument('--no-invert', action='store_true',
+                        help='Force normal polarity (bright pages on dark card), '
+                             'disabling auto-detection.')
     parser.add_argument('--padding', '-p', type=float, default=None,
                         help='Crop margin around detected pages (pixels, or fraction of '
                              f'the median page if 0-1). Default: {DEFAULT_PADDING_RATIO} '
@@ -636,6 +721,11 @@ def main():
 
     if not args.input:
         print("ERROR: --input is required", file=sys.stderr)
+        return 1
+
+    if args.invert and args.no_invert:
+        print("ERROR: --invert and --no-invert are mutually exclusive",
+              file=sys.stderr)
         return 1
 
     input_file = args.input
@@ -728,9 +818,26 @@ def main():
     # === STEP 2: Find contours in the binary image ===
     print("Finding contours on downsampled image...")
 
-    # Invert if needed
-    if args.invert:
-        print("Inverting binary image...")
+    # Threshold polarity. The two known card types are opposite (Yamaha-type:
+    # bright pages on dark card; journal jackets: dark pages on light card)
+    # and the app sends no flag, so the default is per-card auto-detection -
+    # announced LOUDLY, because a silent wrong guess looks like a normal run.
+    min_w = int(original_width * detect_scale * MIN_PAGE_WIDTH_RATIO)
+    min_h = int(original_height * detect_scale * MIN_PAGE_HEIGHT_RATIO)
+    header_skip_px_small = int(original_height * detect_scale * args.header_skip)
+
+    if args.no_invert:
+        do_invert = False
+    elif args.invert:
+        do_invert = True
+        print("Inverting binary image (forced by --invert)...")
+    else:
+        do_invert = autodetect_inversion(
+            binary_img, header_skip_px_small, min_w, min_h)
+        if do_invert:
+            print("Auto-detected polarity: INVERTING "
+                  "(dark pages on a light card)")
+    if do_invert:
         binary_img = cv2.bitwise_not(binary_img)
 
     # Second degenerate-threshold symptom: a real Otsu value but ~everything
@@ -741,51 +848,13 @@ def main():
                       f"(sane maximum {FOREGROUND_SANE_MAX:.0%}; "
                       "blank or washed-out scan, not a card)")
 
-    # Calculate header skip in pixels (on downsampled image)
-    header_skip_px_small = int(original_height * detect_scale * args.header_skip)
+    # === STEP 3: Detect, filter and sort bounding boxes ===
     print(f"Skipping top {header_skip_px_small} pixels in downsampled image (header region)")
-
-    # Mask out header region
-    if header_skip_px_small > 0:
-        binary_img[:header_skip_px_small, :] = 0
-
-    # Delete full-width structure rows (stripes, header/bottom bands) BEFORE
-    # erosion: connectivity cannot separate structure from a page whose sleeve
-    # overlaps its stripe, but full-width geometry can.
-    min_h_detect = int(original_height * detect_scale * MIN_PAGE_HEIGHT_RATIO)
-    removed_rows = remove_structure_rows(
-        binary_img, min_h_detect, header_skip_px_small)
-    if removed_rows:
-        print(f"Removed {removed_rows} full-width structure row-run(s) "
-              "(stripes / edge bands)")
-
-    # Apply erosion to separate touching pages
-    # Kernel size depends on gap between pages (at 10% scale, ~5-10 pixels)
-    print(f"Applying erosion (kernel={DETECT_ERODE_KERNEL}) to separate pages...")
-    kernel = np.ones((DETECT_ERODE_KERNEL, DETECT_ERODE_KERNEL), np.uint8)
-    binary_img = cv2.erode(binary_img, kernel, iterations=DETECT_ERODE_ITERATIONS)
-
-    # The card's frame and stripes reach the border; pages never do. Remove
-    # border-connected foreground so structure cannot enclose (and hide) pages.
-    removed = clear_border_connected(binary_img)
-    if removed > 0:
-        print(f"Removed border-connected structure: {removed:.1%} of foreground")
-
-    print("Finding contours...")
-    contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # === STEP 3: Filter and sort bounding boxes ===
-    # Min sizes on downsampled image
-    min_w = int(original_width * detect_scale * MIN_PAGE_WIDTH_RATIO)
-    min_h = int(original_height * detect_scale * MIN_PAGE_HEIGHT_RATIO)
-
-    boxes = []
-    filtered_contours = []
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        if w >= min_w and h >= min_h:
-            boxes.append((x, y, w, h))
-            filtered_contours.append(c)
+    print(f"Detecting pages (erosion kernel={DETECT_ERODE_KERNEL})...")
+    boxes, filtered_contours, binary_img, det_log = detect_page_boxes(
+        binary_img, header_skip_px_small, min_w, min_h)
+    for line in det_log:
+        print(line)
 
     print(f"Found {len(boxes)} potential pages")
 
@@ -890,7 +959,7 @@ def main():
             return refine_box_local(
                 input_file, box, otsu_thresh,
                 original_width, original_height,
-                invert=args.invert, header_skip_px=header_skip_fullres)
+                invert=do_invert, header_skip_px=header_skip_fullres)
 
         refined = [None] * len(boxes_fullres)
         refine_done = 0
@@ -971,6 +1040,8 @@ def main():
     banner = np.zeros((banner_h, viz.shape[1], 3), dtype=np.uint8)
     banner[:] = (30, 30, 30)
     label = f"Card Quality: {q}/100 ({grade})  |  {quality['grid']}  |  size={quality['size']}  align={quality['alignment']}  spacing={quality['spacing']}  shape={quality['shape']}"
+    if do_invert:
+        label += "  |  inverted" + ("" if args.invert else " (auto)")
     cv2.putText(banner, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, banner_color, 2)
     viz = np.vstack([banner, viz])
 
