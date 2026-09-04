@@ -1041,10 +1041,16 @@ def main():
 
         print(f"\nExtracted {len(boxes_fullres)} pages to {pages_dir}/")
 
-        # Keep the header band as page zero. Everything above the first page row
-        # is masked during detection, and it carries the only text identifying
-        # the card, so throwing it away loses the card's identity.
+        # Keep the header band as page zero. Everything above the first page
+        # row IS the header - on the real journal cards the typed text sits
+        # below the fixed mask line (2026-09-04: a ratio-only crop cut the
+        # date and card index in half), so the crop extends to the topmost
+        # detected page. Capped at twice the configured band so a sparse card
+        # cannot swallow empty rows into page_000; never less than the band.
         header_px = int(original_height * args.header_skip)
+        if boxes_fullres:
+            first_page_y = min(b[1] for b in boxes_fullres)
+            header_px = max(header_px, min(first_page_y, header_px * 2))
         if not args.no_header_page and header_px > 0:
             src = pyvips.Image.new_from_file(input_file, access='random')
             header = src.crop(0, 0, original_width, header_px).resize(HEADER_PROXY_SCALE)

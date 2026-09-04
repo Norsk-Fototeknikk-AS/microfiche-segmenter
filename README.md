@@ -143,7 +143,11 @@ wants `<root>/<fid>/` must pass `-O <root>/<fid>` itself.
 ### C11. The header band is kept as page zero
 
 `--header-skip` masks the top of the card during detection so the header is not
-found as a page. That band is written out as `pages/page_000.tif`.
+found as a page. The band written out as `pages/page_000.tif` is card-adaptive
+(2026-09-04): it extends from the top down to the first detected page row —
+never less than the configured band, capped at twice it. On the real journal
+card the typed text sits *below* the 8 % mask line, so a ratio-only crop cut
+the date and card index in half; everything above the pages is the header.
 
 **On by default since 2026-08-23**, once the import side could handle it:
 `split_scan_dump._journal_pages` separates page zero from the page sequence and

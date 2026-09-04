@@ -587,6 +587,34 @@ def test_real_card_finds_the_taped_pages():
     assert 380 < w < 480 and 250 < h < 350, boxes      # two pages wide, one high
 
 
+def test_header_page_reaches_down_to_the_first_page_row(tmp_path):
+    """On the real journal card the typed header text sits BELOW the 8% mask
+    line - a fixed-ratio page_000 crop cuts the date and card index in half.
+    The header is by definition everything above the first page row, so the
+    crop must extend to the topmost detected page (capped at twice the
+    configured band, so a sparse card cannot swallow empty rows into it)."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.full((12000, 16000), 230, 'uint8')
+    a[:800, :] = 20; a[-800:, :] = 20; a[:, :800] = 20; a[:, -800:] = 20
+    for r in range(3):
+        y = 1000 + r * 2400
+        a[y:y + 200, :] = 30
+        for c in range(4):
+            x = 1000 + c * 3600
+            a[y + 300:y + 2100, x:x + 3000] = 25
+    pyvips.Image.new_from_memory(a.tobytes(), 16000, 12000, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out),
+                         "--invert", "--no-archive")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    header = pyvips.Image.new_from_file(str(out / "pages" / "page_000.tif"))
+    # First page row starts at y=1300 (10.8% of 12000); the 8% mask alone
+    # would cut at 960. At 1/16 scale: >= 1240/16 = 77, old behavior 60.
+    assert header.height >= 77, header.height
+    assert header.height <= int(12000 * 0.08 * 2) // 16 + 1, header.height
+
+
 # --- Structure-row removal ---------------------------------------------------
 # The real journal cards (2026-09-04) are light jackets with dark edge-to-edge
 # stripes between rows, plus dark bands along the header and the bottom.
