@@ -32,9 +32,11 @@ HEADER_SKIP_RATIO = 0.08  # Skip top 8% for yellow header
 MIN_PAGE_WIDTH_RATIO = 0.02
 MIN_PAGE_HEIGHT_RATIO = 0.02
 
-# Maximum grid size for validation
-MAX_COLUMNS = 16
-MAX_ROWS = 13
+# Physical card limits (Trond, 2026-09-04): at most 5 rows of up to 11 pages,
+# and no column structure at all - rows start where they start. Exceeding
+# either axis is itself a misdetection signal.
+MAX_ROWS = 5
+MAX_PAGES_PER_ROW = 11
 
 # Erosion used to separate touching pages. Both passes shrink every blob by a
 # known amount, which is added back to the boxes so they land on the true page
@@ -308,7 +310,7 @@ def detect_page_boxes(binary_img, header_skip_px, min_w, min_h):
 
 
 # No single microfiche page spans close to the whole card in either dimension
-# (real grids run 2-16 columns, 1-13 rows). A detection wider or taller than
+# (real cards run up to 11 pages per row, up to 5 rows). A detection wider or taller than
 # this share of the image is a polarity artifact - a full row or column read
 # as foreground - not a page.
 PAGE_MAX_SPAN = 0.6
@@ -510,60 +512,55 @@ def sort_boxes_by_columns(boxes, tolerance_ratio=0.5):
     return result
 
 
-def sort_boxes_by_rows(boxes, tolerance_ratio=0.5):
-    """Sort boxes: top-to-bottom by row, left-to-right within each row."""
+def group_boxes_into_rows(boxes, tolerance_ratio=0.5):
+    """Group boxes into rows by y proximity; each row sorted left-to-right.
+
+    Rows are the card's only real axis - there is no column structure, and
+    rows start where they start (Trond, 2026-09-04).
+    """
     if not boxes:
         return []
 
-    # Sort by y first
     boxes_sorted = sorted(boxes, key=lambda b: b[1])
-
-    # Group into rows based on y overlap
     avg_height = np.mean([b[3] for b in boxes])
     tolerance = avg_height * tolerance_ratio
 
-    rows = []
-    current_row = [boxes_sorted[0]]
-
+    rows = [[boxes_sorted[0]]]
     for box in boxes_sorted[1:]:
-        # Check if this box is in the same row as previous
-        prev_y = current_row[-1][1]
-        if abs(box[1] - prev_y) < tolerance:
-            current_row.append(box)
+        if abs(box[1] - rows[-1][-1][1]) < tolerance:
+            rows[-1].append(box)
         else:
-            # New row
-            rows.append(sorted(current_row, key=lambda b: b[0]))  # Sort by x
-            current_row = [box]
+            rows.append([box])
+    return [sorted(row, key=lambda b: b[0]) for row in rows]
 
-    rows.append(sorted(current_row, key=lambda b: b[0]))
 
-    # Flatten
-    result = []
-    for row in rows:
-        result.extend(row)
-
-    return result
+def sort_boxes_by_rows(boxes, tolerance_ratio=0.5):
+    """Sort boxes: top-to-bottom by row, left-to-right within each row."""
+    return [box for row in group_boxes_into_rows(boxes, tolerance_ratio)
+            for box in row]
 
 
 def compute_card_quality(boxes, contours):
     """Compute card-level quality score (0-100) for segmentation results.
 
+    Rows are the card's only real axis - there is no column structure, and
+    rows are NOT vertically aligned with each other (Trond, 2026-09-04), so
+    nothing here may reward or punish column geometry.
+
     Components:
     - Size consistency (30%): How uniform page sizes are
-    - Grid alignment (40%): How well pages align to a grid
-    - Spacing regularity (20%): How uniform gaps between pages are
+    - Row alignment (40%): How level the pages sit within each row
+    - Spacing regularity (20%): Rhythm of row centers and of in-row gaps
     - Shape regularity (10%): How rectangular the detections are
     """
     if len(boxes) < 2:
         # 'grid' included even here: callers print it unconditionally.
+        grid = "1 row: 1" if boxes else "0 rows"
         return {'total': 100.0, 'size': 100.0, 'alignment': 100.0,
-                'spacing': 100.0, 'shape': 100.0,
-                'grid': f"{len(boxes)}x{len(boxes)}"}
+                'spacing': 100.0, 'shape': 100.0, 'grid': grid}
 
     widths = np.array([b[2] for b in boxes])
     heights = np.array([b[3] for b in boxes])
-    xs = np.array([b[0] for b in boxes])
-    ys = np.array([b[1] for b in boxes])
 
     # --- 1. Size consistency (30%) ---
     w_median = np.median(widths)
@@ -572,61 +569,36 @@ def compute_card_quality(boxes, contours):
     h_cv = np.std(heights) / h_median if h_median > 0 else 0
     size_score = max(0.0, 100.0 * (1.0 - (w_cv + h_cv) * 2.0))
 
-    # --- 2. Grid alignment (40%) ---
-    avg_width = np.mean(widths)
-    col_tolerance = avg_width * 0.5
+    rows = group_boxes_into_rows(boxes)
+    grid = (f"{len(rows)} row" + ("s" if len(rows) != 1 else "") + ": "
+            + "+".join(str(len(r)) for r in rows))
 
-    sorted_by_x = sorted(range(len(boxes)), key=lambda i: xs[i])
-    columns = [[sorted_by_x[0]]]
-    for idx in sorted_by_x[1:]:
-        if abs(xs[idx] - xs[columns[-1][-1]]) < col_tolerance:
-            columns[-1].append(idx)
-        else:
-            columns.append([idx])
-
+    # --- 2. Row alignment (40%): pages in a row sit level ---
     avg_height = np.mean(heights)
-    row_tolerance = avg_height * 0.5
-
-    sorted_by_y = sorted(range(len(boxes)), key=lambda i: ys[i])
-    rows = [[sorted_by_y[0]]]
-    for idx in sorted_by_y[1:]:
-        if abs(ys[idx] - ys[rows[-1][-1]]) < row_tolerance:
-            rows[-1].append(idx)
-        else:
-            rows.append([idx])
-
-    col_spreads = []
-    for col in columns:
-        if len(col) > 1:
-            spread = np.std(xs[col]) / avg_width if avg_width > 0 else 0
-            col_spreads.append(spread)
-
-    row_spreads = []
-    for row in rows:
-        if len(row) > 1:
-            spread = np.std(ys[row]) / avg_height if avg_height > 0 else 0
-            row_spreads.append(spread)
-
-    avg_col_spread = np.mean(col_spreads) if col_spreads else 0
+    row_spreads = [np.std([b[1] for b in row]) / avg_height
+                   for row in rows if len(row) > 1]
     avg_row_spread = np.mean(row_spreads) if row_spreads else 0
-    alignment_score = max(0.0, 100.0 * (1.0 - (avg_col_spread + avg_row_spread) * 5.0))
+    alignment_score = max(0.0, 100.0 * (1.0 - avg_row_spread * 10.0))
 
-    # --- 3. Spacing regularity (20%) ---
-    col_centers = sorted(np.mean(xs[col]) for col in columns)
-    col_gaps = np.diff(col_centers) if len(col_centers) > 1 else np.array([])
-
-    row_centers = sorted(np.mean(ys[row]) for row in rows)
-    row_gaps = np.diff(row_centers) if len(row_centers) > 1 else np.array([])
-
+    # --- 3. Spacing regularity (20%): row rhythm + in-row gap rhythm ---
     gap_scores = []
-    if len(col_gaps) > 1:
-        col_gap_cv = np.std(col_gaps) / np.mean(col_gaps) if np.mean(col_gaps) > 0 else 0
-        gap_scores.append(max(0.0, 100.0 * (1.0 - col_gap_cv * 3.0)))
+    row_centers = sorted(np.mean([b[1] for b in row]) for row in rows)
+    row_gaps = np.diff(row_centers)
+    if len(row_gaps) > 1 and np.mean(row_gaps) > 0:
+        row_gap_cv = np.std(row_gaps) / np.mean(row_gaps)
+        gap_scores.append(max(0.0, 100.0 * (1.0 - row_gap_cv * 3.0)))
     else:
         gap_scores.append(100.0)
-    if len(row_gaps) > 1:
-        row_gap_cv = np.std(row_gaps) / np.mean(row_gaps) if np.mean(row_gaps) > 0 else 0
-        gap_scores.append(max(0.0, 100.0 * (1.0 - row_gap_cv * 3.0)))
+
+    in_row_cvs = []
+    for row in rows:
+        if len(row) >= 3:
+            centers = [b[0] + b[2] / 2 for b in row]
+            gaps = np.diff(centers)
+            if np.mean(gaps) > 0:
+                in_row_cvs.append(np.std(gaps) / np.mean(gaps))
+    if in_row_cvs:
+        gap_scores.append(max(0.0, 100.0 * (1.0 - np.mean(in_row_cvs) * 3.0)))
     else:
         gap_scores.append(100.0)
     spacing_score = float(np.mean(gap_scores))
@@ -653,7 +625,7 @@ def compute_card_quality(boxes, contours):
         'alignment': round(alignment_score, 1),
         'spacing': round(spacing_score, 1),
         'shape': round(shape_score, 1),
-        'grid': f"{len(columns)}x{len(rows)}",
+        'grid': grid,
     }
 
 
@@ -1077,11 +1049,16 @@ def main():
     quality = compute_card_quality(
         boxes_fullres, filtered_contours if split_count == 0 else None)
 
-    # Validate against max grid size
-    max_pages = MAX_COLUMNS * MAX_ROWS
-    if len(boxes_fullres) > max_pages:
-        print(f"Warning: Found {len(boxes_fullres)} pages, exceeds max grid {MAX_COLUMNS}x{MAX_ROWS}={max_pages}")
-        print("Consider adjusting MIN_PAGE_WIDTH_RATIO or MIN_PAGE_HEIGHT_RATIO")
+    # Validate against the physical card: more rows or more pages per row
+    # than any real card holds is a misdetection signal in itself.
+    layout_rows = group_boxes_into_rows(boxes_fullres)
+    if len(layout_rows) > MAX_ROWS:
+        print(f"Warning: {len(layout_rows)} rows detected - real cards hold "
+              f"at most {MAX_ROWS}. Likely misdetection.")
+    for i, row in enumerate(layout_rows, 1):
+        if len(row) > MAX_PAGES_PER_ROW:
+            print(f"Warning: {len(row)} pages in one row (row {i}) - real "
+                  f"cards hold at most {MAX_PAGES_PER_ROW}. Likely misdetection.")
 
     # Sort based on reading order
     if args.order == 'columns':

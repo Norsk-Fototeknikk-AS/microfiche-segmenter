@@ -279,7 +279,7 @@ mechanism it serves.
 
 ### Tests
 
-82 tests, ~12 s (was 32 when this was written). Unit tests for box
+88 tests, ~12 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 
@@ -306,9 +306,10 @@ Do not assume any of this works. None of it has been exercised.
   (requires `--invert`), edge-to-edge stripes between rows, sleeves that can
   overlap stripes. Still unproven: real page texture (tape is uniform; fiche
   negatives are not), full cards, and page-to-page contrast.
-- **`--order rows`.** Never used on real data; the test card is `columns`.
-  Sharper since 2026-09-03: `rows` is now the *default*, so every app-driven
-  run takes this unproven path unless `--order columns` is passed.
+- ~~**`--order rows`.**~~ Confirmed correct 2026-09-04, from the domain:
+  real cards are rows-only — at most 5 rows of up to 11 pages, no column
+  structure, rows not vertically aligned. `--order columns` matches no real
+  card and is kept only so existing callers do not break.
 - ~~**`--invert`.**~~ Exercised on the first real journal card 2026-09-04 —
   and it was **broken** (uint8 wrap made everything foreground; fixed same
   day). The real journal cards are dark-pages-on-light-jacket. Resolved

@@ -171,18 +171,91 @@ from segment_microfiche import compute_card_quality
 def test_quality_reports_a_grid_for_a_single_box():
     """main() reads quality['grid'] unconditionally, so it must always exist."""
     q = compute_card_quality([(0, 0, 100, 100)], None)
-    assert q['grid'] == "1x1"
+    assert q['grid'] == "1 row: 1"
 
 
 def test_quality_reports_a_grid_for_no_boxes():
     q = compute_card_quality([], None)
-    assert q['grid'] == "0x0"
+    assert q['grid'] == "0 rows"
+
+
+def test_grid_string_reports_rows_and_their_counts():
+    """The cards have rows, not a grid: 'no columns' (Trond, 2026-09-04).
+    Report what is real - row count and pages per row."""
+    boxes = [(100 + c * 500, 100 + r * 400, 400, 300)
+             for r in range(3) for c in range(4)]
+    q = compute_card_quality(boxes, None)
+    assert q['grid'] == "3 rows: 4+4+4"
+
+
+def test_unaligned_rows_are_not_penalized():
+    """Rows start where they start - pages in different rows are NOT
+    vertically aligned on real cards. Column alignment must not drag the
+    score down for a correctly detected card."""
+    aligned = [(100 + c * 500, 100 + r * 400, 400, 300)
+               for r in range(3) for c in range(4)]
+    shifted = [(100 + c * 500 + r * 230, 100 + r * 400, 400, 300)
+               for r in range(3) for c in range(4)]
+    q_aligned = compute_card_quality(aligned, None)
+    q_shifted = compute_card_quality(shifted, None)
+    assert q_shifted['alignment'] == q_aligned['alignment']
+    assert q_shifted['total'] > 80, q_shifted
+
+
+def test_irregular_spacing_within_a_row_still_scores_lower():
+    """In-row spacing is the real spacing axis and must still be measured."""
+    regular = [(100 + c * 500, 100, 400, 300) for c in range(5)]
+    irregular = [(100, 100, 400, 300), (620, 100, 400, 300),
+                 (1400, 100, 400, 300), (1850, 100, 400, 300),
+                 (2700, 100, 400, 300)]
+    assert (compute_card_quality(irregular, None)['spacing']
+            < compute_card_quality(regular, None)['spacing'])
 
 
 def test_quality_always_carries_the_keys_main_prints():
     for boxes in ([], [(0, 0, 10, 10)], [(0, 0, 10, 10), (20, 0, 10, 10)]):
         q = compute_card_quality(boxes, None)
         assert set(q) >= {'total', 'size', 'alignment', 'spacing', 'shape', 'grid'}
+
+
+# --- Card geometry limits ----------------------------------------------------
+# Domain truth (Trond, 2026-09-04): at most 5 rows, 11 pages per row, and no
+# column structure at all. Tighter caps are misdetection tripwires.
+
+from segment_microfiche import MAX_PAGES_PER_ROW, MAX_ROWS
+
+
+def test_card_limits_match_the_physical_cards():
+    assert MAX_ROWS == 5
+    assert MAX_PAGES_PER_ROW == 11
+
+
+def test_too_many_pages_in_a_row_warns(tmp_path):
+    """make_card's fixed pitch cannot hold 12 columns, so build a wide card."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.zeros((800, 6400), 'uint8')
+    for c in range(12):
+        a[200:540, 60 + c * 520:460 + c * 520] = 255
+    pyvips.Image.new_from_memory(a.tobytes(), 6400, 800, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+    proc = run_segmenter("-i", str(src), "-O", str(out),
+                         "--skip-extraction", "--no-invert")
+    assert proc.returncode == 0, proc.stderr
+    assert "12 pages in one row" in proc.stdout, proc.stdout
+
+
+def test_too_many_rows_warns(tmp_path):
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.zeros((3000, 1200), 'uint8')
+    for r in range(6):
+        for c in range(2):
+            a[100 + r * 480:440 + r * 480, 100 + c * 500:500 + c * 500] = 255
+    pyvips.Image.new_from_memory(a.tobytes(), 1200, 3000, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+    proc = run_segmenter("-i", str(src), "-O", str(out),
+                         "--skip-extraction", "--no-invert", "--header-skip", "0")
+    assert proc.returncode == 0, proc.stderr
+    assert "6 rows" in proc.stdout, proc.stdout
 
 
 # --- End-to-end on a synthetic card ----------------------------------------

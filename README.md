@@ -271,7 +271,7 @@ the end.
 |---|---|---|
 | `-i, --input` | — | panorama; anything libvips can open |
 | `-O, --output` | `<input dir>/segmented/<stem>/` | the card folder |
-| `-o, --order` | `rows` | `rows` = right then down (slik journaler leses); `columns` = down then right |
+| `-o, --order` | `rows` | `rows` = right then down (slik journaler leses); `columns` = down then right — matches no real card, kept for compatibility |
 | `-hs, --header-skip` | `0.08` | fraction of height masked at top; this band becomes `page_000.tif` (C11). `0` disables both |
 | `--no-header-page` | off | suppress the header band `pages/page_000.tif` (C11) |
 | `--no-archive` | off | leave the panorama in place instead of archiving (C13) |
@@ -323,7 +323,13 @@ the end.
    the real card: the tape pair splits at the measured valley. `--no-split`
    disables. Then sort into reading order.
 8. Optionally refine each box by re-detecting locally at 20 %.
-9. Score the card (size consistency, grid alignment, spacing, shape).
+9. Score the card (size consistency, **row** alignment, spacing, shape).
+   Rows are the only real axis — real cards hold at most 5 rows of up to 11
+   pages, rows are NOT vertically aligned with each other, and there is no
+   column structure (Trond, 2026-09-04). Nothing in the score rewards or
+   punishes column geometry, and the reported layout is honest: `3 rows:
+   4+4+4`, not an invented `NxM` grid. More than 5 rows or more than 11 pages
+   in a row is warned about as likely misdetection.
 10. Crop each page with the margin and write TIFFs in parallel (5 workers).
 11. Write the header band as `page_000.tif` (C11).
 12. Write `_done` (C2).
