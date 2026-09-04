@@ -213,18 +213,35 @@ def remove_structure_rows(binary_img, min_page_h, top_boundary):
     """
     h, w = binary_img.shape
     coverage = (binary_img > 0).sum(axis=1) / w
-    removed = 0
+
+    # Raw runs of full-width rows...
+    runs = []
     y = 0
     while y < h:
         if coverage[y] > STRIPE_COVERAGE:
             start = y
             while y < h and coverage[y] > STRIPE_COVERAGE:
                 y += 1
-            if (y - start) < min_page_h or start <= top_boundary or y >= h:
-                binary_img[start:y, :] = 0
-                removed += 1
+            runs.append([start, y])
         else:
             y += 1
+
+    # ...coalesced across tiny gaps: noise can make a band's coverage straddle
+    # the threshold row by row, shredding it into 1-row "stripes" that each
+    # fall under the height floor and shave real pages. Judged as one band, it
+    # is page-height and survives. Real stripes sit hundreds of rows apart.
+    merged = []
+    for run in runs:
+        if merged and run[0] - merged[-1][1] <= 2:
+            merged[-1][1] = run[1]
+        else:
+            merged.append(run)
+
+    removed = 0
+    for start, end in merged:
+        if (end - start) < min_page_h or start <= top_boundary or end >= h:
+            binary_img[start:end, :] = 0
+            removed += 1
     return removed
 
 
@@ -321,8 +338,9 @@ def autodetect_inversion(binary_img, header_skip_px, min_w, min_h):
     card types, so the border ring reads as background either way (measured on
     the real journal card, 2026-09-04). Instead run the cheap detect-scale
     pipeline on both polarities and keep the one producing page-like boxes.
-    Ties (e.g. a blank jacket) keep normal polarity - never guess, let the
-    no-pages failure speak.
+    A scoreless tie prefers inverted: the production default is the journal
+    card type - dark pages on a light jacket (Trond, 2026-09-04). Either way
+    a tie ends in the loud no-pages failure downstream.
 
     binary_img is not modified; trials run on copies.
     """
@@ -331,7 +349,98 @@ def autodetect_inversion(binary_img, header_skip_px, min_w, min_h):
         binary_img.copy(), header_skip_px, min_w, min_h)
     inverted, _, _, _ = detect_page_boxes(
         cv2.bitwise_not(binary_img), header_skip_px, min_w, min_h)
-    return page_likeness_score(inverted, W, H) > page_likeness_score(normal, W, H)
+    return page_likeness_score(inverted, W, H) >= page_likeness_score(normal, W, H)
+
+
+# A projection valley must drop below this share of the box's median level to
+# count as a gap between pages. Measured on the real card: gap 0.45 against
+# page level 0.99 (ratio 0.45); in-page content variation stays far above.
+SPLIT_VALLEY_RATIO = 0.6
+
+
+def find_projection_valleys(share, min_gap):
+    """Find gap positions in a 1-D foreground-share profile of a merged box.
+
+    A valley is a run of at least min_gap positions whose share drops below
+    SPLIT_VALLEY_RATIO x the profile's median, not touching either end (a low
+    run at the edge is the box boundary, not an internal gap). Returns the
+    center index of each valley.
+    """
+    share = np.asarray(share, dtype=float)
+    threshold = float(np.median(share)) * SPLIT_VALLEY_RATIO
+    below = share < threshold
+    valleys = []
+    i = 0
+    n = len(below)
+    while i < n:
+        if below[i]:
+            start = i
+            while i < n and below[i]:
+                i += 1
+            if start > 0 and i < n and (i - start) >= min_gap:
+                valleys.append((start + i - 1) // 2)
+        else:
+            i += 1
+    return valleys
+
+
+# Scan scale for the split pass: same as the local refine pass. The real
+# valley (24 full-res px) is ~5px here - resolvable, where the 10% detect
+# scale blurs it into the pages.
+SPLIT_SCAN_SCALE = 0.2
+
+
+def split_box_by_projection(input_file, box, otsu_thresh, invert, min_w, min_h):
+    """Split one detection into the pages it contains, by projection valleys.
+
+    Loads the box region, downsamples to SPLIT_SCAN_SCALE and thresholds
+    AFTER the resize: averaging first is what makes a dirty gap (mixed
+    dark/light, like the real card's overlapping tapes at 45% foreground)
+    read as background, while the full-res-thresholded detect pass read it
+    as page and merged the neighbors.
+
+    Column valleys split vertically, row valleys horizontally (a fused block
+    splits into a grid). A split line that would leave a piece smaller than
+    min_w/min_h (full-res) is noise, not a gap. Returns full-res boxes;
+    [box] unchanged when no valley is found.
+    """
+    x, y, w, h = box
+    img = pyvips.Image.new_from_file(input_file, access='random')
+    region = img.crop(x, y, w, h)
+    if region.bands > 1:
+        region = region.colourspace('b-w')
+    small = region.resize(SPLIT_SCAN_SCALE)
+    a = np.ndarray(buffer=small.write_to_memory(), dtype=np.uint8,
+                   shape=[small.height, small.width])
+    fg = a >= otsu_thresh
+    if invert:
+        fg = ~fg
+
+    min_gap = max(2, int(10 * SPLIT_SCAN_SCALE))
+    col_cuts = find_projection_valleys(fg.mean(axis=0), min_gap)
+    row_cuts = find_projection_valleys(fg.mean(axis=1), min_gap)
+
+    def segments(cuts, length, min_len):
+        # A cut that would leave an under-sized piece is noise - typically an
+        # edge artifact from the background rim inside the box (seen on the
+        # real card: a col-7 artifact next to the real col-430 gap). Judge
+        # each cut alone, so an artifact never vetoes a real gap.
+        kept = []
+        prev = 0
+        for cut in (int(c / SPLIT_SCAN_SCALE) for c in cuts):
+            if cut - prev >= min_len and length - cut >= min_len:
+                kept.append(cut)
+                prev = cut
+        edges = [0] + kept + [length]
+        return [(edges[i], edges[i + 1] - edges[i])
+                for i in range(len(edges) - 1)]
+
+    x_parts = segments(col_cuts, w, min_w)
+    y_parts = segments(row_cuts, h, min_h)
+    if len(x_parts) == 1 and len(y_parts) == 1:
+        return [box]
+    return [(x + px, y + py, pw, ph)
+            for (py, ph) in y_parts for (px, pw) in x_parts]
 
 
 def erosion_radius(kernel_size, iterations):
@@ -695,6 +804,9 @@ def main():
                              'inherit the artifacts.')
     parser.add_argument('--refine', action='store_true',
                         help='Refine page positions using local high-res re-detection')
+    parser.add_argument('--no-split', action='store_true',
+                        help='Do not split merged detections at projection '
+                             'valleys (splitting is the default).')
     parser.add_argument('--output', '-O', default=None,
                         help='Output directory (default: segmented/<card_name>/ next to input)')
     parser.add_argument('--no-archive', action='store_true',
@@ -905,48 +1017,79 @@ def main():
                   f"size {int(w * scale_up)} x {int(h * scale_up)} full-res")
         print(f"{len(boxes)} pages remain")
 
-    # Warn loudly about kept boxes that look like several pages fused into one
-    # (weak edges at detect scale). They are kept - dropping loses content -
-    # but the operator must see it in the log, not just as a wide box in the
-    # viz. Splitting is a known follow-up, pending a real failing card.
-    if len(boxes) >= 4:
-        med_w = np.median([b[2] for b in boxes])
-        med_h = np.median([b[3] for b in boxes])
-        scale_up = 1.0 / detect_scale
-        for (x, y, w, h) in boxes:
-            if w > med_w * 1.5 or h > med_h * 1.5:
-                print(f"WARNING: suspected merged pages "
-                      f"(~{max(round(w / med_w), round(h / med_h))} fused): "
-                      f"at ({int(x * scale_up)}, {int(y * scale_up)}) "
-                      f"size {int(w * scale_up)} x {int(h * scale_up)} full-res")
-
-    # === Compute card quality score ===
-    quality = compute_card_quality(boxes, filtered_contours)
-
-    # Validate against max grid size
-    max_pages = MAX_COLUMNS * MAX_ROWS
-    if len(boxes) > max_pages:
-        print(f"Warning: Found {len(boxes)} pages, exceeds max grid {MAX_COLUMNS}x{MAX_ROWS}={max_pages}")
-        print("Consider adjusting MIN_PAGE_WIDTH_RATIO or MIN_PAGE_HEIGHT_RATIO")
-
-    # Sort based on reading order
-    if args.order == 'columns':
-        print("Sorting by columns (left-to-right, then top-to-bottom within each column)")
-        boxes_sorted = sort_boxes_by_columns(boxes)
-    else:
-        print("Sorting by rows (top-to-bottom, then left-to-right within each row)")
-        boxes_sorted = sort_boxes_by_rows(boxes)
-
     # === STEP 4: Scale coordinates back to original size ===
     scale_back = 1.0 / detect_scale
     boxes_fullres = []
-    for (x, y, w, h) in boxes_sorted:
+    for (x, y, w, h) in boxes:
         boxes_fullres.append((
             int(x * scale_back),
             int(y * scale_back),
             int(w * scale_back),
             int(h * scale_back)
         ))
+
+    # === STEP 4a: Split merged detections at projection valleys ===
+    # Weak edges fuse touching pages into one detection; the gap between real
+    # pages is a projection valley at scan scale. Scanned per box against the
+    # source file (like refine), split boxes replace their merge.
+    split_count = 0
+    if not args.no_split:
+        min_w_full = int(original_width * MIN_PAGE_WIDTH_RATIO)
+        min_h_full = int(original_height * MIN_PAGE_HEIGHT_RATIO)
+
+        def _split_one(box):
+            return split_box_by_projection(
+                input_file, box, otsu_thresh, do_invert, min_w_full, min_h_full)
+
+        pieces = [None] * len(boxes_fullres)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(_split_one, b): i
+                       for i, b in enumerate(boxes_fullres)}
+            for future in as_completed(futures):
+                pieces[futures[future]] = future.result()
+
+        split_boxes = []
+        for original, parts in zip(boxes_fullres, pieces):
+            if len(parts) > 1:
+                split_count += len(parts) - 1
+                x, y, w, h = original
+                print(f"Split merged detection at ({x}, {y}) {w} x {h} "
+                      f"into {len(parts)} pages")
+            split_boxes.extend(parts)
+        boxes_fullres = split_boxes
+
+    # Warn loudly about kept boxes that STILL look like several pages fused
+    # into one after the split attempt (no usable valley). They are kept -
+    # dropping loses content - but the operator must see it in the log, not
+    # just as a wide box in the viz.
+    if len(boxes_fullres) >= 4:
+        med_w = np.median([b[2] for b in boxes_fullres])
+        med_h = np.median([b[3] for b in boxes_fullres])
+        for (x, y, w, h) in boxes_fullres:
+            if w > med_w * 1.5 or h > med_h * 1.5:
+                print(f"WARNING: suspected merged pages "
+                      f"(~{max(round(w / med_w), round(h / med_h))} fused): "
+                      f"at ({x}, {y}) size {w} x {h} full-res")
+
+    # === Compute card quality score ===
+    # After a split the detect-scale contours no longer correspond to the
+    # boxes; the shape component then falls back to neutral.
+    quality = compute_card_quality(
+        boxes_fullres, filtered_contours if split_count == 0 else None)
+
+    # Validate against max grid size
+    max_pages = MAX_COLUMNS * MAX_ROWS
+    if len(boxes_fullres) > max_pages:
+        print(f"Warning: Found {len(boxes_fullres)} pages, exceeds max grid {MAX_COLUMNS}x{MAX_ROWS}={max_pages}")
+        print("Consider adjusting MIN_PAGE_WIDTH_RATIO or MIN_PAGE_HEIGHT_RATIO")
+
+    # Sort based on reading order
+    if args.order == 'columns':
+        print("Sorting by columns (left-to-right, then top-to-bottom within each column)")
+        boxes_fullres = sort_boxes_by_columns(boxes_fullres)
+    else:
+        print("Sorting by rows (top-to-bottom, then left-to-right within each row)")
+        boxes_fullres = sort_boxes_by_rows(boxes_fullres)
 
     # === STEP 4b: Optionally refine positions at higher local resolution ===
     if args.refine:

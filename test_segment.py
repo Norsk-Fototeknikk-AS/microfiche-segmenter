@@ -536,6 +536,158 @@ def test_card_structure_touching_the_border_is_not_pages(tmp_path):
     assert len(rows) == n, proc.stdout
 
 
+# --- Splitting touching pages ------------------------------------------------
+# Weak edges merge touching pages into one detection. The gap between two real
+# pages is a projection VALLEY: columns (or rows) where the foreground share
+# drops far below the box's typical level. Measured on the real card
+# (2026-09-04): the valley between the two tape-pages is 24 full-res px wide
+# at 45% foreground against 99% inside the pages.
+
+from segment_microfiche import find_projection_valleys
+
+
+def test_finds_the_measured_real_valley():
+    """A profile shaped like the real card's: ~0.99 everywhere, one narrow dip
+    to ~0.45."""
+    share = np.full(430, 0.99)
+    share[209:214] = 0.45          # the 24px valley at 20% scan scale
+    assert find_projection_valleys(share, min_gap=3) == [211]
+
+
+def test_a_shallow_dip_is_not_a_valley():
+    """Content variation inside a page (sparse text, dust) must not split it."""
+    share = np.full(430, 0.95)
+    share[200:220] = 0.80
+    assert find_projection_valleys(share, min_gap=3) == []
+
+
+def test_valleys_touching_the_ends_are_edges_not_gaps():
+    """A low run at the box edge is the box boundary itself."""
+    share = np.full(430, 0.99)
+    share[0:15] = 0.1
+    share[420:430] = 0.1
+    assert find_projection_valleys(share, min_gap=3) == []
+
+
+def test_two_valleys_split_a_triple_merge():
+    share = np.full(600, 0.98)
+    share[195:205] = 0.3
+    share[395:405] = 0.3
+    assert find_projection_valleys(share, min_gap=3) == [199, 399]
+
+
+def test_a_valley_narrower_than_min_gap_is_noise():
+    share = np.full(430, 0.99)
+    share[210] = 0.2
+    assert find_projection_valleys(share, min_gap=3) == []
+
+
+def _dirty_seam(a, x, y, w, h):
+    """A real-world page gap: not clean background, but a mix (the tapes on
+    the real card overlap their gap - 45% foreground). Thresholded at full
+    resolution the mix reads as page (so detection merges the neighbors);
+    averaged first (resize, then threshold) it reads as background (so the
+    split scan sees the valley). Striped rows give exactly that duality."""
+    for row in range(y, y + h):
+        if row % 5 < 3:
+            a[row, x:x + w] = 25       # dark rows: 60% duty, fine-grained
+        else:
+            a[row, x:x + w] = 230
+
+
+def test_splits_two_pages_sharing_a_dirty_seam(tmp_path):
+    src = tmp_path / "pair.jpg"
+    a = np.full((4000, 8000), 230, 'uint8')
+    a[500:3500, 1000:4000] = 25                    # page A
+    a[500:3500, 4024:7024] = 25                    # page B
+    _dirty_seam(a, 4000, 500, 24, 3000)            # the 24px mixed gap
+    pyvips.Image.new_from_memory(a.tobytes(), 8000, 4000, 1, 'uchar').write_to_file(str(src))
+
+    from segment_microfiche import split_box_by_projection
+    # otsu 90: the seam's resize-average (0.6*25 + 0.4*230 = 107) must land
+    # on the LIGHT side for the scan, while per-pixel thresholding at full
+    # res keeps its dark rows as page - the duality that merges detection.
+    out = split_box_by_projection(str(src), (1000, 500, 6024, 3000),
+                                  otsu_thresh=90, invert=True,
+                                  min_w=100, min_h=100)
+    assert len(out) == 2, out
+    (ax, ay, aw, ah), (bx, by, bw, bh) = sorted(out)
+    assert abs(ax - 1000) < 60 and abs(ax + aw - 4012) < 60, out
+    assert abs(bx - 4012) < 60 and abs(bx + bw - 7024) < 60, out
+    assert ay == by == 500 and ah == bh == 3000, out
+
+
+def test_edge_artifact_cuts_do_not_veto_the_real_split(tmp_path):
+    """Erosion-compensated boxes carry a rim of background at their edges,
+    which reads as a shallow valley just inside the border. Such a cut would
+    create an impossibly small piece - discard THAT cut alone, never the real
+    mid-box cut alongside it (the real card's pair went unsplit exactly this
+    way: a col-7 edge artifact vetoed the col-430 gap)."""
+    src = tmp_path / "pair.jpg"
+    a = np.full((4000, 8000), 230, 'uint8')
+    a[500:3500, 1000:4000] = 25
+    a[500:3500, 4024:7024] = 25
+    _dirty_seam(a, 4000, 500, 24, 3000)
+    # A dark sliver inside the rim (jacket edge/shadow) separates the rim's
+    # low columns from the box edge, so they read as an internal valley.
+    a[500:3500, 952:958] = 25
+    pyvips.Image.new_from_memory(a.tobytes(), 8000, 4000, 1, 'uchar').write_to_file(str(src))
+
+    from segment_microfiche import split_box_by_projection
+    # Box deliberately 60px wider on the left: the strip of background inside
+    # the box edge yields an artifact valley there.
+    out = split_box_by_projection(str(src), (940, 500, 6084, 3000),
+                                  otsu_thresh=90, invert=True,
+                                  min_w=500, min_h=500)
+    assert len(out) == 2, out
+
+
+def test_a_single_page_is_not_split(tmp_path):
+    src = tmp_path / "single.jpg"
+    a = np.full((4000, 8000), 230, 'uint8')
+    a[500:3500, 1000:4000] = 25
+    pyvips.Image.new_from_memory(a.tobytes(), 8000, 4000, 1, 'uchar').write_to_file(str(src))
+
+    from segment_microfiche import split_box_by_projection
+    box = (1000, 500, 3000, 3000)
+    out = split_box_by_projection(str(src), box, otsu_thresh=125, invert=True,
+                                  min_w=100, min_h=100)
+    assert out == [box]
+
+
+def test_merged_pair_is_split_end_to_end(tmp_path):
+    """Detection merges the seam-sharing pair; the split pass must separate
+    them again, so the CSV carries every page and numbering stays honest."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.full((12000, 16000), 230, 'uint8')
+    a[:800, :] = 20; a[-800:, :] = 20; a[:, :800] = 20; a[:, -800:] = 20
+    n = 0
+    for r in range(3):
+        y = 1000 + r * 2400
+        a[y:y + 200, :] = 30
+        for c in range(4):
+            x = 1000 + c * 3600
+            a[y + 300:y + 2100, x:x + 3000] = 25
+            n += 1
+    # Row 1: close the gap between pages 1 and 2 with a dirty seam so the
+    # detect pass merges them (columns 4000..7024 shift: page2 moved left).
+    y = 1000 + 1 * 2400
+    a[y + 300:y + 2100, 4600:7600] = 230           # erase original page 2
+    a[y + 300:y + 2100, 4024:7024] = 25            # rebuild it against the seam
+    _dirty_seam(a, 4000, y + 300, 24, 1800)
+    pyvips.Image.new_from_memory(a.tobytes(), 16000, 12000, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rows = [line.split(",") for line in (out / "page_coordinates.csv").read_text().splitlines()
+            if line and not line.startswith(("#", "page"))]
+    assert len(rows) == n, proc.stdout
+    assert "Split" in proc.stdout, proc.stdout
+    # The split pair sits in row 2 (pages 5 and 6 in reading order): two
+    # boxes, not one double-wide.
+    widths = sorted(int(r[3]) for r in rows)
+    assert widths[-1] < 3600, widths                # nothing double-wide left
 # --- Polarity autodetection --------------------------------------------------
 # The app sends no flags, and the two known card types have opposite polarity
 # (Yamaha: bright pages on dark card; journals: dark pages on light jacket).
@@ -591,6 +743,14 @@ def test_autodetect_prefers_nothing_over_impossible_boxes_on_the_blank():
     h, w = b.shape
     invert = autodetect_inversion(b, int(h * 0.08), int(w * 0.02), int(h * 0.02))
     assert invert is True
+
+
+def test_autodetect_tie_prefers_inverted():
+    """When neither polarity yields anything (a scoreless tie), prefer
+    inverted: the production default is the journal card type - dark pages on
+    a light jacket (Trond, 2026-09-04)."""
+    b = np.zeros((500, 800), np.uint8)
+    assert autodetect_inversion(b, 0, 20, 20) is True
 
 
 def test_autodetect_runs_end_to_end_without_flags(tmp_path):
@@ -764,6 +924,18 @@ def test_removes_a_tall_run_at_the_header_boundary():
     b[80:200, :] = 255            # starts right at the header mask line
     remove_structure_rows(b, min_page_h=40, top_boundary=80)
     assert b[150, 1000] == 0
+
+
+def test_coverage_oscillating_at_the_threshold_is_not_shredded():
+    """A page band whose coverage straddles the threshold row by row (noise)
+    must be judged as ONE band, not as dozens of 1-row 'stripes' that each
+    fall under the height floor and get deleted - shredding real pages."""
+    b = _canvas()
+    b[300:500, 0:1695] = 255                       # a page band at 84.75%
+    b[300:500:2, 1695:1706] = 255                  # alternate rows: 85.3%
+    removed = remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    assert removed == 0
+    assert (b[300:500, 0:1695] == 255).all()
 
 
 def test_page_rows_are_never_touched():

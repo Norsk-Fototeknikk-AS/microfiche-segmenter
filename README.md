@@ -203,9 +203,9 @@ into one detection: several pages wide but full page height (reported on real
 material 2026-09-03). Width cannot tell a merged row from a band — a
 full-width band and a fully merged row are equally wide — but thinness can:
 the documented real band was 0.44× the median height, and no page is that
-flat. A merged row is kept and warned about (`suspected merged pages` in the
-log); splitting it is a known follow-up, pending a real failing card to
-verify against.
+flat. A merged detection is first offered to the split pass (below); what
+still cannot be split is kept and warned about (`suspected merged pages` in
+the log) — dropping loses content.
 
 The minimum-size filter only catches specks. The opposite failure is a bright
 band along a card edge — far too wide and flat to be a page, far too big to be
@@ -278,6 +278,7 @@ the end.
 | `--archive-dir` | `../PanoramaArchive` | where an archived panorama goes |
 | `-p, --padding` | `0.03` | crop margin; ≤1 = fraction of median page, >1 = pixels |
 | `--refine` | off | re-detect each page locally at 20 %; slower, slightly looser |
+| `--no-split` | off | keep merged detections instead of splitting at projection valleys |
 | `--format` | `tif` | see C7 |
 | `--invert` | auto | force inverted polarity (dark pages on light card) |
 | `--no-invert` | auto | force normal polarity, disabling auto-detection |
@@ -310,7 +311,17 @@ the end.
 4. Contours → bounding boxes, filtered by minimum page size.
 5. **Expand boxes by the erosion radius** (C1).
 6. **Reject detections that are not page-shaped** (C12).
-7. Sort into reading order, scale back to full resolution.
+7. Scale back to full resolution and **split merged detections**: touching
+   pages fuse into one box at detect scale, but the gap between real pages is
+   a projection *valley* — columns/rows whose foreground share drops below
+   `SPLIT_VALLEY_RATIO` (0.6×) of the box's median. Each box is re-scanned
+   against the source at 20 % — thresholding **after** the resize, which is
+   what makes a dirty gap (the real card's overlapping tapes: 45 % foreground)
+   read as background where the full-res-thresholded detect pass read it as
+   page. Cuts that would leave an impossibly small piece are edge artifacts
+   and are judged individually, so they never veto a real gap. Verified on
+   the real card: the tape pair splits at the measured valley. `--no-split`
+   disables. Then sort into reading order.
 8. Optionally refine each box by re-detecting locally at 20 %.
 9. Score the card (size consistency, grid alignment, spacing, shape).
 10. Crop each page with the margin and write TIFFs in parallel (5 workers).

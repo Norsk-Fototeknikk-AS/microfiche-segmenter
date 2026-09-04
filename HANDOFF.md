@@ -267,7 +267,7 @@ disagreed by ~50 px. Refine is slightly *looser* than the default path
 
 ### Tests
 
-71 tests, ~10 s (was 32 when this was written). Unit tests for box
+82 tests, ~12 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 
