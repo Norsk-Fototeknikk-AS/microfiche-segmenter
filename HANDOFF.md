@@ -267,7 +267,7 @@ disagreed by ~50 px. Refine is slightly *looser* than the default path
 
 ### Tests
 
-54 tests, ~6 s (was 32 when this was written). Unit tests for box
+63 tests, ~8 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 
@@ -278,13 +278,21 @@ CLI against a generated 4×3 card.
 Do not assume any of this works. None of it has been exercised.
 
 - ~~**Multi-card journals.**~~ **PROVEN 2026-08-22** — see below.
-- **Real archival material.** Every run so far has been on *one* physical test
-  card containing a Yamaha RD500LC service manual. Never run on real patient
-  journals. Page density, contrast, and layout of real cards may differ.
+- **Real archival material.** Partly addressed 2026-09-04: a real journal
+  jacket (no patient info; two anonymized tape-pages at accurate geometry) is
+  committed at detect scale in `testdata/` with pinning tests. It differs from
+  the Yamaha card in every way that matters: light jacket, dark pages
+  (requires `--invert`), edge-to-edge stripes between rows, sleeves that can
+  overlap stripes. Still unproven: real page texture (tape is uniform; fiche
+  negatives are not), full cards, and page-to-page contrast.
 - **`--order rows`.** Never used on real data; the test card is `columns`.
   Sharper since 2026-09-03: `rows` is now the *default*, so every app-driven
   run takes this unproven path unless `--order columns` is passed.
-- **`--invert`.** Never exercised at all.
+- ~~**`--invert`.**~~ Exercised on the first real journal card 2026-09-04 —
+  and it was **broken** (uint8 wrap made everything foreground; fixed same
+  day). The real journal cards are dark-pages-on-light-jacket, so production
+  runs on them REQUIRE `--invert`; the app does not pass it today. Open
+  cross-repo question.
 - **`--format jpg`.** Not run since today's changes. Forbidden for pipeline
   output anyway (contract C7), but the code path exists.
 - **Zero-page failure in production.** Verified with a synthetic specks-only

@@ -282,17 +282,27 @@ the end.
 ## How detection works
 
 1. Otsu threshold from a 1 % thumbnail, applied to the full image.
-2. Downscale to 10 % and erode to separate touching pages.
-3. Contours → bounding boxes, filtered by minimum page size.
-4. **Expand boxes by the erosion radius** (C1).
-5. **Reject detections that are not page-shaped** (C12).
-6. Sort into reading order, scale back to full resolution.
-7. Optionally refine each box by re-detecting locally at 20 %.
-8. Score the card (size consistency, grid alignment, spacing, shape).
-9. Crop each page with the margin and write TIFFs in parallel (5 workers).
-10. Write the header band as `page_000.tif` (C11).
-11. Write `_done` (C2).
-12. Move the panorama to `PanoramaArchive/` (C13).
+2. Downscale to 10 %. With `--invert` (dark pages on a light jacket — the real
+   journal card type, first seen 2026-09-04) the binary is inverted here.
+3. **Remove card structure.** Full-width row-runs that are thinner than any
+   possible page or touch the image boundary / header mask are stripes and
+   edge bands — deleted (`remove_structure_rows`). Then erosion, then any
+   remaining foreground *connected to the image border* is removed
+   (`clear_border_connected`): the frame always reaches the border, pages
+   never do. Validated against the real blank jacket, which must detect as
+   exactly nothing. Connectivity alone is not enough — a sleeve can overlap
+   its stripe (seen on the real card), which would drag the page into the
+   border component; height/geometry is what separates structure from pages.
+4. Contours → bounding boxes, filtered by minimum page size.
+5. **Expand boxes by the erosion radius** (C1).
+6. **Reject detections that are not page-shaped** (C12).
+7. Sort into reading order, scale back to full resolution.
+8. Optionally refine each box by re-detecting locally at 20 %.
+9. Score the card (size consistency, grid alignment, spacing, shape).
+10. Crop each page with the margin and write TIFFs in parallel (5 workers).
+11. Write the header band as `page_000.tif` (C11).
+12. Write `_done` (C2).
+13. Move the panorama to `PanoramaArchive/` (C13).
 
 ## Tests
 

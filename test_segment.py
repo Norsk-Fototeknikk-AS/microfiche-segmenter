@@ -471,6 +471,182 @@ def test_still_drops_a_sliver_band_at_page_multiple_width():
     assert dropped == [sliver]
 
 
+def make_inverted_card(path, cols=4, rows=3):
+    """Dark page rectangles on a BRIGHT card - the real journal card type
+    (fiche negatives in a light jacket), first seen 2026-09-04. Detection
+    needs --invert here."""
+    a = np.full((1500, 2000), 230, 'uint8')
+    for r in range(rows):
+        for c in range(cols):
+            y = 200 + r * 420
+            x = 60 + c * 480
+            a[y:y + 340, x:x + 400] = 25
+    pyvips.Image.new_from_memory(a.tobytes(), 2000, 1500, 1, 'uchar').write_to_file(str(path))
+    return cols * rows
+
+
+def test_invert_finds_dark_pages_on_bright_card(tmp_path):
+    """--invert was never exercised until the first real journal card arrived
+    (2026-09-04) and turned out dark-on-bright. It was broken: the pyvips
+    threshold already yields 0/255, and the pipeline's *255 "conversion" wraps
+    255 to 1 in uint8, so bitwise_not turns BOTH levels nonzero - everything
+    becomes foreground and the run dies on the degenerate-threshold guard."""
+    src = tmp_path / "612130000012_00012.jpg"
+    n = make_inverted_card(src)
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out),
+                         "--skip-extraction", "--invert")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rows = [line for line in (out / "page_coordinates.csv").read_text().splitlines()
+            if line and not line.startswith(("#", "page"))]
+    assert len(rows) == n, proc.stdout
+
+
+def test_card_structure_touching_the_border_is_not_pages(tmp_path):
+    """The real journal card (2026-09-04) is a light jacket with a dark frame
+    and dark edge-to-edge stripes between rows. Inverted, that structure is one
+    connected foreground component ENCLOSING every page - RETR_EXTERNAL sees
+    only the frame, and the pages inside it vanish. Structure always touches
+    the image border; pages never do. Border-connected foreground must be
+    removed, leaving exactly the pages."""
+    src = tmp_path / "612130000012_00012.jpg"
+    # Proportions matter, at DETECT scale: real stripes are ~1-2% of image
+    # height - thin enough to be structure, thick enough to survive the detect
+    # erosion. A small fixture cannot represent both, so this one is big.
+    a = np.full((12000, 16000), 230, 'uint8')
+    a[:800, :] = 20; a[-800:, :] = 20; a[:, :800] = 20; a[:, -800:] = 20  # frame
+    n = 0
+    for r in range(3):
+        y = 1000 + r * 2400
+        a[y:y + 200, :] = 30                        # stripe, edge to edge
+        top = y + 150 if r == 0 else y + 300        # row 0 OVERLAPS its stripe,
+        for c in range(4):                          # like the real card's sleeve
+            x = 1000 + c * 3600
+            a[top:y + 2100, x:x + 3000] = 25        # dark pages
+            n += 1
+    pyvips.Image.new_from_memory(a.tobytes(), 16000, 12000, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out),
+                         "--skip-extraction", "--invert", "--header-skip", "0")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rows = [line for line in (out / "page_coordinates.csv").read_text().splitlines()
+            if line and not line.startswith(("#", "page"))]
+    assert len(rows) == n, proc.stdout
+
+
+# --- Real journal card (committed at detect scale) --------------------------
+# testdata/ holds the first real journal card (2026-09-04, no patient info) at
+# 10% scale - exactly what the detect pass sees. Two variants: the jacket with
+# two anonymized pages (black tape at accurate page size/position - geometry is
+# truth, texture is not), and the SAME jacket empty. The empty card is the
+# negative control: everything on it is structure, so detection must find
+# nothing at all.
+
+from segment_microfiche import (DETECT_ERODE_ITERATIONS, DETECT_ERODE_KERNEL,
+                                MIN_PAGE_HEIGHT_RATIO, MIN_PAGE_WIDTH_RATIO,
+                                clear_border_connected)
+
+
+def _detect_on_committed_thumb(name):
+    """The detect pass, replicated on an image already at detect scale."""
+    img = pyvips.Image.new_from_file(str(REPO / "testdata" / name)).colourspace('b-w')
+    a = np.ndarray(buffer=img.write_to_memory(), dtype=np.uint8,
+                   shape=[img.height, img.width])
+    thresh, _ = cv2.threshold(a, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    b = ((a >= thresh) * 255).astype(np.uint8)
+    b = cv2.bitwise_not(b)                       # dark pages on light jacket
+    h, w = b.shape
+    hdr = int(h * 0.08)
+    b[:hdr, :] = 0
+    from segment_microfiche import remove_structure_rows
+    remove_structure_rows(b, int(h * MIN_PAGE_HEIGHT_RATIO), hdr)
+    kernel = np.ones((DETECT_ERODE_KERNEL,) * 2, np.uint8)
+    b = cv2.erode(b, kernel, iterations=DETECT_ERODE_ITERATIONS)
+    clear_border_connected(b)
+    contours, _ = cv2.findContours(b, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = [cv2.boundingRect(c) for c in contours]
+    return [bx for bx in boxes
+            if bx[2] >= int(w * MIN_PAGE_WIDTH_RATIO)
+            and bx[3] >= int(h * MIN_PAGE_HEIGHT_RATIO)]
+
+
+def test_real_blank_card_detects_nothing():
+    """Everything on the empty jacket is structure - stripes, frame, header."""
+    assert _detect_on_committed_thumb("real_card_blank_10pct.jpg") == []
+
+
+def test_real_card_finds_the_taped_pages():
+    """The two tape-pages touch each other, so until splitting exists they are
+    ONE detection - at the tape position, top-right of row one."""
+    boxes = _detect_on_committed_thumb("real_card_10pct.jpg")
+    assert len(boxes) == 1, boxes
+    x, y, w, h = boxes[0]
+    assert 2100 < x < 2250 and 200 < y < 300, boxes    # detect-scale pixels
+    assert 380 < w < 480 and 250 < h < 350, boxes      # two pages wide, one high
+
+
+# --- Structure-row removal ---------------------------------------------------
+# The real journal cards (2026-09-04) are light jackets with dark edge-to-edge
+# stripes between rows, plus dark bands along the header and the bottom.
+# Inverted, that structure connects to everything it touches - including pages
+# whose sleeves overlap a stripe - so connectivity alone cannot separate them.
+# Full-width row-runs ARE separable: a run is structure if it is thinner than
+# any possible page, or touches the image boundary / header mask; a (merged)
+# row of pages is page-height and floats inside the card.
+
+from segment_microfiche import remove_structure_rows
+
+
+def _canvas(h=1000, w=2000):
+    return np.zeros((h, w), np.uint8)
+
+
+def test_removes_a_thin_full_width_stripe():
+    b = _canvas()
+    b[500:520, :] = 255           # 2% of height, edge to edge
+    b[100:250, 300:500] = 255     # a page, for contrast
+    removed = remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    assert b[510, 1000] == 0
+    assert b[150, 400] == 255
+    assert removed > 0
+
+
+def test_keeps_a_tall_full_width_run_in_the_middle():
+    """A fully merged row of pages is full-width too - height tells them apart."""
+    b = _canvas()
+    b[400:600, :] = 255           # 20% of height: page-height, floating
+    remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    assert b[500, 1000] == 255
+
+
+def test_removes_a_tall_run_touching_the_bottom():
+    b = _canvas()
+    b[900:1000, :] = 255          # tall, but runs into the image edge
+    remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    assert b[950, 1000] == 0
+
+
+def test_removes_a_tall_run_at_the_header_boundary():
+    """The header mask cuts structure mid-band; what abuts the cut is the
+    band's continuation, not a page row."""
+    b = _canvas()
+    b[80:200, :] = 255            # starts right at the header mask line
+    remove_structure_rows(b, min_page_h=40, top_boundary=80)
+    assert b[150, 1000] == 0
+
+
+def test_page_rows_are_never_touched():
+    """Rows holding separated pages have big gaps - far below full coverage."""
+    b = _canvas()
+    for c in range(4):
+        b[100:300, 100 + c * 500:400 + c * 500] = 255
+    removed = remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    assert removed == 0
+    assert b[200, 200] == 255
+
+
 def test_a_merged_row_is_kept_and_warned_about_end_to_end(tmp_path):
     """Weak edges fuse a row at detect scale. The row must survive as ONE
     detection (content present, inspectable in the viz) and the log must warn

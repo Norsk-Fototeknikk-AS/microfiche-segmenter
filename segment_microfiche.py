@@ -192,6 +192,67 @@ def drop_band_detections(boxes, contours, band_ratio):
     return kept_boxes, kept_contours, dropped
 
 
+# A row of the binary counts as "full width" above this foreground share.
+# Measured on the first real journal card (2026-09-04): structure rows (stripes,
+# header/bottom bands) run 0.86-1.0 coverage, rows holding separated pages ~0.2.
+STRIPE_COVERAGE = 0.85
+
+
+def remove_structure_rows(binary_img, min_page_h, top_boundary):
+    """Delete full-width row-runs that cannot be pages, in place.
+
+    The light journal jackets have dark edge-to-edge stripes between rows and
+    dark bands along the header and bottom. Connectivity cannot separate them
+    from pages - a sleeve can physically overlap its stripe (seen on the real
+    card) - but geometry can: structure runs are thinner than any possible
+    page, or touch the image boundary / the header-mask line. A fully merged
+    row of pages is full-width too, but page-HEIGHT and floating mid-card, so
+    it survives (and is handled by the merged-pages warning downstream).
+
+    Returns the number of runs deleted, for the log.
+    """
+    h, w = binary_img.shape
+    coverage = (binary_img > 0).sum(axis=1) / w
+    removed = 0
+    y = 0
+    while y < h:
+        if coverage[y] > STRIPE_COVERAGE:
+            start = y
+            while y < h and coverage[y] > STRIPE_COVERAGE:
+                y += 1
+            if (y - start) < min_page_h or start <= top_boundary or y >= h:
+                binary_img[start:y, :] = 0
+                removed += 1
+        else:
+            y += 1
+    return removed
+
+
+def clear_border_connected(binary_img):
+    """Zero out foreground connected to the image border, in place.
+
+    The card's own structure - the dark frame and the edge-to-edge stripes
+    between rows - always reaches the image border; a page never does. On the
+    light journal cards (dark pages, --invert) that structure is one connected
+    component ENCLOSING every page, so RETR_EXTERNAL would return only the
+    frame and lose all pages inside it. Removing border-connected foreground
+    "diffs away" the card itself and leaves only floating detections: pages.
+
+    Returns the share of foreground pixels that were removed, for the log.
+    """
+    h, w = binary_img.shape
+    before = np.count_nonzero(binary_img)
+    if before == 0:
+        return 0.0
+    mask = np.zeros((h + 2, w + 2), np.uint8)
+    seeds = ([(x, 0) for x in range(w)] + [(x, h - 1) for x in range(w)]
+             + [(0, y) for y in range(h)] + [(w - 1, y) for y in range(h)])
+    for x, y in seeds:
+        if binary_img[y, x]:
+            cv2.floodFill(binary_img, mask, (x, y), 0)
+    return 1.0 - np.count_nonzero(binary_img) / before
+
+
 def erosion_radius(kernel_size, iterations):
     """Pixels eaten from each side of a blob by cv2.erode with this kernel."""
     return (kernel_size // 2) * iterations
@@ -651,8 +712,10 @@ def main():
         dtype=np.uint8,
         shape=[binary_small.height, binary_small.width]
     )
-    # Convert boolean (0/1) to grayscale (0/255)
-    binary_img = (binary_img * 255).astype(np.uint8)
+    # pyvips relational ops already yield 0/255 (NOT 0/1 - multiplying by 255
+    # here wrapped 255 to 1 in uint8 and silently broke --invert); the resize
+    # interpolates edge pixels, so re-binarize at the midpoint.
+    binary_img = ((binary_img > 127) * 255).astype(np.uint8)
 
     # Save full-res binary TIFF for reference (optional)
     if args.debug:
@@ -686,11 +749,27 @@ def main():
     if header_skip_px_small > 0:
         binary_img[:header_skip_px_small, :] = 0
 
+    # Delete full-width structure rows (stripes, header/bottom bands) BEFORE
+    # erosion: connectivity cannot separate structure from a page whose sleeve
+    # overlaps its stripe, but full-width geometry can.
+    min_h_detect = int(original_height * detect_scale * MIN_PAGE_HEIGHT_RATIO)
+    removed_rows = remove_structure_rows(
+        binary_img, min_h_detect, header_skip_px_small)
+    if removed_rows:
+        print(f"Removed {removed_rows} full-width structure row-run(s) "
+              "(stripes / edge bands)")
+
     # Apply erosion to separate touching pages
     # Kernel size depends on gap between pages (at 10% scale, ~5-10 pixels)
     print(f"Applying erosion (kernel={DETECT_ERODE_KERNEL}) to separate pages...")
     kernel = np.ones((DETECT_ERODE_KERNEL, DETECT_ERODE_KERNEL), np.uint8)
     binary_img = cv2.erode(binary_img, kernel, iterations=DETECT_ERODE_ITERATIONS)
+
+    # The card's frame and stripes reach the border; pages never do. Remove
+    # border-connected foreground so structure cannot enclose (and hide) pages.
+    removed = clear_border_connected(binary_img)
+    if removed > 0:
+        print(f"Removed border-connected structure: {removed:.1%} of foreground")
 
     print("Finding contours...")
     contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
