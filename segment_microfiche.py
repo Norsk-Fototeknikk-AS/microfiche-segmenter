@@ -450,6 +450,74 @@ def erosion_radius(kernel_size, iterations):
     return (kernel_size // 2) * iterations
 
 
+def make_anon_mask(shape, contours, dilate_radius):
+    """Solid silhouettes of the detected blobs, strictly 0/255.
+
+    Filling each EXTERNAL contour erases everything inside a blob (text is a
+    hole in the blob, holes get painted over), while a gap that reaches the
+    blob's edge - a stitching seam splitting a page - is not a hole and stays
+    visible. That asymmetry is the whole point: geometry out, content not.
+    Never smooth or close this mask; it would seal the seam gaps we ship it
+    out to reveal.
+    """
+    mask = np.zeros(shape, np.uint8)
+    if contours:
+        cv2.drawContours(mask, contours, -1, 255, thickness=cv2.FILLED)
+    if dilate_radius > 0:
+        kernel = np.ones((2 * dilate_radius + 1, 2 * dilate_radius + 1), np.uint8)
+        mask = cv2.dilate(mask, kernel)
+    return mask
+
+
+def _stamp_solid(img, color, draw):
+    """Run `draw` on a fresh mono layer, then paint every marked pixel in one
+    solid color. OpenCV antialiases text regardless of lineType, and the
+    anonymized output must never contain midtones - so no drawing call may
+    touch the output directly."""
+    layer = np.zeros(img.shape[:2], np.uint8)
+    draw(layer)
+    img[layer > 127] = color
+
+
+def render_anon_viz(mask, boxes_fullres, fullres_to_mask, label, banner_color):
+    """Annotate the silhouette mask with page boxes and the quality banner.
+
+    Everything here must keep the two-level safety property: INTER_NEAREST for
+    the resize and hard-thresholded stamps for all overlay drawing, so the
+    output holds only black/white plus the overlay palette.
+    """
+    viz_scale = min(1.0, 2000 / max(mask.shape[1], mask.shape[0]))
+    viz = cv2.resize(mask, None, fx=viz_scale, fy=viz_scale,
+                     interpolation=cv2.INTER_NEAREST)
+    viz = cv2.cvtColor(viz, cv2.COLOR_GRAY2BGR)
+
+    fullres_to_viz = fullres_to_mask * viz_scale
+    scaled = [(int(x * fullres_to_viz), int(y * fullres_to_viz),
+               int(w * fullres_to_viz), int(h * fullres_to_viz))
+              for (x, y, w, h) in boxes_fullres]
+
+    def draw_boxes(layer):
+        for (sx, sy, sw, sh) in scaled:
+            cv2.rectangle(layer, (sx, sy), (sx + sw, sy + sh), 255, 2)
+
+    def draw_numbers(layer):
+        for i, (sx, sy, _, _) in enumerate(scaled, 1):
+            cv2.putText(layer, str(i), (sx + 5, sy + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 2)
+
+    _stamp_solid(viz, (0, 255, 0), draw_boxes)
+    _stamp_solid(viz, (0, 0, 255), draw_numbers)
+
+    banner_h = 32
+    banner = np.zeros((banner_h, viz.shape[1], 3), dtype=np.uint8)
+    banner[:] = (30, 30, 30)
+    _stamp_solid(banner, banner_color,
+                 lambda layer: cv2.putText(layer, label, (8, 22),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                           255, 2))
+    return np.vstack([banner, viz])
+
+
 def expand_boxes(boxes, radius, max_width, max_height):
     """Grow each (x, y, w, h) box by radius per side, clamped to image bounds."""
     if radius == 0:
@@ -797,6 +865,11 @@ def main():
                              'as of 2026-08-23. Still accepted so existing callers '
                              'do not fail — argparse exits 2 on an unknown flag, '
                              'which collides with EXIT_NO_PAGES.')
+    parser.add_argument('--anon-viz', action='store_true',
+                        help='Also write _debug/anon_viz.jpg: detected blobs as '
+                             'solid black/white silhouettes with boxes and the '
+                             'quality banner, but no readable content. Safe to '
+                             'take off an air-gapped machine for diagnostics.')
     parser.add_argument('--debug', action='store_true',
                         help='Also write the binary TIFF and box overlay to <card>/_debug/. '
                              'Off by default: the OCR app reads loose image files in the '
@@ -1167,6 +1240,19 @@ def main():
 
     cv2.imwrite(str(viz_path), viz)
     print(f"Saved {viz_path}")
+
+    # Anonymized view for air-gapped diagnostics: solid silhouettes of the
+    # detected blobs (content filled shut, seam gaps preserved) with the same
+    # boxes and banner. The normal visualization above shows readable journal
+    # content and must stay on the machine; this one may leave it.
+    if args.anon_viz:
+        anon_mask = make_anon_mask(binary_img.shape, filtered_contours,
+                                   detect_radius)
+        anon_viz = render_anon_viz(anon_mask, boxes_fullres, detect_scale,
+                                   label, banner_color)
+        anon_path = debug_dir / "anon_viz.jpg"
+        cv2.imwrite(str(anon_path), anon_viz)
+        print(f"Saved {anon_path} (anonymized)")
 
     # === STEP 6: Extract pages (optional) ===
     if not args.skip_extraction:

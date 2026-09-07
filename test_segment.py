@@ -1245,3 +1245,124 @@ def test_a_failed_card_goes_to_error_not_the_archive(tmp_path):
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert (panoramas / "error" / src.name).exists(), "not moved to error/"
     assert not (tmp_path / ARCHIVE_DIR_NAME).exists(), "failed card was archived"
+
+
+# --- Anonymized visualization (--anon-viz) --------------------------------
+# m4-studio holds journal content that must never leave the machine. The anon
+# viz replaces every detected blob with a SOLID filled silhouette so seams and
+# geometry stay visible while no glyph survives.
+
+from segment_microfiche import make_anon_mask
+
+
+def test_anon_mask_fills_content_holes():
+    """Text inside a page is a hole in the blob - it must be filled solid."""
+    img = np.zeros((200, 300), np.uint8)
+    img[40:160, 50:250] = 255
+    img[90:100, 100:150] = 0  # a glyph-sized hole of readable content
+    contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    mask = make_anon_mask(img.shape, contours, dilate_radius=0)
+
+    assert mask[95, 120] == 255, "content hole leaked through the silhouette"
+    assert set(np.unique(mask)) <= {0, 255}, "mask must be strictly two-level"
+
+
+def test_anon_mask_preserves_through_gaps():
+    """A light seam splitting a page reaches the blob edge - it is NOT a hole
+    and must stay visible: the gap is the diagnostic signal we ship out."""
+    img = np.zeros((300, 200), np.uint8)
+    img[20:100, 30:170] = 255   # top third
+    img[120:280, 30:170] = 255  # bottom two thirds
+    contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    mask = make_anon_mask(img.shape, contours, dilate_radius=0)
+
+    assert not mask[100:120, 30:170].any(), "seam gap was filled shut"
+    assert mask[60, 100] == 255 and mask[200, 100] == 255
+
+
+def test_anon_mask_dilation_undoes_detection_erosion():
+    """Contours come from the eroded image; the silhouette grows back by the
+    erosion radius so it lines up with the (compensated) page boxes."""
+    img = np.zeros((200, 200), np.uint8)
+    img[50:150, 50:150] = 255
+    contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    mask = make_anon_mask(img.shape, contours, dilate_radius=6)
+
+    ys, xs = np.nonzero(mask)
+    assert (xs.min(), xs.max(), ys.min(), ys.max()) == (44, 155, 44, 155)
+
+
+from segment_microfiche import render_anon_viz
+
+
+def test_anon_viz_render_is_two_level_plus_overlay_colors():
+    """The safety property: no pixel value derived from card CONTENT may
+    survive - only pure black/white silhouette plus the overlay palette.
+    Any midtone means source texture leaked into the shipped image."""
+    mask = np.zeros((1650, 2200), np.uint8)  # wider than the 2000px viz cap
+    mask[200:800, 300:1900] = 255
+    boxes_fullres = [(3000, 2000, 7000, 6000), (11000, 2000, 7000, 6000)]
+
+    viz = render_anon_viz(mask, boxes_fullres, fullres_to_mask=0.1,
+                          label="Card Quality: 99/100 (GOOD)  |  1 row: 2",
+                          banner_color=(0, 180, 0))
+
+    colors = {tuple(c) for c in np.unique(viz.reshape(-1, 3), axis=0)}
+    allowed = {(0, 0, 0), (255, 255, 255),   # silhouette
+               (0, 255, 0), (0, 0, 255),     # box outline, page number
+               (30, 30, 30), (0, 180, 0)}    # banner background, banner text
+    assert colors <= allowed, f"unexpected midtones leaked: {colors - allowed}"
+    assert (0, 255, 0) in colors, "page boxes missing from overlay"
+    assert (0, 180, 0) in colors, "banner missing from overlay"
+
+
+def test_anon_viz_flag_writes_anonymized_view(tmp_path):
+    src = tmp_path / "612130000012_00016.jpg"
+    make_card(src)
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--anon-viz",
+                         "--no-archive")
+    assert proc.returncode == 0, proc.stderr
+
+    assert (out / "_debug" / "anon_viz.jpg").exists(), "anon viz not written"
+    assert (out / "_debug" / "visualization.jpg").exists(), \
+        "normal viz must still be written (it stays on the machine)"
+
+
+def test_anon_viz_not_written_without_flag(tmp_path):
+    src = tmp_path / "612130000012_00016.jpg"
+    make_card(src)
+    out = tmp_path / "card"
+
+    assert run_segmenter("-i", str(src), "-O", str(out),
+                         "--no-archive").returncode == 0
+    assert not (out / "_debug" / "anon_viz.jpg").exists()
+
+
+def test_real_card_anon_mask_holds_no_glyph_sized_detail():
+    """Safety pin on the real journal card: every silhouette in the anon mask
+    is at least page-sized. Only size-filtered detections may be drawn - if a
+    future change feeds unfiltered contours in, stray glyph silhouettes would
+    be readable text and this must fail."""
+    from segment_microfiche import detect_page_boxes, make_anon_mask
+    b = cv2.bitwise_not(_binary_of("real_card_10pct.jpg"))
+    h, w = b.shape
+    min_w, min_h = int(w * MIN_PAGE_WIDTH_RATIO), int(h * MIN_PAGE_HEIGHT_RATIO)
+
+    boxes, contours, b, _ = detect_page_boxes(b, int(h * 0.08), min_w, min_h)
+    assert boxes, "fixture regression: the tape pages were not detected"
+
+    mask = make_anon_mask(
+        b.shape, contours,
+        erosion_radius(DETECT_ERODE_KERNEL, DETECT_ERODE_ITERATIONS))
+
+    assert set(np.unique(mask)) <= {0, 255}
+    n, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    assert n > 1, "mask is empty"
+    for i in range(1, n):
+        assert stats[i, cv2.CC_STAT_WIDTH] >= min_w, "sub-page-sized silhouette"
+        assert stats[i, cv2.CC_STAT_HEIGHT] >= min_h, "sub-page-sized silhouette"

@@ -283,7 +283,19 @@ the end.
 | `--invert` | auto | force inverted polarity (dark pages on light card) |
 | `--no-invert` | auto | force normal polarity, disabling auto-detection |
 | `--skip-extraction` | off | coordinates only; non-destructive (C4) |
+| `--anon-viz` | off | also write `_debug/anon_viz.jpg`: solid black/white silhouettes of the detected blobs with boxes and banner, no readable content — safe to take off an air-gapped machine |
 | `--debug` | off | write full-res binary TIFF to `<card>/_debug/` (box-overlayen `visualization.jpg` skrives alltid) |
+
+`--anon-viz` exists because the production machine is air-gapped with journal
+content that must not leave it: `visualization.jpg` and the binary TIFF show
+readable text. The anon view fills every detected blob solid (text inside a
+page is a hole in the blob and gets painted over) while a gap that reaches the
+blob's edge — a stitching seam splitting a page — survives, which is exactly
+the diagnostic it exists to carry out. Overlay drawing is stamped in hard
+colors; a test pins that the rendered image holds only black/white plus the
+overlay palette, and another pins that no silhouette on the real card is
+smaller than a page. Never add smoothing/closing to the mask or antialiased
+drawing to the overlay.
 
 ## How detection works
 

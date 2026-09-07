@@ -279,9 +279,23 @@ mechanism it serves.
 
 ### Tests
 
-88 tests, ~12 s (was 32 when this was written). Unit tests for box
+95 tests, ~17 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
+
+### Anonymized diagnostics off the air-gapped machine (2026-09-07)
+
+`--anon-viz` writes `_debug/anon_viz.jpg`: the detected blobs as SOLID
+black/white silhouettes (external contours filled, dilated by the erosion
+radius) with the usual boxes, numbers and quality banner stamped on top in
+hard colors. Content inside a page is a hole in the blob and gets filled shut;
+a gap reaching the blob edge — a stitching seam that split a page — is not a
+hole and stays visible. That asymmetry IS the feature: geometry and seams go
+out on the USB stick, journal content does not. Two safety pins in the tests:
+the rendered image may hold only black/white plus the overlay palette (OpenCV
+5 antialiases text regardless of lineType, hence the mono-layer stamping in
+`_stamp_solid`), and no silhouette on the real card may be smaller than a
+page. Do not add closing/smoothing to the mask or draw directly on the output.
 
 ---
 
