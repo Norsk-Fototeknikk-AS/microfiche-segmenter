@@ -262,15 +262,21 @@ wrong: the card fails loudly instead (exit 3, no `_done`, source to `error/`
 for re-stitching — merging could become phase 2 once real seamed cards have
 been inspected via `--anon-viz`).
 
-The signature (`find_fragment_pairs`): two detections with x-interval IoU ≥
-0.8, vertical gap ≤ 15 % of the expected page height, and a union height
-inside 0.8–1.8× the expected height. Expected height is the tallest detection
-capped at 1.5× the 75th-percentile height — the tallest box is a whole page
-even when most detections are fragments, and the cap keeps one unsplit
-vertical merge from doubling the estimate. The union band is what separates a
-split page (union ≈ 1×) from whole pages in adjacent rows (union ≈ 2×, and
-row gaps also fail the gap test). Both visualizations mark the suspect boxes
-in orange and the banner says `SUSPECT FRAGMENTS`.
+The signature (`find_fragment_groups`): detections sharing an x-span
+(interval IoU ≥ 0.8) with vertical gaps ≤ 15 % of the expected page height
+are linked into transitive chains; within each chain (sorted by y) every
+maximal contiguous window whose union height lands inside 0.8–1.8× the
+expected height is a fragment group. Chains, not just pairs, because
+production cards showed pages cut into stacks of 3–4 where no *pair* reaches
+the union band (612130000111_00012); the windowing also keeps a tight
+next-row neighbour from hiding a real stack by pushing the whole chain past
+the band. Expected height is the tallest detection capped at 1.5× the
+75th-percentile height — the tallest box is a whole page even when most
+detections are fragments, and the cap keeps one unsplit vertical merge from
+doubling the estimate. The union band is what separates a split page (union
+≈ 1×) from whole pages in adjacent rows (union ≈ 2×, and row gaps also fail
+the gap test). Both visualizations mark the suspect boxes in orange and the
+banner says `SUSPECT FRAGMENTS`.
 
 Known blind spot: a card whose *every* detection is a fragment of the same
 kind has no whole page left to anchor the expected height. The generous union

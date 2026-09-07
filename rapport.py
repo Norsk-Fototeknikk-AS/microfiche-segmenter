@@ -46,19 +46,26 @@ def copy_safe(src, dst):
     shutil.copyfile(src, dst)
 
 
-def summary_line(stem, exit_code, pages, fragment_pairs, anon_missing=False):
+QUALITY_WARN_BELOW = 50  # field data 2026-09-07: sick cards < 50, healthy > 74
+
+
+def summary_line(stem, exit_code, pages, fragment_groups, anon_missing=False,
+                 quality=None):
     if anon_missing:
         # Whatever the exit code said: without the anonymized image the card
         # cannot be inspected across the air gap, and a missing expected
         # artifact must never read as success.
         return (f"FEIL      exit {exit_code}  {pages:3d} sider  {stem}  "
                 "(anon_viz mangler)")
+    warn = ""
+    if quality is not None and quality < QUALITY_WARN_BELOW:
+        warn = f"  ADVARSEL LAV KVALITET: {quality}"
     if exit_code == 0:
-        return f"OK        exit 0  {pages:3d} sider  {stem}"
+        return f"OK        exit 0  {pages:3d} sider  {stem}{warn}"
     if exit_code == 3:
         return (f"FRAGMENT  exit 3  {pages:3d} sider  {stem}  "
-                f"({fragment_pairs} par)")
-    return f"FEIL      exit {exit_code}  {pages:3d} sider  {stem}"
+                f"({fragment_groups} grupper){warn}")
+    return f"FEIL      exit {exit_code}  {pages:3d} sider  {stem}{warn}"
 
 
 def find_panoramas(folder):
@@ -88,9 +95,14 @@ def count_pages(workdir):
     return max(0, len(lines) - 2)  # minus quality comment + column header
 
 
-def count_fragment_pairs(output):
+def count_fragment_groups(output):
     m = re.search(r"(\d+) suspected page fragment", output)
     return int(m.group(1)) if m else 0
+
+
+def parse_quality(output):
+    m = re.search(r"Card Quality: ([\d.]+)/100", output)
+    return float(m.group(1)) if m else None
 
 
 def unique_dir(base):
@@ -129,8 +141,9 @@ def run_report(source_folder, report_dir, open_finder=True):
             if anon.exists():
                 copy_safe(anon, report_dir / f"{stem}_anon_viz.jpg")
             rows.append(summary_line(stem, exit_code, pages,
-                                     count_fragment_pairs(output),
-                                     anon_missing=not anon.exists()))
+                                     count_fragment_groups(output),
+                                     anon_missing=not anon.exists(),
+                                     quality=parse_quality(output)))
 
     ok = sum(1 for r in rows if r.startswith("OK"))
     frag = sum(1 for r in rows if r.startswith("FRAGMENT"))

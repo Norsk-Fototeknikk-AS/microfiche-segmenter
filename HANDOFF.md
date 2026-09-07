@@ -314,9 +314,24 @@ visualization.jpg. And rapport.py's SAMMENDRAG forces any card without an
 anon_viz to a FEIL row with "(anon_viz mangler)" - a missing expected
 artifact must never read as success, whatever the exit code said.
 
+### Guard extended to chains + quality warning (2026-09-07, late)
+
+Report analysis of 81+6 production cards confirmed the seam hypothesis
+(scattered horizontal blending damage, one cluster per page row, varying per
+card - re-stitching is the fix, auto-merge is shelved because content is
+EATEN, not just displaced). It also caught a guard blind spot in the wild:
+612130000111_00012 passed OK with pages split into stacks of 3-4 fragments -
+no PAIR reaches the union band. `find_fragment_pairs` became
+`find_fragment_groups`: transitive chains over the same x-IoU/gap criteria,
+then maximal contiguous windows inside the union band (windowing keeps a
+tight next-row neighbour from pushing a real stack past the band).
+SAMMENDRAG additionally warns `ADVARSEL LAV KVALITET` on any card scoring
+below 50 regardless of exit code - in the field run every sick card was
+below 50, every healthy one above 74.
+
 ### Tests
 
-110 tests, ~19 s (was 32 when this was written). Unit tests for box
+117 tests, ~19 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 

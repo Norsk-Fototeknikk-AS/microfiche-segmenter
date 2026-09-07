@@ -491,31 +491,74 @@ def _x_interval_iou(a, b):
     return (right - left) / union
 
 
-def find_fragment_pairs(boxes):
-    """Index pairs of detections that look like ONE page cut horizontally.
+def find_fragment_groups(boxes):
+    """Index groups of detections that look like ONE page cut horizontally.
 
-    Signature: same x-span (interval IoU >= FRAGMENT_X_IOU), small vertical
-    gap, and a union height that matches the expected page height - which is
-    exactly what separates a split page from two whole pages in adjacent rows
-    (their union is ~2 pages tall and their gap is the row gap).
+    A seam-damaged page can come back as 2, 3 or 4 stacked fragments
+    (production 2026-09-07: stacks of 3-4 where no PAIR reaches the union
+    band). So: link boxes sharing an x-span (interval IoU >= FRAGMENT_X_IOU)
+    with a small vertical gap, take the transitive chains, and inside each
+    chain (sorted by y) report every maximal contiguous window whose union
+    height matches the expected page height. The union band is what separates
+    split pages (~1x expected) from whole pages in adjacent rows (~2x) - and
+    the windowing keeps a tight next-row neighbour from hiding a real stack
+    by pushing the whole chain's union past the band.
     """
-    if len(boxes) < 2:
+    n = len(boxes)
+    if n < 2:
         return []
     exp_h = expected_page_height(boxes)
-    pairs = []
-    for i in range(len(boxes)):
-        for j in range(i + 1, len(boxes)):
+    max_gap = FRAGMENT_MAX_GAP_RATIO * exp_h
+
+    adj = {i: set() for i in range(n)}
+    for i in range(n):
+        for j in range(i + 1, n):
             top, bot = ((boxes[i], boxes[j]) if boxes[i][1] <= boxes[j][1]
                         else (boxes[j], boxes[i]))
             if _x_interval_iou(top, bot) < FRAGMENT_X_IOU:
                 continue
-            gap = bot[1] - (top[1] + top[3])
-            if gap > FRAGMENT_MAX_GAP_RATIO * exp_h:
+            if bot[1] - (top[1] + top[3]) > max_gap:
                 continue
-            union_h = max(top[1] + top[3], bot[1] + bot[3]) - top[1]
-            if FRAGMENT_UNION_MIN * exp_h <= union_h <= FRAGMENT_UNION_MAX * exp_h:
-                pairs.append((i, j))
-    return pairs
+            adj[i].add(j)
+            adj[j].add(i)
+
+    seen = set()
+    groups = []
+    for start in range(n):
+        if start in seen or not adj[start]:
+            continue
+        comp = []
+        stack = [start]
+        seen.add(start)
+        while stack:
+            node = stack.pop()
+            comp.append(node)
+            for nb in adj[node]:
+                if nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        comp.sort(key=lambda k: boxes[k][1])
+
+        # Greedy top-down: the longest contiguous window still inside the
+        # union band becomes a group; scanning resumes after it.
+        i = 0
+        while i < len(comp) - 1:
+            best_end = None
+            for j in range(i + 1, len(comp)):
+                window = comp[i:j + 1]
+                top_y = min(boxes[k][1] for k in window)
+                bot_y = max(boxes[k][1] + boxes[k][3] for k in window)
+                union_h = bot_y - top_y
+                if union_h > FRAGMENT_UNION_MAX * exp_h:
+                    break
+                if union_h >= FRAGMENT_UNION_MIN * exp_h:
+                    best_end = j
+            if best_end is None:
+                i += 1
+            else:
+                groups.append(tuple(sorted(comp[i:best_end + 1])))
+                i = best_end + 1
+    return sorted(groups)
 
 
 def make_anon_mask(shape, contours, dilate_radius):
@@ -1269,16 +1312,16 @@ def main():
     # be MISSING in the gap, so merging them back is wrong - the card fails
     # loudly further down, after the visualizations are written with the
     # suspect pairs marked.
-    fragment_pairs = find_fragment_pairs(boxes_fullres)
-    fragment_indices = {i for pair in fragment_pairs for i in pair}
-    if fragment_pairs:
-        print(f"\nERROR: {len(fragment_pairs)} suspected page fragment "
-              "pair(s) - a page cut horizontally in two detections:",
+    fragment_groups = find_fragment_groups(boxes_fullres)
+    fragment_indices = {i for group in fragment_groups for i in group}
+    if fragment_groups:
+        print(f"\nERROR: {len(fragment_groups)} suspected page fragment "
+              "group(s) - a page cut horizontally into stacked detections:",
               file=sys.stderr)
-        for i, j in fragment_pairs:
-            print(f"  pages {i + 1} + {j + 1}: "
-                  f"{boxes_fullres[i]} over {boxes_fullres[j]}",
-                  file=sys.stderr)
+        for group in fragment_groups:
+            pages = "+".join(str(i + 1) for i in group)
+            coords = ", ".join(str(boxes_fullres[i]) for i in group)
+            print(f"  pages {pages}: {coords}", file=sys.stderr)
 
     # Output coordinates
     print("\n=== PAGE COORDINATES (full resolution) ===")
@@ -1343,8 +1386,8 @@ def main():
     label = f"Card Quality: {q}/100 ({grade})  |  {quality['grid']}  |  size={quality['size']}  align={quality['alignment']}  spacing={quality['spacing']}  shape={quality['shape']}"
     if do_invert:
         label += "  |  inverted" + ("" if args.invert else " (auto)")
-    if fragment_pairs:
-        label = f"SUSPECT FRAGMENTS ({len(fragment_pairs)} pair(s))  |  " + label
+    if fragment_groups:
+        label = f"SUSPECT FRAGMENTS ({len(fragment_groups)} group(s))  |  " + label
         banner_color = (0, 0, 200)
     cv2.putText(banner, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, banner_color, 2)
     viz = np.vstack([banner, viz])
@@ -1370,7 +1413,7 @@ def main():
     # marked. Extracting would archive half-pages as success with shifted
     # numbering; the cause is bad input (stitching seam), so the card goes to
     # error/ for re-stitching, like the no-pages failure.
-    if fragment_pairs:
+    if fragment_groups:
         print(f"\nERROR: suspected split pages in {input_file} - "
               "not extracting.", file=sys.stderr)
         print("  No _done sentinel written — this card will not be offered "

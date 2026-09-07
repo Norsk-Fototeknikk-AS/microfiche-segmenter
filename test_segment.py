@@ -1376,30 +1376,30 @@ def test_real_card_anon_mask_holds_no_glyph_sized_detail():
 # in the gap, so merging is wrong: the card must fail loudly instead.
 
 from segment_microfiche import (EXIT_SUSPECT_FRAGMENTS, expected_page_height,
-                                find_fragment_pairs)
+                                find_fragment_groups)
 
 
 def _whole_page_row(n=4, w=400, h=600, pitch=500, y=100):
     return [(i * pitch, y, w, h) for i in range(n)]
 
 
-def test_fragment_pairs_flags_a_third_two_thirds_split():
+def test_fragment_groups_flags_a_third_two_thirds_split():
     boxes = _whole_page_row() + [
         (2000, 100, 400, 180),   # top third
         (2000, 310, 400, 390),   # bottom two thirds, 30px gap
     ]
-    assert find_fragment_pairs(boxes) == [(4, 5)]
+    assert find_fragment_groups(boxes) == [(4, 5)]
 
 
-def test_fragment_pairs_ignores_whole_pages_in_adjacent_rows():
+def test_fragment_groups_ignores_whole_pages_in_adjacent_rows():
     """Vertically stacked WHOLE pages align in x and sit close - but their
     union is ~2 pages tall, nowhere near the expected page height."""
     boxes = _whole_page_row(y=100) + _whole_page_row(y=780)  # 80px row gap
-    assert find_fragment_pairs(boxes) == []
+    assert find_fragment_groups(boxes) == []
 
 
-def test_fragment_pairs_ignores_side_by_side_pages():
-    assert find_fragment_pairs(_whole_page_row()) == []
+def test_fragment_groups_ignores_side_by_side_pages():
+    assert find_fragment_groups(_whole_page_row()) == []
 
 
 def test_expected_height_survives_half_the_boxes_being_fragments():
@@ -1436,12 +1436,13 @@ def test_real_card_with_synthetic_seam_flags_a_fragment_pair():
     boxes = sorted(boxes, key=lambda bb: bb[1])
 
     assert len(boxes) == 2, boxes
-    assert find_fragment_pairs(boxes) == [(0, 1)]
+    assert find_fragment_groups(boxes) == [(0, 1)]
 
 
-def make_seamed_card(path):
-    """A 4x3 card where a light seam cuts every page of the middle row at 1/3
-    height - the failed-stitching input seen in production.
+def make_seamed_card(path, seams=1):
+    """A 4x3 card where light seams cut every page of the middle row - the
+    failed-stitching input seen in production (1 seam = 1/3+2/3 pairs,
+    2 seams = stacks of three).
 
     Proportions matter: pages must be tall enough that a 1/3 fragment
     survives the detect-scale erosion (radius 6 there = 120px here, per
@@ -1453,8 +1454,9 @@ def make_seamed_card(path):
             y = 350 + r * 900
             x = 60 + c * 480
             a[y:y + 700, x:x + 400] = 255
-    seam_y = 350 + 900 + 700 // 3
-    a[seam_y:seam_y + 30, :] = 0
+    for k in range(1, seams + 1):
+        seam_y = 350 + 900 + (700 * k) // (seams + 1)
+        a[seam_y:seam_y + 30, :] = 0
     pyvips.Image.new_from_memory(a.tobytes(), 2000, 3000, 1, 'uchar').write_to_file(str(path))
 
 
@@ -1537,8 +1539,23 @@ def test_summary_lines_show_status_exit_pages_and_fragments():
     frag = rapport.summary_line("kort_b", 3, 16, 2)
     fail = rapport.summary_line("kort_c", 2, 0, 0)
     assert ok.startswith("OK") and " 16 " in ok and "kort_a" in ok
-    assert frag.startswith("FRAGMENT") and "2 par" in frag
+    assert frag.startswith("FRAGMENT") and "2 grupper" in frag
     assert fail.startswith("FEIL") and "exit 2" in fail
+
+
+def test_summary_warns_on_low_quality_even_at_exit_zero():
+    """Field data 2026-09-07: every seam-sick card scored below 50, every
+    healthy one above 74. A low score on an OK card is the early warning."""
+    low = rapport.summary_line("kort_d", 0, 16, 0, quality=23.6)
+    fine = rapport.summary_line("kort_a", 0, 16, 0, quality=98.9)
+    assert "LAV KVALITET" in low and "23.6" in low
+    assert "LAV KVALITET" not in fine
+
+
+def test_quality_is_parsed_from_run_output():
+    out = "...\n  Card Quality: 23.6/100  (POOR)\n..."
+    assert rapport.parse_quality(out) == 23.6
+    assert rapport.parse_quality("no quality here") is None
 
 
 def test_rapport_end_to_end_collects_only_safe_artifacts(tmp_path):
@@ -1600,3 +1617,61 @@ def test_rapport_flags_a_card_without_anon_viz_as_failure(tmp_path):
     line = next(l for l in summary.splitlines() if "612130000012_00099" in l)
     assert line.startswith("FEIL"), line
     assert "anon_viz mangler" in line, line
+
+
+# --- Chain extension of the fragment guard --------------------------------
+# Production card 612130000111_00012 passed as OK: pages split in STACKS of
+# 3-4 fragments, and the pairwise union of any two neighbours lands BELOW the
+# 0.8x band. The guard must group stacked boxes transitively and judge the
+# chain's union against the expected page height.
+
+def test_fragment_groups_catches_a_three_way_split():
+    """Two seams through one page: three stacked fragments. Any PAIR of them
+    unions below the band - only the full chain reaches page height."""
+    boxes = _whole_page_row() + [
+        (2000, 100, 400, 180),
+        (2000, 295, 400, 190),
+        (2000, 500, 400, 180),
+    ]
+    assert find_fragment_groups(boxes) == [(4, 5, 6)]
+
+
+def test_fragment_groups_still_reports_plain_pairs():
+    boxes = _whole_page_row() + [
+        (2000, 100, 400, 180),
+        (2000, 310, 400, 390),
+    ]
+    assert find_fragment_groups(boxes) == [(4, 5)]
+
+
+def test_fragment_chain_stops_before_swallowing_the_next_row():
+    """Transitive chaining may link a fragment stack to a whole page in the
+    row below it when the gap is tight; the group must still be found as the
+    contiguous window that hits page height - not lost because the full
+    chain's union overshoots the band."""
+    boxes = _whole_page_row() + [
+        (2000, 100, 400, 180),
+        (2000, 295, 400, 190),
+        (2000, 500, 400, 180),
+        (2000, 710, 400, 600),   # whole page, next row, 30px gap
+    ]
+    assert find_fragment_groups(boxes) == [(4, 5, 6)]
+
+
+def test_fragment_groups_ignores_whole_pages_in_adjacent_rows_too():
+    boxes = _whole_page_row(y=100) + _whole_page_row(y=780)
+    assert find_fragment_groups(boxes) == []
+
+
+def test_triple_seamed_card_fails_loudly_end_to_end(tmp_path):
+    """The exact production miss: two seams per page in one row - exit 3."""
+    panoramas = tmp_path / "Panoramas"
+    panoramas.mkdir()
+    src = panoramas / "612130000111_00012.jpg"
+    make_seamed_card(src, seams=2)
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out))
+
+    assert proc.returncode == EXIT_SUSPECT_FRAGMENTS, proc.stdout + proc.stderr
+    assert not (out / DONE_SENTINEL).exists()
