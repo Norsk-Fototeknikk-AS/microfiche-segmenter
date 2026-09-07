@@ -314,7 +314,11 @@ the end.
 
 `--anon-viz` exists because the production machine is air-gapped with journal
 content that must not leave it: `visualization.jpg` and the binary TIFF show
-readable text. The anon view fills every detected blob solid (text inside a
+readable text. Like `visualization.jpg`, the anon view is written on EVERY
+run **including the failure paths** (exit 2/3) — failing cards are exactly
+the ones that must be inspectable across the air gap; on failure it shows the
+silhouettes of whatever survived detection plus a red `FAILED: <reason>`
+banner. The anon view fills every detected blob solid (text inside a
 page is a hole in the blob and gets painted over) while a gap that reaches the
 blob's edge — a stitching seam splitting a page — survives, which is exactly
 the diagnostic it exists to carry out. Overlay drawing is stamped in hard

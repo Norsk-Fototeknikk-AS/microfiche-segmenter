@@ -1563,3 +1563,40 @@ def test_rapport_end_to_end_collects_only_safe_artifacts(tmp_path):
     assert "612130000012_00001" in summary
     # anon viz per card came along, under whitelisted names
     assert any(n.endswith("anon_viz.jpg") for n in files), files
+
+
+def test_failed_card_still_writes_anon_viz(tmp_path):
+    """Production 2026-09-07: error-path cards got a text report but no
+    anonymized image - and the failing cards are exactly the ones that most
+    need to be SEEN across the air gap. Same principle as visualization.jpg:
+    written on EVERY run, failure included."""
+    src = tmp_path / "612130000012_00016.jpg"
+    a = np.zeros((1500, 2000), 'uint8')
+    for yy in range(100, 1400, 300):
+        for xx in range(100, 1900, 400):
+            a[yy:yy + 12, xx:xx + 12] = 255  # specks only: exit 2, no pages
+    pyvips.Image.new_from_memory(a.tobytes(), 2000, 1500, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out),
+                         "--skip-extraction", "--anon-viz")
+
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert (out / "_debug" / "anon_viz.jpg").exists(), \
+        "error path skipped the anonymized view"
+
+
+def test_rapport_flags_a_card_without_anon_viz_as_failure(tmp_path):
+    """A missing anonymized image must never look like success in the
+    summary - whatever the reason it is missing."""
+    src = tmp_path / "arkiv"
+    src.mkdir()
+    (src / "612130000012_00099.jpg").write_bytes(b"not an image at all")
+
+    report_dir = rapport.run_report(src, tmp_path / "RAPPORT-test",
+                                    open_finder=False)
+
+    summary = (report_dir / "SAMMENDRAG.txt").read_text()
+    line = next(l for l in summary.splitlines() if "612130000012_00099" in l)
+    assert line.startswith("FEIL"), line
+    assert "anon_viz mangler" in line, line

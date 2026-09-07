@@ -304,9 +304,19 @@ end as defense in depth. The .command wrapper derives the repo path from its
 own location (`$0`) and calls `.venv/bin/python` absolutely - launchd/Finder
 gives no usable PATH.
 
+### Anon viz on the failure paths + rapport guard (2026-09-07, evening)
+
+Field bug from m4-studio: error-path cards (exit 2) got text reports but no
+anon_viz - main returned at the STEP-3 fail branch before the viz step ever
+ran. Now the fail branch writes anon_viz too (silhouettes of whatever
+survived detection + red FAILED banner), same every-run principle as
+visualization.jpg. And rapport.py's SAMMENDRAG forces any card without an
+anon_viz to a FEIL row with "(anon_viz mangler)" - a missing expected
+artifact must never read as success, whatever the exit code said.
+
 ### Tests
 
-108 tests, ~18 s (was 32 when this was written). Unit tests for box
+110 tests, ~19 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 

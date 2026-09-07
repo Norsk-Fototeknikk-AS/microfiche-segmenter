@@ -46,7 +46,13 @@ def copy_safe(src, dst):
     shutil.copyfile(src, dst)
 
 
-def summary_line(stem, exit_code, pages, fragment_pairs):
+def summary_line(stem, exit_code, pages, fragment_pairs, anon_missing=False):
+    if anon_missing:
+        # Whatever the exit code said: without the anonymized image the card
+        # cannot be inspected across the air gap, and a missing expected
+        # artifact must never read as success.
+        return (f"FEIL      exit {exit_code}  {pages:3d} sider  {stem}  "
+                "(anon_viz mangler)")
     if exit_code == 0:
         return f"OK        exit 0  {pages:3d} sider  {stem}"
     if exit_code == 3:
@@ -123,7 +129,8 @@ def run_report(source_folder, report_dir, open_finder=True):
             if anon.exists():
                 copy_safe(anon, report_dir / f"{stem}_anon_viz.jpg")
             rows.append(summary_line(stem, exit_code, pages,
-                                     count_fragment_pairs(output)))
+                                     count_fragment_pairs(output),
+                                     anon_missing=not anon.exists()))
 
     ok = sum(1 for r in rows if r.startswith("OK"))
     frag = sum(1 for r in rows if r.startswith("FRAGMENT"))

@@ -1102,6 +1102,23 @@ def main():
         fail_viz = cv2.resize(binary_img, None, fx=fail_scale, fy=fail_scale)
         cv2.imwrite(str(viz_path), fail_viz)
         print(f"  Detection view saved to {viz_path}", file=sys.stderr)
+        # The anonymized view is written on failure too - failing cards are
+        # exactly the ones that must be inspectable across the air gap. The
+        # silhouettes of whatever survived detection (often nothing: a black
+        # frame) plus the failure reason still carry no readable content.
+        if args.anon_viz:
+            fail_radius = erosion_radius(DETECT_ERODE_KERNEL,
+                                         DETECT_ERODE_ITERATIONS)
+            anon_mask = make_anon_mask(binary_img.shape, filtered_contours,
+                                       fail_radius)
+            fail_boxes = [(int(x / detect_scale), int(y / detect_scale),
+                           int(w / detect_scale), int(h / detect_scale))
+                          for (x, y, w, h) in boxes]
+            anon_viz = render_anon_viz(anon_mask, fail_boxes, detect_scale,
+                                       f"FAILED: {reason}", (0, 0, 200))
+            anon_path = debug_dir / "anon_viz.jpg"
+            cv2.imwrite(str(anon_path), anon_viz)
+            print(f"  Anonymized view saved to {anon_path}", file=sys.stderr)
         if not args.skip_extraction:
             moved = move_without_clobber(input_path, input_path.parent / "error")
             print(f"  Source scan moved to {moved}", file=sys.stderr)
