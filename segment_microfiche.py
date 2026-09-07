@@ -59,6 +59,23 @@ DONE_SENTINEL = "_done"
 
 # Exit codes, so an app-driven run can tell failure modes apart
 EXIT_NO_PAGES = 2
+# Detections that look like one page cut horizontally in two (stitching seam
+# suspected). Content may be MISSING in the gap, so auto-merging is wrong and
+# the card fails loudly instead of archiving half-pages as success.
+EXIT_SUSPECT_FRAGMENTS = 3
+
+# Fragment-pair signature: two detections covering the same x-span (interval
+# IoU), separated by a small vertical gap, whose union is one page tall.
+FRAGMENT_X_IOU = 0.8
+FRAGMENT_MAX_GAP_RATIO = 0.15   # gap vs expected page height
+# The union band is what separates a split page (union ~1x expected) from two
+# whole pages in adjacent rows (union ~2x expected, must stay outside). The
+# upper bound is generous because a card where EVERY page is split has no
+# whole page left to anchor the expected height - it lands low, and the real
+# pair must still fit under the bound (measured 1.6x on the seamed fasit).
+FRAGMENT_UNION_MIN = 0.8
+FRAGMENT_UNION_MAX = 1.8
+FRAGMENT_MARK_COLOR = (0, 165, 255)  # orange boxes in both visualizations
 
 # A card is pages on visible card background, so foreground can never be
 # ~everything. Above this share the threshold split is meaningless (blank or
@@ -450,6 +467,57 @@ def erosion_radius(kernel_size, iterations):
     return (kernel_size // 2) * iterations
 
 
+def expected_page_height(boxes):
+    """Robust page height for a card: the tallest detection, capped at 1.5x
+    the 75th percentile of heights.
+
+    Pages on a card are near-uniform and fragments (split pages) are always
+    SHORTER than a whole page, so the tallest box is a whole page even on a
+    card where everything else is fragments - a badly seamed card can be half
+    fragments, which sinks the median. The percentile cap keeps one outlier
+    (an unsplittable vertical merge, ~2 pages tall) from dragging the
+    estimate up to double height.
+    """
+    heights = [h for (_, _, _, h) in boxes]
+    return float(min(max(heights), 1.5 * np.percentile(heights, 75)))
+
+
+def _x_interval_iou(a, b):
+    left = max(a[0], b[0])
+    right = min(a[0] + a[2], b[0] + b[2])
+    if right <= left:
+        return 0.0
+    union = max(a[0] + a[2], b[0] + b[2]) - min(a[0], b[0])
+    return (right - left) / union
+
+
+def find_fragment_pairs(boxes):
+    """Index pairs of detections that look like ONE page cut horizontally.
+
+    Signature: same x-span (interval IoU >= FRAGMENT_X_IOU), small vertical
+    gap, and a union height that matches the expected page height - which is
+    exactly what separates a split page from two whole pages in adjacent rows
+    (their union is ~2 pages tall and their gap is the row gap).
+    """
+    if len(boxes) < 2:
+        return []
+    exp_h = expected_page_height(boxes)
+    pairs = []
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            top, bot = ((boxes[i], boxes[j]) if boxes[i][1] <= boxes[j][1]
+                        else (boxes[j], boxes[i]))
+            if _x_interval_iou(top, bot) < FRAGMENT_X_IOU:
+                continue
+            gap = bot[1] - (top[1] + top[3])
+            if gap > FRAGMENT_MAX_GAP_RATIO * exp_h:
+                continue
+            union_h = max(top[1] + top[3], bot[1] + bot[3]) - top[1]
+            if FRAGMENT_UNION_MIN * exp_h <= union_h <= FRAGMENT_UNION_MAX * exp_h:
+                pairs.append((i, j))
+    return pairs
+
+
 def make_anon_mask(shape, contours, dilate_radius):
     """Solid silhouettes of the detected blobs, strictly 0/255.
 
@@ -479,8 +547,11 @@ def _stamp_solid(img, color, draw):
     img[layer > 127] = color
 
 
-def render_anon_viz(mask, boxes_fullres, fullres_to_mask, label, banner_color):
+def render_anon_viz(mask, boxes_fullres, fullres_to_mask, label, banner_color,
+                    fragment_indices=frozenset()):
     """Annotate the silhouette mask with page boxes and the quality banner.
+    Boxes whose index is in fragment_indices are marked orange - they are one
+    half of a suspected split page.
 
     Everything here must keep the two-level safety property: INTER_NEAREST for
     the resize and hard-thresholded stamps for all overlay drawing, so the
@@ -496,16 +567,18 @@ def render_anon_viz(mask, boxes_fullres, fullres_to_mask, label, banner_color):
                int(w * fullres_to_viz), int(h * fullres_to_viz))
               for (x, y, w, h) in boxes_fullres]
 
-    def draw_boxes(layer):
-        for (sx, sy, sw, sh) in scaled:
-            cv2.rectangle(layer, (sx, sy), (sx + sw, sy + sh), 255, 2)
+    def draw_boxes(layer, wanted):
+        for i, (sx, sy, sw, sh) in enumerate(scaled):
+            if (i in fragment_indices) == wanted:
+                cv2.rectangle(layer, (sx, sy), (sx + sw, sy + sh), 255, 2)
 
     def draw_numbers(layer):
         for i, (sx, sy, _, _) in enumerate(scaled, 1):
             cv2.putText(layer, str(i), (sx + 5, sy + 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 2)
 
-    _stamp_solid(viz, (0, 255, 0), draw_boxes)
+    _stamp_solid(viz, (0, 255, 0), lambda layer: draw_boxes(layer, False))
+    _stamp_solid(viz, FRAGMENT_MARK_COLOR, lambda layer: draw_boxes(layer, True))
     _stamp_solid(viz, (0, 0, 255), draw_numbers)
 
     banner_h = 32
@@ -1174,6 +1247,22 @@ def main():
 
         boxes_fullres = refined
 
+    # Fragment guard: pages cut horizontally in two by a light stitching seam
+    # in the panorama (bad input, seen in production 2026-09-07). Content may
+    # be MISSING in the gap, so merging them back is wrong - the card fails
+    # loudly further down, after the visualizations are written with the
+    # suspect pairs marked.
+    fragment_pairs = find_fragment_pairs(boxes_fullres)
+    fragment_indices = {i for pair in fragment_pairs for i in pair}
+    if fragment_pairs:
+        print(f"\nERROR: {len(fragment_pairs)} suspected page fragment "
+              "pair(s) - a page cut horizontally in two detections:",
+              file=sys.stderr)
+        for i, j in fragment_pairs:
+            print(f"  pages {i + 1} + {j + 1}: "
+                  f"{boxes_fullres[i]} over {boxes_fullres[j]}",
+                  file=sys.stderr)
+
     # Output coordinates
     print("\n=== PAGE COORDINATES (full resolution) ===")
     print("Page#, X, Y, Width, Height")
@@ -1219,7 +1308,9 @@ def main():
     for i, (x, y, w, h) in enumerate(boxes_fullres, 1):
         sx, sy = int(x * fullres_to_viz), int(y * fullres_to_viz)
         sw, sh = int(w * fullres_to_viz), int(h * fullres_to_viz)
-        cv2.rectangle(viz, (sx, sy), (sx + sw, sy + sh), (0, 255, 0), 2)
+        box_color = (FRAGMENT_MARK_COLOR if (i - 1) in fragment_indices
+                     else (0, 255, 0))
+        cv2.rectangle(viz, (sx, sy), (sx + sw, sy + sh), box_color, 2)
         cv2.putText(viz, str(i), (sx + 5, sy + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
     # Add quality score banner at the top
@@ -1235,6 +1326,9 @@ def main():
     label = f"Card Quality: {q}/100 ({grade})  |  {quality['grid']}  |  size={quality['size']}  align={quality['alignment']}  spacing={quality['spacing']}  shape={quality['shape']}"
     if do_invert:
         label += "  |  inverted" + ("" if args.invert else " (auto)")
+    if fragment_pairs:
+        label = f"SUSPECT FRAGMENTS ({len(fragment_pairs)} pair(s))  |  " + label
+        banner_color = (0, 0, 200)
     cv2.putText(banner, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, banner_color, 2)
     viz = np.vstack([banner, viz])
 
@@ -1249,10 +1343,28 @@ def main():
         anon_mask = make_anon_mask(binary_img.shape, filtered_contours,
                                    detect_radius)
         anon_viz = render_anon_viz(anon_mask, boxes_fullres, detect_scale,
-                                   label, banner_color)
+                                   label, banner_color,
+                                   fragment_indices=fragment_indices)
         anon_path = debug_dir / "anon_viz.jpg"
         cv2.imwrite(str(anon_path), anon_viz)
         print(f"Saved {anon_path} (anonymized)")
+
+    # Fragment guard verdict, after both visualizations exist with the pairs
+    # marked. Extracting would archive half-pages as success with shifted
+    # numbering; the cause is bad input (stitching seam), so the card goes to
+    # error/ for re-stitching, like the no-pages failure.
+    if fragment_pairs:
+        print(f"\nERROR: suspected split pages in {input_file} - "
+              "not extracting.", file=sys.stderr)
+        print("  No _done sentinel written — this card will not be offered "
+              "for import.", file=sys.stderr)
+        if not args.skip_extraction:
+            moved = move_without_clobber(input_path, input_path.parent / "error")
+            print(f"  Source scan moved to {moved}", file=sys.stderr)
+        else:
+            print("  Source left in place (--skip-extraction is "
+                  "inspection-only).", file=sys.stderr)
+        return EXIT_SUSPECT_FRAGMENTS
 
     # === STEP 6: Extract pages (optional) ===
     if not args.skip_extraction:

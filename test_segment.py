@@ -1366,3 +1366,137 @@ def test_real_card_anon_mask_holds_no_glyph_sized_detail():
     for i in range(1, n):
         assert stats[i, cv2.CC_STAT_WIDTH] >= min_w, "sub-page-sized silhouette"
         assert stats[i, cv2.CC_STAT_HEIGHT] >= min_h, "sub-page-sized silhouette"
+
+
+# --- Fragment guard (exit 3) ----------------------------------------------
+# Production 2026-09-07: ~half the successfully segmented cards had pages cut
+# horizontally in two detections (top ~1/3 + bottom ~2/3) - suspected light
+# stitching seams in the panorama. Half-pages archived as success with shifted
+# numbering is the worst kind of quiet corruption, and content may be MISSING
+# in the gap, so merging is wrong: the card must fail loudly instead.
+
+from segment_microfiche import (EXIT_SUSPECT_FRAGMENTS, expected_page_height,
+                                find_fragment_pairs)
+
+
+def _whole_page_row(n=4, w=400, h=600, pitch=500, y=100):
+    return [(i * pitch, y, w, h) for i in range(n)]
+
+
+def test_fragment_pairs_flags_a_third_two_thirds_split():
+    boxes = _whole_page_row() + [
+        (2000, 100, 400, 180),   # top third
+        (2000, 310, 400, 390),   # bottom two thirds, 30px gap
+    ]
+    assert find_fragment_pairs(boxes) == [(4, 5)]
+
+
+def test_fragment_pairs_ignores_whole_pages_in_adjacent_rows():
+    """Vertically stacked WHOLE pages align in x and sit close - but their
+    union is ~2 pages tall, nowhere near the expected page height."""
+    boxes = _whole_page_row(y=100) + _whole_page_row(y=780)  # 80px row gap
+    assert find_fragment_pairs(boxes) == []
+
+
+def test_fragment_pairs_ignores_side_by_side_pages():
+    assert find_fragment_pairs(_whole_page_row()) == []
+
+
+def test_expected_height_survives_half_the_boxes_being_fragments():
+    """Median would sink toward the fragments; the upper quartile stays on the
+    whole pages as long as fragments are a minority of... up to ~75%."""
+    whole = _whole_page_row(n=4)
+    frags = [(2000, 100, 400, 180), (2000, 310, 400, 390),
+             (2500, 100, 400, 200), (2500, 330, 400, 370)]
+    exp = expected_page_height(whole + frags)
+    assert 550 <= exp <= 620, exp
+
+
+def test_expected_height_caps_a_vertically_merged_outlier():
+    """One unsplittable vertical merge (~2 pages tall) must not drag the
+    estimate up to double height - that would make whole-page row stacks
+    match the union band and fail good cards."""
+    boxes = _whole_page_row() + [(2000, 100, 400, 1280)]
+    assert expected_page_height(boxes) <= 900
+
+
+def test_real_card_with_synthetic_seam_flags_a_fragment_pair():
+    """The production signature, reproduced on the fasit: a light stitching
+    seam at 1/3 page height cuts the detection in two stacked boxes. Worst
+    case on purpose - EVERY detection on this card is a fragment, so there is
+    no whole page left to anchor the expected height."""
+    from segment_microfiche import detect_page_boxes
+    b = cv2.bitwise_not(_binary_of("real_card_10pct.jpg"))
+    h, w = b.shape
+    b[244 + 301 // 3: 244 + 301 // 3 + 8, :] = 0  # seam through the tape pair
+
+    boxes, _, _, _ = detect_page_boxes(
+        b, int(h * 0.08), int(w * MIN_PAGE_WIDTH_RATIO),
+        int(h * MIN_PAGE_HEIGHT_RATIO))
+    boxes = sorted(boxes, key=lambda bb: bb[1])
+
+    assert len(boxes) == 2, boxes
+    assert find_fragment_pairs(boxes) == [(0, 1)]
+
+
+def make_seamed_card(path):
+    """A 4x3 card where a light seam cuts every page of the middle row at 1/3
+    height - the failed-stitching input seen in production.
+
+    Proportions matter: pages must be tall enough that a 1/3 fragment
+    survives the detect-scale erosion (radius 6 there = 120px here, per
+    side), and the seam wide enough (30px = 3px at detect scale) not to
+    average back into foreground in the downsample."""
+    a = np.zeros((3000, 2000), 'uint8')
+    for r in range(3):
+        for c in range(4):
+            y = 350 + r * 900
+            x = 60 + c * 480
+            a[y:y + 700, x:x + 400] = 255
+    seam_y = 350 + 900 + 700 // 3
+    a[seam_y:seam_y + 30, :] = 0
+    pyvips.Image.new_from_memory(a.tobytes(), 2000, 3000, 1, 'uchar').write_to_file(str(path))
+
+
+def test_seamed_card_fails_loudly_with_exit_3(tmp_path):
+    """Half-pages must never archive as success: no _done, source to error/,
+    own exit code so the app can tell it from no-pages."""
+    panoramas = tmp_path / "Panoramas"
+    panoramas.mkdir()
+    src = panoramas / "612130000012_00016.jpg"
+    make_seamed_card(src)
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out))
+
+    assert proc.returncode == EXIT_SUSPECT_FRAGMENTS, proc.stdout + proc.stderr
+    assert not (out / DONE_SENTINEL).exists(), "_done written for a seamed card"
+    assert "fragment" in (proc.stdout + proc.stderr).lower()
+    assert (panoramas / "error" / src.name).exists(), "not moved to error/"
+    assert not (tmp_path / ARCHIVE_DIR_NAME).exists(), "seamed card was archived"
+
+
+def test_whole_card_still_passes_the_fragment_guard(tmp_path):
+    src = tmp_path / "612130000012_00016.jpg"
+    make_card(src)
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--no-archive")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_anon_viz_marks_fragment_pairs_in_orange_and_stays_clean():
+    mask = np.zeros((500, 800), np.uint8)
+    mask[100:400, 100:700] = 255
+    boxes = [(1000, 1000, 3000, 1000), (1000, 2200, 3000, 2200),
+             (5000, 1000, 3000, 3400)]
+
+    viz = render_anon_viz(mask, boxes, fullres_to_mask=0.1,
+                          label="SUSPECT FRAGMENTS", banner_color=(0, 0, 200),
+                          fragment_indices={0, 1})
+
+    colors = {tuple(c) for c in np.unique(viz.reshape(-1, 3), axis=0)}
+    allowed = {(0, 0, 0), (255, 255, 255), (0, 255, 0), (0, 0, 255),
+               (30, 30, 30), (0, 0, 200), (0, 165, 255)}
+    assert colors <= allowed, f"unexpected midtones leaked: {colors - allowed}"
+    assert (0, 165, 255) in colors, "fragment boxes not marked in orange"
+    assert (0, 255, 0) in colors, "ordinary page box lost its green"

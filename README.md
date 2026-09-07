@@ -136,6 +136,7 @@ the failure is reported, not guessed around.
 | 0 | success |
 | 1 | unhandled exception (traceback on stderr) |
 | 2 | no usable detection (zero pages, or degenerate threshold); source moved to `error/` |
+| 3 | suspected page fragments — a page cut horizontally in two detections (stitching seam in the input); source moved to `error/`, no `_done` (see C14) |
 
 `-O` / `--output` names the **card folder**, not the watch root. A caller that
 wants `<root>/<fid>/` must pass `-O <root>/<fid>` itself.
@@ -250,6 +251,31 @@ rewrite; it is the input that is no longer where it was.
 Known wart: failed scans go to `error/` *inside* the input folder, while the
 archive sits *beside* it. Those two should probably agree. Nobody has decided
 which way.
+
+### C14. Split pages fail the card, they are not merged
+
+Production 2026-09-07: a light horizontal stitching seam in the panorama cuts
+pages in two detections — top ~1/3 and bottom ~2/3, same x-span, small gap.
+Extracting would archive half-pages as success with shifted page numbering,
+and content may be **missing** in the seam gap, so auto-merging the halves is
+wrong: the card fails loudly instead (exit 3, no `_done`, source to `error/`
+for re-stitching — merging could become phase 2 once real seamed cards have
+been inspected via `--anon-viz`).
+
+The signature (`find_fragment_pairs`): two detections with x-interval IoU ≥
+0.8, vertical gap ≤ 15 % of the expected page height, and a union height
+inside 0.8–1.8× the expected height. Expected height is the tallest detection
+capped at 1.5× the 75th-percentile height — the tallest box is a whole page
+even when most detections are fragments, and the cap keeps one unsplit
+vertical merge from doubling the estimate. The union band is what separates a
+split page (union ≈ 1×) from whole pages in adjacent rows (union ≈ 2×, and
+row gaps also fail the gap test). Both visualizations mark the suspect boxes
+in orange and the banner says `SUSPECT FRAGMENTS`.
+
+Known blind spot: a card whose *every* detection is a fragment of the same
+kind has no whole page left to anchor the expected height. The generous union
+band covers the measured fasit case (1.6×), but proportions beyond that
+escape the guard.
 
 ---
 

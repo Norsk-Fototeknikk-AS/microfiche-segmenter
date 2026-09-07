@@ -277,9 +277,24 @@ the valley. Neither order is "correct"; the detect order is robust for finding
 pages, the scan order is sensitive to gaps. Changing either order breaks the
 mechanism it serves.
 
+### Fragment guard, exit 3 (2026-09-07)
+
+~Half the production cards after the m4-studio upgrade got pages cut
+horizontally in two detections (top ~1/3 + bottom ~2/3) by light stitching
+seams — archived as SUCCESS with shifted numbering. `find_fragment_pairs`
+detects the signature (x-IoU ≥ 0.8, gap ≤ 15 % of expected page height, union
+0.8–1.8× expected) and the card exits 3 without `_done`, source to `error/`,
+suspect boxes orange in both visualizations. Expected height = tallest box
+capped at 1.5× the 75th-percentile height; see C14 in the README for why each
+piece is shaped that way and for the all-fragments blind spot. Merging the
+halves instead is deliberately NOT done — content may be missing in the seam
+gap (possible phase 2 after real seamed cards are inspected with
+`--anon-viz`). MicroficheStation must treat exit 3 as failure — agreed with
+the coordinator session 2026-09-07.
+
 ### Tests
 
-95 tests, ~17 s (was 32 when this was written). Unit tests for box
+104 tests, ~19 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 
