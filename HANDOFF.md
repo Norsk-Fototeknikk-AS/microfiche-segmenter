@@ -292,9 +292,21 @@ gap (possible phase 2 after real seamed cards are inspected with
 `--anon-viz`). MicroficheStation must treat exit 3 as failure — agreed with
 the coordinator session 2026-09-07.
 
+### RAPPORT.command + rapport.py (2026-09-07)
+
+Finder-first report extraction on m4-studio: inspect every panorama in a
+chosen folder, collect ONLY whitelisted anonymized artifacts (per-card
+rapport.txt, anon_viz.jpg, SAMMENDRAG.txt) into `~/Desktop/RAPPORT-<dato>/`
+for the USB stick. Inspection runs into a TemporaryDirectory precisely
+because that output contains the non-anonymized visualization - the report
+folder only ever receives files through `copy_safe`, and is re-scanned at the
+end as defense in depth. The .command wrapper derives the repo path from its
+own location (`$0`) and calls `.venv/bin/python` absolutely - launchd/Finder
+gives no usable PATH.
+
 ### Tests
 
-104 tests, ~19 s (was 32 when this was written). Unit tests for box
+108 tests, ~18 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 

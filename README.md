@@ -323,6 +323,18 @@ overlay palette, and another pins that no silhouette on the real card is
 smaller than a page. Never add smoothing/closing to the mask or antialiased
 drawing to the overlay.
 
+### RAPPORT.command (m4-studio)
+
+Double-click in Finder on the production machine: pick the folder holding the
+panorama images, and every one is inspected (`--skip-extraction --anon-viz`,
+touching neither sources nor existing card folders). Only whitelisted,
+anonymized artifacts land in `~/Desktop/RAPPORT-<dato>/` — per-card text
+logs, `<kort>_anon_viz.jpg`, and a `SAMMENDRAG.txt` with page counts, exit
+codes and which cards tripped the fragment guard. `rapport.py` enforces the
+whitelist on every copy and re-scans the finished folder; `visualization.jpg`,
+binaries and page crops can never end up there. Cards that fail inspection
+appear loudly as `FEIL` lines in the summary.
+
 ## How detection works
 
 1. Otsu threshold from a 1 % thumbnail, applied to the full image.

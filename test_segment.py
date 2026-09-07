@@ -1500,3 +1500,66 @@ def test_anon_viz_marks_fragment_pairs_in_orange_and_stays_clean():
     assert colors <= allowed, f"unexpected midtones leaked: {colors - allowed}"
     assert (0, 165, 255) in colors, "fragment boxes not marked in orange"
     assert (0, 255, 0) in colors, "ordinary page box lost its green"
+
+
+# --- RAPPORT.command / rapport.py -----------------------------------------
+# Safe report extraction on the air-gapped m4-studio: inspect every panorama
+# in a folder, collect ONLY anonymized artifacts for the USB stick. Journal
+# content (visualization.jpg, binaries, page crops) must never end up in the
+# report folder, not even by accident - hence a hard whitelist.
+
+import pytest
+
+import rapport
+
+
+def test_whitelist_allows_only_anonymous_artifacts():
+    assert rapport.is_safe_artifact("anon_viz.jpg")
+    assert rapport.is_safe_artifact("612130000012_00001 Panorama_rapport.txt")
+    assert rapport.is_safe_artifact("SAMMENDRAG.txt")
+
+    assert not rapport.is_safe_artifact("visualization.jpg")
+    assert not rapport.is_safe_artifact("page_001.tif")
+    assert not rapport.is_safe_artifact("temp_binary.tif")
+    assert not rapport.is_safe_artifact("612130000012_00001 Panorama.jpg")
+
+
+def test_guarded_copy_refuses_files_outside_the_whitelist(tmp_path):
+    src = tmp_path / "visualization.jpg"
+    src.write_bytes(b"journal content")
+    with pytest.raises(rapport.UnsafeArtifact):
+        rapport.copy_safe(src, tmp_path / "out" / "visualization.jpg")
+    assert not (tmp_path / "out").exists()
+
+
+def test_summary_lines_show_status_exit_pages_and_fragments():
+    ok = rapport.summary_line("kort_a", 0, 16, 0)
+    frag = rapport.summary_line("kort_b", 3, 16, 2)
+    fail = rapport.summary_line("kort_c", 2, 0, 0)
+    assert ok.startswith("OK") and " 16 " in ok and "kort_a" in ok
+    assert frag.startswith("FRAGMENT") and "2 par" in frag
+    assert fail.startswith("FEIL") and "exit 2" in fail
+
+
+def test_rapport_end_to_end_collects_only_safe_artifacts(tmp_path):
+    """Two panoramas - one clean, one seamed - inspected into a report folder
+    that must hold nothing but whitelisted files and name the seamed card."""
+    src = tmp_path / "arkiv"
+    src.mkdir()
+    make_card(src / "612130000012_00001.jpg")
+    make_seamed_card(src / "612130000012_00002.jpg")
+
+    report_dir = rapport.run_report(src, tmp_path / "RAPPORT-test",
+                                    open_finder=False)
+
+    files = sorted(p.name for p in report_dir.iterdir())
+    assert "SAMMENDRAG.txt" in files
+    assert "612130000012_00001_rapport.txt" in files
+    for name in files:
+        assert rapport.is_safe_artifact(name), f"unsafe file leaked: {name}"
+
+    summary = (report_dir / "SAMMENDRAG.txt").read_text()
+    assert "612130000012_00002" in summary and "FRAGMENT" in summary
+    assert "612130000012_00001" in summary
+    # anon viz per card came along, under whitelisted names
+    assert any(n.endswith("anon_viz.jpg") for n in files), files
