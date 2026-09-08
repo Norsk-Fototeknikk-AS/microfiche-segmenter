@@ -720,6 +720,35 @@ whitelist on every copy and re-scans the finished folder; `visualization.jpg`,
 binaries and page crops can never end up there. Cards that fail inspection
 appear loudly as `FEIL` lines in the summary.
 
+### TEST-RUNDE.command (m4-studio)
+
+One orchestrated test round, from a list of card IDs to a comparison.
+Double-click in Finder; the card list is `TEST-KORT.txt` beside the script,
+one ID per line (`#` is a comment), or it asks for a file.
+
+It **copies** each named panorama into a fresh `TEST-RUNDE-<date>/` folder
+and never moves anything — a test round must not disturb the production
+queue, so the sources stay exactly where the app and the runner expect them.
+Cards are looked for in `Panoramas/`, `Panoramas/error/`,
+`PanoramaArchive/` and `Error/` under `sessionRoot` (read from
+`~/.microfiche-station.json` like the app, default
+`/Users/m4-studio/Desktop/NHA`), and the folder each was found in is
+printed. Anything not found is listed loudly rather than silently skipped.
+
+Then it inspects the copies in **both** modes into `rapport-standard/` and
+`rapport-bakgrunn/`, and writes `SAMMENLIGNING.txt` against the previous
+test round: one line per card with the outcome, page count, grid, quality
+and `TRINN2`, marked `=` unchanged, `!` changed, `+` new, `-` gone — both
+states on the changed line so a difference can be grepped, not just seen.
+Per card it also carries the staircase (`TRINN2:` trigger, otsu and border
+before/after, and whether step two proved itself) and the cell evidence
+(`CELL` counts and median foreground for occupied and empty cells).
+
+Only whitelisted, anonymized artifacts reach the stick, and each copy is
+verified byte for byte. The whitelist is `rapport.py`'s, composed with the
+one addition `SAMMENLIGNING.txt` — never duplicated, so it keeps a single
+source of truth.
+
 ### VIS-PANORAMA.command (m4-studio)
 
 The production panoramas are zstd-TIFFs that Preview cannot open.

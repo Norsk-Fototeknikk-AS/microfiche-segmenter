@@ -4204,3 +4204,252 @@ def test_a_failing_cell_measurement_cannot_fail_the_card(tmp_path,
     assert (out_b / "page_coordinates.csv").read_text() == coords_ok
     assert "CELL measurement failed" in err, err
     assert "RuntimeError" in err, err
+
+
+# --- TEST-RUNDE (2026-09-08): one orchestrated test round ------------------
+# The manual round cost an evening of moving panoramas between Panoramas,
+# error and PanoramaArchive by hand, minding the app's _done rules and
+# copying logs. This tool does the round: it COPIES the named cards into a
+# fresh folder, runs both modes, and diffs against the previous round. It
+# never moves anything and never touches a source.
+
+import test_runde
+
+
+def _station_tree(root):
+    for sub in ("Panoramas", "Panoramas/error", "PanoramaArchive", "Error"):
+        (root / sub).mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def test_card_ids_are_read_one_per_line(tmp_path):
+    f = tmp_path / "TEST-KORT.txt"
+    f.write_text("# en kommentar\n612130000203_00012\n\n"
+                 "612130000609_00024  \n")
+    assert test_runde.read_card_ids(f) == ["612130000203_00012",
+                                           "612130000609_00024"]
+
+
+def test_cards_are_found_in_every_source_folder(tmp_path):
+    root = _station_tree(tmp_path / "NHA")
+    (root / "Panoramas" / "612130000012_00012.tif").write_text("a")
+    (root / "Panoramas" / "error" / "612130000203_00012.tif").write_text("b")
+    (root / "PanoramaArchive" / "612130000456_00012.tif").write_text("c")
+    (root / "Error" / "612130000609_00024.tif").write_text("d")
+
+    found, missing = test_runde.find_panoramas(
+        ["612130000012_00012", "612130000203_00012", "612130000456_00012",
+         "612130000609_00024", "612130000999_00012"], root)
+
+    assert missing == ["612130000999_00012"], missing
+    where = {p.name: src for p, src in found}
+    assert where["612130000012_00012.tif"] == "Panoramas"
+    assert where["612130000203_00012.tif"] == "Panoramas/error"
+    assert where["612130000456_00012.tif"] == "PanoramaArchive"
+    assert where["612130000609_00024.tif"] == "Error"
+
+
+def test_the_round_copies_and_never_moves(tmp_path):
+    root = _station_tree(tmp_path / "NHA")
+    src = root / "Panoramas" / "612130000012_00012.tif"
+    src.write_text("panorama")
+    dest = tmp_path / "runde"
+
+    copied, missing = test_runde.stage_cards(["612130000012_00012"], root,
+                                             dest)
+
+    assert src.exists(), "the source must never be moved"
+    assert (dest / "612130000012_00012.tif").read_text() == "panorama"
+    assert copied == 1 and missing == []
+
+
+def test_the_whitelist_still_governs_what_leaves(tmp_path):
+    """Composed with rapport.py's, never duplicated: SAMMENLIGNING.txt is
+    the only addition."""
+    assert test_runde.is_safe_artifact("SAMMENLIGNING.txt")
+    assert test_runde.is_safe_artifact("SAMMENDRAG.txt")
+    assert test_runde.is_safe_artifact("612130000012_00012_rapport.txt")
+    assert not test_runde.is_safe_artifact("visualization.jpg")
+    assert not test_runde.is_safe_artifact("page_001.tif")
+    assert not test_runde.is_safe_artifact("612130000012_00012.tif")
+
+
+def _fake_report(folder, rows):
+    """rows: {stem: (exit, pages, grid, quality, step2, cells)}"""
+    folder.mkdir(parents=True, exist_ok=True)
+    lines = ["RAPPORT generert 2026-09-08", "Kilde: x",
+             "Kode: abc1234  |  Modus: standard", "", ]
+    for stem, (ex, pages, grid, q, step2, cells) in rows.items():
+        label = "OK      " if ex == 0 else "FRAGMENT"
+        lines.append(f"{label}  exit {ex}  {pages:3d} sider  kv {q:>5}  "
+                     f"{grid:<20}{'  TRINN2' if step2 else ''}  {stem}")
+        body = [f"  Card Quality: {q}/100  (GOOD)",
+                f"  Detected grid: {grid}"]
+        for page, fg in cells:
+            body.append(f"CELL row=1 x=100 y=100 page={page} fg={fg} "
+                        "edge=0.100")
+        if step2:
+            body.append("Step 2 threshold: trigger 0 detections")
+        (folder / f"{stem}_rapport.txt").write_text("\n".join(body) + "\n")
+    (folder / "SAMMENDRAG.txt").write_text("\n".join(lines) + "\n")
+
+
+def test_comparison_marks_every_kind_of_change(tmp_path):
+    before = tmp_path / "before"
+    after = tmp_path / "after"
+    _fake_report(before, {
+        "612130000012_00012": (0, 12, "1 row: 12", 94.0, False,
+                               [(1, 0.9), (0, 0.0)]),
+        "612130000203_00012": (0, 41, "5 rows: 5+3+12+12+9", 84.8, False,
+                               [(1, 0.2)]),
+        "612130000609_00012": (2, 0, "?", 0.0, False, []),
+    })
+    _fake_report(after, {
+        "612130000012_00012": (0, 12, "1 row: 12", 94.0, False,
+                               [(1, 0.9), (0, 0.0)]),   # unchanged
+        "612130000203_00012": (3, 0, "?", 0.0, False, []),   # now refused
+        "612130000609_00012": (0, 12, "1 row: 12", 91.0, True,
+                               [(1, 0.8)]),                  # step two saved
+    })
+
+    text = test_runde.comparison(after, before)
+
+    lines = {l.split()[1]: l for l in text.splitlines()
+             if l[:1] in "=+-!" and len(l.split()) > 1}
+    assert lines["612130000012_00012"].startswith("="), lines
+    assert lines["612130000203_00012"].startswith("!"), lines
+    assert lines["612130000609_00012"].startswith("!"), lines
+    assert "TRINN2" in lines["612130000609_00012"]
+    assert "41" in lines["612130000203_00012"], "page count change must show"
+
+
+def test_comparison_summarises_the_cell_evidence(tmp_path):
+    after = tmp_path / "after"
+    _fake_report(after, {"612130000012_00012": (0, 2, "1 row: 2", 99.0, False,
+                                                [(1, 0.90), (1, 0.80),
+                                                 (0, 0.02), (0, 0.00)])})
+    text = test_runde.comparison(after, None)
+    line = [l for l in text.splitlines() if "CELL" in l][0]
+    assert "page=1" in line and "page=0" in line, line
+    assert "0.85" in line, ("median of the occupied cells", line)
+    assert "0.01" in line, ("median of the empty cells", line)
+
+
+def test_comparison_names_a_card_that_appeared_or_vanished(tmp_path):
+    before, after = tmp_path / "b", tmp_path / "a"
+    _fake_report(before, {"612130000012_00012": (0, 12, "1 row: 12", 94.0,
+                                                 False, [])})
+    _fake_report(after, {"612130000999_00012": (0, 5, "1 row: 5", 90.0,
+                                                False, [])})
+    text = test_runde.comparison(after, before)
+    assert any(l.startswith("-") and "612130000012_00012" in l
+               for l in text.splitlines()), text
+    assert any(l.startswith("+") and "612130000999_00012" in l
+               for l in text.splitlines()), text
+
+
+def test_comparison_shows_the_staircase_per_card(tmp_path):
+    """What Trond reads first: did step two fire, and did it prove itself."""
+    after = tmp_path / "after"
+    after.mkdir()
+    (after / "SAMMENDRAG.txt").write_text(
+        "RAPPORT generert 2026-09-08\n\n"
+        "OK        exit 0   60 sider  kv  97.5  5 rows: 12+12+12+12+12"
+        "  TRINN2  612130000579_00012\n")
+    (after / "612130000579_00012_rapport.txt").write_text(
+        "  Card Quality: 97.5/100  (GOOD)\n"
+        "  Detected grid: 5 rows: 12+12+12+12+12\n"
+        "Step 2 threshold: trigger evidence guard refused the card, border "
+        "62% (over 40%), otsu 98 -> 157\n"
+        "Removed border-connected structure: 12.0% of foreground\n"
+        "Step 2 proved itself: border 62% -> 12%, 60 pages on the format "
+        "prior\n")
+
+    text = test_runde.comparison(after, None)
+    line = [l for l in text.splitlines() if "TRINN2:" in l]
+
+    assert line, text
+    assert "98" in line[0] and "157" in line[0], ("otsu before/after", line)
+    assert "62" in line[0] and "12" in line[0], ("border before/after", line)
+    assert "bevist" in line[0].lower() or "proved" in line[0].lower(), line
+
+
+def test_comparison_shows_a_failed_staircase_too(tmp_path):
+    after = tmp_path / "after"
+    after.mkdir()
+    (after / "SAMMENDRAG.txt").write_text(
+        "RAPPORT generert 2026-09-08\n\n"
+        "FEIL      exit 2    0 sider  kv     ?  ?  TRINN2  "
+        "612130000623_00024\n")
+    (after / "612130000623_00024_rapport.txt").write_text(
+        "Step 2 threshold: trigger 0 detections, border 100% (over 40%), "
+        "otsu 104 -> 190\n"
+        "ERROR: threshold found only the frame; re-threshold failed "
+        "(border 100% -> 99%, second threshold 190 found no pages either)\n")
+
+    text = test_runde.comparison(after, None)
+    line = [l for l in text.splitlines() if "TRINN2:" in l][0]
+    assert "mislyktes" in line.lower() or "failed" in line.lower(), line
+
+
+def test_the_command_wrapper_uses_absolute_paths():
+    """Finder and launchd give no usable PATH - the same lesson as
+    RAPPORT.command."""
+    text = (REPO / "TEST-RUNDE.command").read_text()
+    assert '"$SCRIPT_DIR/.venv/bin/python"' in text, text
+    assert "test_runde.py" in text and '"$@"' in text, text
+    assert (REPO / "TEST-RUNDE.command").stat().st_mode & 0o111
+
+
+def test_the_card_list_is_readable_by_the_tool():
+    ids = test_runde.read_card_ids(REPO / "TEST-KORT.txt")
+    assert len(ids) >= 20, ids
+    assert all(re.fullmatch(r"\d{12}_\d+", i) for i in ids), ids
+
+
+def test_a_whole_round_runs_end_to_end(tmp_path, monkeypatch):
+    """The tool's actual job: from a card list to two report folders and a
+    comparison, with the sources untouched."""
+    root = _station_tree(tmp_path / "NHA")
+    make_card(root / "Panoramas" / "612130000012_00012.jpg")
+    make_card(root / "PanoramaArchive" / "612130000456_00012.jpg")
+    before = root / "Panoramas" / "612130000012_00012.jpg"
+    before_bytes = before.read_bytes()
+
+    cards = tmp_path / "TEST-KORT.txt"
+    cards.write_text("612130000012_00012\n612130000456_00012\n"
+                     "612130000999_00012\n")     # one that does not exist
+    monkeypatch.setattr(test_runde, "session_root", lambda: root)
+    monkeypatch.setattr(test_runde, "USB_REPORT_DIR",
+                        tmp_path / "nope" / "Rapport")
+
+    folder = test_runde.run_round(cards, parent=tmp_path, open_finder=False)
+
+    assert before.read_bytes() == before_bytes, "a source was touched"
+    assert (folder / "rapport-standard" / "SAMMENDRAG.txt").exists()
+    assert (folder / "rapport-bakgrunn" / "SAMMENDRAG.txt").exists()
+    text = (folder / "SAMMENLIGNING.txt").read_text()
+    assert "612130000012_00012" in text and "612130000456_00012" in text
+    assert "ingen tidligere runde" in text
+    for f in (folder / "rapport-standard").iterdir():
+        assert test_runde.is_safe_artifact(f.name), f.name
+
+
+def test_a_second_round_compares_against_the_first(tmp_path, monkeypatch):
+    root = _station_tree(tmp_path / "NHA")
+    make_card(root / "Panoramas" / "612130000012_00012.jpg")
+    cards = tmp_path / "TEST-KORT.txt"
+    cards.write_text("612130000012_00012\n")
+    monkeypatch.setattr(test_runde, "session_root", lambda: root)
+    monkeypatch.setattr(test_runde, "USB_REPORT_DIR",
+                        tmp_path / "nope" / "Rapport")
+
+    first = test_runde.run_round(cards, parent=tmp_path, open_finder=False)
+    second = test_runde.run_round(cards, parent=tmp_path, open_finder=False)
+
+    assert first != second
+    text = (second / "SAMMENLIGNING.txt").read_text()
+    assert str(first / "rapport-standard") in text, text
+    assert any(l.startswith("= 612130000012_00012")
+               for l in text.splitlines()), ("same card, same code, must "
+                                             "read unchanged", text)

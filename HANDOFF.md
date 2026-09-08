@@ -531,10 +531,16 @@ Do not assume any of this works. None of it has been exercised.
 - **Zero-page failure in production.** Verified with a synthetic specks-only
   card, never on a real bad scan. Note the failure path *moves the operator's
   source file* — that behaviour has only ever run against throwaway inputs.
-- **The `error/` folder location.** We write to `<input dir>/error/`, i.e.
-  `Panoramas/error/`. There is also a separate `NHA/Error/` used by other stages,
-  and C13's archive sits beside the input rather than inside it. None of these
-  three agree and nobody has reconciled them.
+- ~~**The `error/` folder location.**~~ **RESOLVED 2026-09-08** (coordinator).
+  It was never a disagreement — they are two stages:
+  - `NHA/Error/` (capital E) is the **stitch runner's** folder for failed
+    TILE SETS, one folder per set with a `REASON.txt`. The app's `errorDir`
+    points there.
+  - `Panoramas/error/` (lowercase) is the **segmenter's** folder for failed
+    PANORAMAS (C9, C13).
+  A panorama therefore never lands in `NHA/Error/`. `test_runde.py` searches
+  it anyway when locating a card — it costs nothing and makes the layout
+  visible rather than reporting a card as missing.
 - ~~**Output root.**~~ Confirmed 2026-08-22: `segmenterWatchRoot` is
   `/Users/m4-studio/NHA/Microfiche` in `~/.ocr-pipeline-config.json`. It was
   first chosen by inference as the NB02 equivalent, before that config file
