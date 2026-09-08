@@ -5406,3 +5406,102 @@ def test_a_half_empty_raster_is_flagged_in_the_notes():
     assert len(boxes) == 5, boxes
     warning = [n for n in notes if "WARNING" in n]
     assert warning and "5" in warning[0] and "12" in warning[0], notes
+
+
+# --- Steg 8C-2 (2026-09-08): the cell prior as step three -----------------
+
+def _splintered_card(path):
+    """609_00024's shape: the whole raster is there and the content is
+    there, but the pages are broken into pieces, so the card ships 81
+    fragments in impossible rows and exits 3."""
+    pw, ph, pitch = 2030, 2780, 2180
+    h, w = 5200, 400 + 3 * pitch
+    a = np.full((h, w), 226, np.uint8)
+    a[:150, :] = 2; a[-150:, :] = 2; a[:, :150] = 2; a[:, -150:] = 2
+    a[600:820, :] = 55                       # stripe above row 1
+    a[3900:4120, :] = 55                     # ...and below it
+    for c in range(3):
+        x = 300 + c * pitch
+        for band in range(6):                # the page, in six slices with
+            y = 900 + band * 460             # gaps the chain cannot link
+            a[y:y + 380, x:x + pw] = 60
+    pyvips.Image.new_from_memory(a.tobytes(), w, h, 1,
+                                 'uchar').write_to_file(str(path))
+
+
+def test_step_three_lays_out_the_card_cell_by_cell(tmp_path):
+    src = tmp_path / "612130000012_00012.jpg"
+    _splintered_card(src)
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--no-archive", "--skip-extraction")
+    out = proc.stdout + proc.stderr
+
+    if "Step 3" in out:
+        assert "cell page at" in out, out
+        assert re.search(r"Step 3: .* raster", out), out
+
+
+def test_step_three_leaves_a_healthy_card_alone(tmp_path):
+    src = tmp_path / "612130000012_00012.jpg"
+    make_card(src)
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--no-archive", "--skip-extraction")
+    assert "Step 3" not in proc.stdout + proc.stderr
+
+
+def test_a_complete_raster_is_recognised_structurally():
+    """No string matching on a human sentence: a MISSING marker is a
+    zero-length run, and that is what the check reads."""
+    runs = [(2630 + k * 3455, 2880 + k * 3455) for k in range(6)]
+    runs += [(20690, 21510)]
+    structure, rejected = classify_structure_runs(
+        runs, [1.0] * len(runs), CARD_H, CARD_MIN_PAGE_H, CARD_HEADER)
+    assert not [r for r, _t in rejected if r[0] == r[1]], rejected
+
+    gappy = [r for i, r in enumerate(runs) if i != 3]
+    structure2, rejected2 = classify_structure_runs(
+        gappy, [1.0] * len(gappy), CARD_H, CARD_MIN_PAGE_H, CARD_HEADER)
+    assert [r for r, _t in rejected2 if r[0] == r[1]], rejected2
+
+
+def test_step_three_refuses_a_raster_it_had_to_guess():
+    """A card whose detections are fused has no neighbour distances, so the
+    pitch falls back to a guess - and a raster built on a guess is card
+    203's error in new clothes. The tests found this: step three was
+    rescuing a fused-row card by laying out cells on an invented grid."""
+    fused = [(2010, 3300, 4 * 2030, 2780)]
+    measured = []
+    card_cells(fused, 2030, 2780, 29071, pitch_measured_out=measured)
+    assert measured == [False], measured
+
+    real = [(2010 + k * 2180, 3300, 2030, 2780) for k in range(4)]
+    measured = []
+    card_cells(real, 2030, 2780, 29071, pitch_measured_out=measured)
+    assert measured == [True], measured
+
+
+def test_step_three_declines_rather_than_ship_a_card_with_pages_missing(
+        tmp_path):
+    """The suite caught this: on a card with a fused top row, step three
+    placed 8 of 12 cells - the fused row's four cells have no internal edges
+    and failed the floor - and the card SHIPPED with four pages gone. A loud
+    failure had become a quiet incomplete card. A cell where detection found
+    something must be placed, or step three declines."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.zeros((1500, 2000), 'uint8')
+    for r in range(3):
+        for c in range(4):
+            y, x = 200 + r * 420, 60 + c * 480
+            a[y:y + 340, x:x + 400] = 255
+    a[200:540, 60:60 + 3 * 480 + 400] = 255      # row 1 fused
+    pyvips.Image.new_from_memory(a.tobytes(), 2000, 1500, 1,
+                                 'uchar').write_to_file(str(src))
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction", "--no-archive")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 3, (proc.returncode, out)
+    assert "Step 3 declined" in out, out
+    assert "impossible geometry" in out, out

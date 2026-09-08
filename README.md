@@ -574,6 +574,41 @@ It runs inside `repair_and_snap`, so a report replays through it, and
 pages against pages. Every dropped detection is logged with its size and
 position; nothing is dropped silently.
 
+### C25. Step three: the card laid out cell by cell
+
+The last step of the staircase (C9), and the narrowest. It runs **only**
+when all of these hold:
+
+- the card **fails** on fragments or over-repair — a card that passes is
+  never touched;
+- the **stripe raster is complete** — no MISSING position, so we know where
+  every row is (checked structurally: a MISSING marker is a zero-length
+  run, never a word in a sentence);
+- the **cell pitch was measured** from real neighbour distances, not
+  defaulted. A raster built on a guessed pitch is card 203's error in new
+  clothes, and the suite caught step three doing exactly that on a card
+  whose detections were fused.
+
+Then every cell of the raster is measured on the **graytone** and one that
+clears the floor (C22) becomes a full page. The detections are **discarded,
+not patched**: card 609_00024 had all its content but in 101 splinters, and
+all 60 of its cells clear the floor.
+
+**It declines rather than ship a card with pages missing.** A cell where
+detection *did* find something must be placed; if the evidence cannot
+confirm it, step three stands down and the card keeps its own failure. The
+suite found this too: on a card with a fused top row, step three placed 8 of
+12 cells — the fused row has no internal edges and failed the floor — and
+the card shipped with four pages gone. A loud failure had become a quiet
+incomplete card, which is the worst trade in this codebase.
+
+Afterwards the whole chain runs again on the placed pages, so the card must
+pass every guard on its own. Cell pages count as detections in the evidence
+guard (C19) — they *are* evidence, measured on the graytone against a floor
+calibrated on 61 known-empty cells, which is stronger than a blob that
+survived a threshold. Every cell is logged with its numbers, placed or not,
+because the cells that fail are the population the calibration lacks.
+
 ### C21. The staircase: one diagnosed second threshold
 
 C9 allows re-thresholding only as step two, after a measured trigger. This

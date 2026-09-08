@@ -664,7 +664,8 @@ def clear_border_connected(binary_img):
 
 def detect_page_boxes(binary_img, header_skip_px, min_w, min_h,
                       collect_witnesses=False, structure_rows_out=None,
-                      report_scale=1.0, border_share_out=None):
+                      report_scale=1.0, border_share_out=None,
+                      raster_complete_out=None):
     """The detect-scale pipeline: mask header, remove card structure, erode,
     drop border-connected foreground, find and size-filter contours.
 
@@ -688,6 +689,11 @@ def detect_page_boxes(binary_img, header_skip_px, min_w, min_h,
         structure_rows_out.extend(structure_runs)
     # Thickness and coverage for the stripes we kept AND the reason for every
     # run we refused: the next A/B calibrates the thresholds against these.
+    if raster_complete_out is not None:
+        # A MISSING stripe is recorded as a zero-length run, so the check is
+        # structural - never a search for a word in a human sentence.
+        raster_complete_out.append(
+            not any(r[0] == r[1] for r, _t in structure_notes))
     for _run, text in structure_notes:
         log_lines.append("  " + text)
     if removed_rows:
@@ -1915,7 +1921,7 @@ def validate_manual_boxes(boxes, image_w, image_h, warn=False):
 
 
 def card_cells(boxes, page_w, page_h, image_w, margin_cells=0,
-               omitted_out=None):
+               omitted_out=None, pitch_measured_out=None):
     """Every cell of the card's raster: the ones a page occupies AND the
     empty ones beside them (steg 8A).
 
@@ -1945,6 +1951,11 @@ def card_cells(boxes, page_w, page_h, image_w, margin_cells=0,
         diffs += [b - a for a, b in zip(xs, xs[1:])
                   if page_w <= b - a <= page_w * 1.45]
     pitch = float(np.median(diffs)) if diffs else page_w * 1.05
+    if pitch_measured_out is not None:
+        # Without neighbour distances the pitch is a GUESS, and a raster
+        # built on a guess is exactly card 203's error. Step three refuses
+        # to lay out cells on one (steg 8C-2).
+        pitch_measured_out.append(bool(diffs))
 
     # The raster every row is measured against is the CARD's, not its own
     # (steg 10D): a short bottom row is where the known-empty control cells
@@ -2586,7 +2597,7 @@ def finish_card(boxes_fullres, input_file, input_path, out_dir,
 
 
 def main(otsu_override=None, step2=False, step1_border=None,
-         step1_reasons=()):
+         step1_reasons=(), step3=False):
     parser = argparse.ArgumentParser(description='Segment microfiche pages')
     # Not argparse-required: a missing input must exit 1 (generic failure),
     # while argparse errors exit 2 and would collide with EXIT_NO_PAGES.
@@ -2910,13 +2921,16 @@ def main(otsu_override=None, step2=False, step1_border=None,
     print(f"Detecting pages (erosion kernel={DETECT_ERODE_KERNEL})...")
     structure_rows = []   # detect-scale y-runs of the deleted stripes
     border_share_out = []
+    raster_complete_out = []
     boxes, filtered_contours, binary_img, det_log, small_witnesses = \
         detect_page_boxes(binary_img, header_skip_px_small, min_w, min_h,
                           collect_witnesses=True,
                           structure_rows_out=structure_rows,
                           report_scale=1 / detect_scale,
-                          border_share_out=border_share_out)
+                          border_share_out=border_share_out,
+                          raster_complete_out=raster_complete_out)
     border_share = border_share_out[0] if border_share_out else 0.0
+    raster_complete = bool(raster_complete_out and raster_complete_out[0])
     for line in det_log:
         print(line)
     # The stripes are the row boundaries (steg 2): full-res in the report so
@@ -3251,6 +3265,77 @@ def main(otsu_override=None, step2=False, step1_border=None,
                         step1_reasons=tuple(chain.card_refusals))
     if chain.quality is not None:
         quality = chain.quality
+
+    # Step three (C25): the card fails on fragments or over-repair, but the
+    # RASTER is complete - we know where every cell is. Then the pages are
+    # laid out cell by cell from the graytone evidence, and the detections
+    # are discarded rather than patched: card 609_00024 had all its content
+    # but in 101 splinters, and every one of its 60 cells clears the floor.
+    if (not step3 and (fragment_groups or snap_refused or refused_groups
+                       or geo_overload) and raster_complete
+            and not args.manual_boxes):
+        cell_pw, cell_ph, _ = resolve_page_size(boxes_fullres)
+        pitch_measured = []
+        cells = card_cells(boxes_fullres, cell_pw, cell_ph, original_width,
+                           pitch_measured_out=pitch_measured)
+        evidence = []
+        for cell in cells:
+            local = illumination_local_threshold(
+                otsu_thresh, illum_field, illum_norm,
+                (cell["x"], cell["y"], cell_pw, cell_ph),
+                original_width, original_height)
+            evidence.append(cell_evidence(gray_small, cell, cell_pw, cell_ph,
+                                          detect_scale, local,
+                                          dark_pages=do_invert))
+        if not (pitch_measured and pitch_measured[0]):
+            print("\nStep 3 not attempted: the cell pitch could not be "
+                  "measured from the detections, so the raster would be a "
+                  "guess", file=sys.stderr)
+            cells, evidence = [], []
+        placed, cell_notes = pages_from_cells(cells, evidence, cell_pw,
+                                              cell_ph)
+        # A cell where detection DID find something must be placed. If the
+        # evidence cannot confirm it, step three would be shipping a card
+        # with pages missing where the detections said there were some -
+        # trading a loud failure for a quiet incomplete card, which is the
+        # worst trade there is. Cells with no detection and no evidence are
+        # legitimately empty and are not required (steg 8C-2, found by the
+        # suite: a fused row lost four pages this way).
+        wanted = {(c["x"], c["y"]) for c in cells if c["page"]}
+        got = {(b[0], b[1]) for b in placed}
+        lost = sorted(wanted - got)
+        if lost:
+            print(f"\nStep 3 declined: {len(lost)} cell(s) hold a detection "
+                  "but no evidence that clears the floor - the card keeps "
+                  "its own failure rather than shipping without them:",
+                  file=sys.stderr)
+            for x, y in lost:
+                print(f"  cell ({x}, {y})", file=sys.stderr)
+            placed = []
+        if cells:
+            print(f"\nStep 3: the card fails but its raster is complete - "
+                  f"laying out {len(cells)} cells from the graytone")
+        for note in cell_notes:
+            print(f"  {note}")
+        if placed:
+            chain = repair_and_snap(placed, (), stripes_fullres,
+                                    original_width, original_height,
+                                    header_px=int(original_height
+                                                  * args.header_skip))
+            for stream, text in chain.output:
+                print(text, file=sys.stdout if stream == 1 else sys.stderr)
+            boxes_fullres = chain.boxes
+            geo_indices = chain.repaired
+            repaired_count = len(geo_indices)
+            fragment_groups = chain.fragment_groups
+            fragment_indices = {i for g in fragment_groups for i in g}
+            refused_groups = chain.refused_groups
+            snap_refused = chain.snap_refused
+            geo_overload = chain.geo_overload
+            card_refusals = chain.card_refusals
+            quality = (chain.quality if chain.quality is not None
+                       else compute_card_quality(boxes_fullres, None))
+            step3 = True
 
     # Step two must prove itself (C9): the border share has to at least
     # halve against the first pass, and the page size must come from the
