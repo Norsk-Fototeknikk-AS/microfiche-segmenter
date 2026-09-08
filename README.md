@@ -495,6 +495,14 @@ overlap almost completely. So this contract measures and logs; it decides
 nothing. The calibration comes from the field, where the empty cells of
 short rows are the control that analysis never had.
 
+**The empty cells must be empty CELLS, not the card margin** (steg 9F). The
+first version enumerated on to the image edge, and healthy card
+612130000531_00012 then reported its five `page=0` cells at x = 50–255 —
+left of its first page at 2200, in the jacket and frame, where foreground
+measures 0.39–0.48 and means nothing. Only the raster a row itself spans is
+enumerated now; a cell the row *skips over* is the control we want. Extra
+cells are opt-in (`margin_cells`), and the count left out is logged.
+
 Nothing may act on these numbers until they have been calibrated against a
 production run. Building a prior on an uncalibrated floor would be card
 203's mistake with a better explanation.

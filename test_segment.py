@@ -4086,13 +4086,16 @@ from segment_microfiche import card_cells
 
 
 def test_card_cells_covers_the_empty_positions_too():
-    """A row of 3 pages on a card 5 cells wide: the two empty cells are the
-    control the 203 analysis never had."""
-    boxes = [(2010 + k * 2180, 3300, 2040, 2780) for k in range(3)]
-    cells = card_cells(boxes, 2040, 2780, image_w=2010 + 5 * 2180)
+    """A row that skips two positions: those gaps are the control the 203
+    analysis never had. (Cells beyond the row's own span are margin, not
+    control - see steg 9F.)"""
+    boxes = ([(2010 + k * 2180, 3300, 2040, 2780) for k in range(2)]
+             + [(2010 + k * 2180, 3300, 2040, 2780) for k in range(4, 6)])
+    cells = card_cells(boxes, 2040, 2780, image_w=29071)
 
-    assert len(cells) == 5, cells
-    assert sum(1 for c in cells if c["page"]) == 3, cells
+    assert len(cells) == 6, cells
+    assert sum(1 for c in cells if c["page"]) == 4, cells
+    assert sum(1 for c in cells if not c["page"]) == 2, cells
     xs = [c["x"] for c in cells]
     assert xs == sorted(xs) and xs[0] == 2010
     assert all(abs((b - a) - 2180) <= 2 for a, b in zip(xs, xs[1:])), xs
@@ -4121,7 +4124,9 @@ def test_the_report_measures_every_cell(tmp_path):
     off the report folders."""
     src = tmp_path / "612130000012_00012.jpg"
     a = np.full((3000, 6400), 180, 'uint8')
-    for c in range(8):                      # 8 pages, room for more cells
+    for c in range(10):                     # a real GAP at columns 4 and 5,
+        if c in (4, 5):                     # not margin cells (steg 9F)
+            continue
         x = 100 + c * 520
         a[350:1050, x:x + 400] = 110
     pyvips.Image.new_from_memory(a.tobytes(), 6400, 3000, 1,
@@ -4129,7 +4134,7 @@ def test_the_report_measures_every_cell(tmp_path):
 
     proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
                          "--skip-extraction")
-    lines = [l for l in proc.stdout.splitlines() if l.startswith("CELL ")]
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("CELL row=")]
 
     assert len(lines) >= 8, proc.stdout
     for line in lines:
@@ -4139,7 +4144,7 @@ def test_the_report_measures_every_cell(tmp_path):
     occupied = [l for l in lines if " page=1 " in l]
     empty = [l for l in lines if " page=0 " in l]
     assert len(occupied) == 8, occupied
-    assert empty, "a card with room to spare must report its empty cells"
+    assert len(empty) == 2, ("the gap inside the row is the control", empty)
 
 
 def test_an_empty_cell_measures_lower_than_a_page(tmp_path):
@@ -4147,7 +4152,9 @@ def test_an_empty_cell_measures_lower_than_a_page(tmp_path):
     could not."""
     src = tmp_path / "612130000012_00012.jpg"
     a = np.full((3000, 6400), 180, 'uint8')
-    for c in range(8):
+    for c in range(10):
+        if c in (4, 5):                     # a real gap, not the margin
+            continue
         x = 100 + c * 520
         a[350:1050, x:x + 400] = 110
     pyvips.Image.new_from_memory(a.tobytes(), 6400, 3000, 1,
@@ -4825,3 +4832,44 @@ def test_step_two_never_trades_a_real_diagnosis_for_its_own_excuse(tmp_path):
 
     assert proc.returncode == 3, (proc.returncode, out)
     assert "6 rows detected" in out, out
+
+
+# --- Steg 9F (2026-09-08): the empty-cell control must be empty CELLS -----
+# Card 612130000531_00012 is healthy (60 pages, 5x12, quality 99.3, never
+# step two) and its five page=0 cells sat at x = 50, 195, 210, 250, 255 -
+# left of the first page at x ~2200. They are the card MARGIN, where jacket
+# and frame naturally measure 0.39-0.48 foreground. The control population
+# 8B is meant to calibrate against was measuring the wrong thing.
+
+def test_cells_do_not_run_out_into_the_margin():
+    """531's shape: a full row starting well inside the card."""
+    row = [(2200 + k * 2130, 3523, 2030, 2780) for k in range(12)]
+    cells = card_cells(row, 2030, 2780, image_w=29071)
+    assert len(cells) == 12, cells
+    assert all(c["page"] == 1 for c in cells), cells
+    assert min(c["x"] for c in cells) == 2200, cells
+
+
+def test_a_gap_inside_the_row_is_still_an_empty_cell():
+    """The control we DO want: a cell the row skipped over."""
+    row = ([(2200 + k * 2130, 3523, 2030, 2780) for k in range(3)]
+           + [(2200 + k * 2130, 3523, 2030, 2780) for k in range(6, 9)])
+    cells = card_cells(row, 2030, 2780, image_w=29071)
+    assert len(cells) == 9, cells
+    assert sum(1 for c in cells if c["page"] == 0) == 3, cells
+
+
+def test_margin_cells_are_opt_in_and_counted():
+    row = [(2200 + k * 2130, 3523, 2030, 2780) for k in range(12)]
+    omitted = []
+    plain = card_cells(row, 2030, 2780, image_w=29071, omitted_out=omitted)
+    assert len(plain) == 12 and omitted and omitted[0] > 0, (plain, omitted)
+
+    # A margin cell that would fall off the image is still omitted: on this
+    # geometry only the left one fits.
+    wide = card_cells(row, 2030, 2780, image_w=29071, margin_cells=1)
+    assert len(wide) == 13, wide
+    assert sum(1 for c in wide if c["page"] == 0) == 1, wide
+    roomy = card_cells(row, 2030, 2780, image_w=40000, margin_cells=1)
+    assert len(roomy) == 14 and sum(1 for c in roomy
+                                    if c["page"] == 0) == 2, roomy

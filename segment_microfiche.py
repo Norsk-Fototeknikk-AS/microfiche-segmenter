@@ -1837,7 +1837,8 @@ def header_zone_detections(boxes, page_w, page_h, header_px):
     return dropped, note
 
 
-def card_cells(boxes, page_w, page_h, image_w):
+def card_cells(boxes, page_w, page_h, image_w, margin_cells=0,
+               omitted_out=None):
     """Every cell of the card's raster: the ones a page occupies AND the
     empty ones beside them (steg 8A).
 
@@ -1850,6 +1851,13 @@ def card_cells(boxes, page_w, page_h, image_w):
 
     Phase is per ROW: real cards are rows-only and rows are not vertically
     aligned (Trond, 2026-09-04). Pitch is card-wide - one physical raster.
+
+    Only the raster the ROW ITSELF spans is enumerated (steg 9F). Running
+    on to the image edge put the control cells in the card MARGIN: healthy
+    card 612130000531_00012 reported its five page=0 cells at x = 50-255,
+    left of its first page at 2200, where jacket and frame measure 0.39-0.48
+    foreground and mean nothing. margin_cells opts extra cells in on each
+    side; omitted_out receives how many were left out.
     """
     if not boxes:
         return []
@@ -1862,21 +1870,25 @@ def card_cells(boxes, page_w, page_h, image_w):
     pitch = float(np.median(diffs)) if diffs else page_w * 1.05
 
     cells = []
+    omitted = 0
     for row in rows:
         xs = sorted(b[0] for b in row)
         y = int(np.median([b[1] for b in row]))
         taken = set(xs)
-        k0 = -int(xs[0] // pitch)
-        k = k0
-        while True:
+        span = int(round((xs[-1] - xs[0]) / pitch))
+        for k in range(-margin_cells, span + margin_cells + 1):
             x = int(round(xs[0] + k * pitch))
-            if x + page_w > image_w:
-                break
-            if x >= 0:
-                on_page = any(abs(x - px) <= pitch * 0.25 for px in taken)
-                cells.append({"row": rows.index(row) + 1, "x": x, "y": y,
-                              "page": 1 if on_page else 0})
-            k += 1
+            if x < 0 or x + page_w > image_w:
+                omitted += 1
+                continue
+            on_page = any(abs(x - px) <= pitch * 0.25 for px in taken)
+            cells.append({"row": rows.index(row) + 1, "x": x, "y": y,
+                          "page": 1 if on_page else 0})
+        # Cells the row does not span are margin, not evidence.
+        omitted += max(0, int((image_w - page_w - xs[0]) // pitch) - span)
+        omitted += int(xs[0] // pitch)
+    if omitted_out is not None:
+        omitted_out.append(omitted)
     return cells
 
 
@@ -2961,8 +2973,9 @@ def main(otsu_override=None, step2=False, step1_border=None,
     # down with it otherwise.
     try:
         cell_pw, cell_ph, _ = resolve_page_size(boxes_fullres)
+        omitted_cells = []
         for cell in card_cells(boxes_fullres, cell_pw, cell_ph,
-                               original_width):
+                               original_width, omitted_out=omitted_cells):
             local = illumination_local_threshold(
                 otsu_thresh, illum_field, illum_norm,
                 (cell["x"], cell["y"], cell_pw, cell_ph),
@@ -2972,6 +2985,10 @@ def main(otsu_override=None, step2=False, step1_border=None,
                                      dark_pages=do_invert)
             print(f"CELL row={cell['row']} x={cell['x']} y={cell['y']} "
                   f"page={cell['page']} fg={fg:.3f} edge={edge:.3f}")
+        if omitted_cells:
+            print(f"Cell margin: {omitted_cells[0]} cell(s) omitted "
+                  "outside the raster the rows span - card margin, not "
+                  "evidence (steg 9F)")
     except Exception as exc:                       # measurement only - never
         print(f"CELL measurement failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)                     # ...a reason to fail
