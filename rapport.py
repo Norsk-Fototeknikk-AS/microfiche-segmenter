@@ -75,14 +75,15 @@ def find_panoramas(folder):
                   if p.is_file() and p.suffix.lower() in PANORAMA_SUFFIXES)
 
 
-def inspect_panorama(panorama, workdir):
+def inspect_panorama(panorama, workdir, extra_args=()):
     """One inspection run. Never touches the source (--skip-extraction) and
     writes only to workdir, which stays outside the report folder because it
-    holds the NON-anonymized visualization."""
+    holds the NON-anonymized visualization. extra_args flow to the
+    segmenter - the A/B path for flagged modes like --background-first."""
     proc = subprocess.run(
         [sys.executable, str(SEGMENTER),
          "-i", str(panorama), "-O", str(workdir),
-         "--skip-extraction", "--anon-viz"],
+         "--skip-extraction", "--anon-viz", *extra_args],
         capture_output=True, text=True, cwd=str(REPO))
     return proc.returncode, proc.stdout + proc.stderr
 
@@ -114,7 +115,7 @@ def unique_dir(base):
     return candidate
 
 
-def run_report(source_folder, report_dir, open_finder=True):
+def run_report(source_folder, report_dir, open_finder=True, extra_args=()):
     source_folder = Path(source_folder)
     panoramas = find_panoramas(source_folder)
     if not panoramas:
@@ -132,7 +133,8 @@ def run_report(source_folder, report_dir, open_finder=True):
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp) / stem
             try:
-                exit_code, output = inspect_panorama(panorama, workdir)
+                exit_code, output = inspect_panorama(panorama, workdir,
+                                                     extra_args)
             except Exception as exc:  # a crash must land in SAMMENDRAG, loudly
                 exit_code, output = -1, f"KLARTE IKKE AA KJOERE: {exc!r}"
             (report_dir / f"{stem}_rapport.txt").write_text(output)
@@ -172,13 +174,15 @@ def run_report(source_folder, report_dir, open_finder=True):
 
 
 def main(argv):
-    if len(argv) < 1:
+    extra = [a for a in argv if a.startswith("--")]
+    positional = [a for a in argv if not a.startswith("--")]
+    if not positional:
         raise SystemExit("Bruk: rapport.py <mappe-med-panoramaer> "
-                         "[rapportmappe]")
+                         "[rapportmappe] [--background-first ...]")
     default_report = (Path.home() / "Desktop"
                       / f"RAPPORT-{date.today().isoformat()}")
-    report = Path(argv[1]) if len(argv) > 1 else default_report
-    run_report(argv[0], report)
+    report = Path(positional[1]) if len(positional) > 1 else default_report
+    run_report(positional[0], report, extra_args=extra)
 
 
 if __name__ == "__main__":

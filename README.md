@@ -332,9 +332,48 @@ box: the blob gives position, `PAGE_SIZE_PRIOR` (2050×2780, measured across
   toward the over-repair limit — normalizing to the known size is normal
   operation; content verification is the planned occupancy check.
 
-Field regression (both 2026-09-08 reports, 29 cards) is a committed test:
+### C16. Coverage guard — uncovered foreground caps the score
+
+Field card 612130000036 scored **100.0** with its entire first page row
+outside every box (see C17's row-building history). Now the share of
+foreground mass outside all page boxes is measured on every run, in every
+mode: above `COVERAGE_WARN_SHARE` (15 %) it prints a loud warning, caps the
+quality score at `100 × (1 − share)`, and puts `COVERAGE: …` in both
+visualization banners. It is the one signal that survives any upstream
+mistake — never remove it to "clean up" the banner.
+
+### C17. Background-first binarization (`--background-first`, flagged)
+
+Trond's Photoshop principle: the jacket is the only *stable* class — content
+varies wildly (faded, washed, half-dark) — so select the background and take
+the complement. Foreground = |pixel − local jacket level| beyond
+`BG_BAND_RATIO` (0.22) of the level, in **either** direction; the level is
+the per-card p90 illumination field. Split/refine use the same rule via
+local scalars. Polarity does not exist in this mode.
+
+Mechanism choice (over direct blank-card diffing): jackets vary physically
+card to card (brown/gray stripes), so a per-card statistical band is the
+production mechanism and the **blank fasit card is the calibration**: its
+jacket, texture and all, stays within ~0.25 of the local level; real content
+sits at 0.35+; the faded-page fasit (28 % darker than jacket, invisible to
+the global Otsu) is caught from 0.18 up. Hence 0.22.
+
+Known limitations, why it stays FLAGGED until A/B-validated in production
+(`RAPPORT.command` passes `--background-first` through to the segmenter):
+it assumes the light-jacket journal type (on a Yamaha-type card the p90
+field IS the pages), and the anonymized tape on the test fasit sits too
+close to jacket level to detect — the tape was never representative of real
+pages.
+
+Field regression (all 2026-09-08 reports, 45 cards) is a committed test:
 no refusals on passing cards, quality up across the board, worst card
 612130000135 from 20.5 to 73.8.
+
+Position witnesses (C15 addendum): sub-min-size blobs never build rows and
+never vote on phase/pitch/edges, but one with real mass (≥ 0.5 % of a page —
+a 20×10 speck of dirt once claimed a phantom cell on the real fasit) inside
+an otherwise empty cell of an existing row claims a full page there (field
+card 612130000098 lost half a row to the min-size filter).
 
 The signature (`find_fragment_groups`): detections sharing an x-span
 (interval IoU ≥ 0.8) with vertical gaps ≤ 15 % of the expected page height

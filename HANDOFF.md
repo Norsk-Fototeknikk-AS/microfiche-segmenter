@@ -420,9 +420,34 @@ phase median. A member may reach into the inter-page GAP (dirty seams put
 split cuts mid-gap) but never into the neighbour page. Field regression
 over both reports is a skipif-guarded committed test.
 
+### Background-first round (2026-09-09): root causes and five components
+
+Root causes from RAPPORT-2026-09-08-5, identified as ordered (not just
+made to disappear):
+- 036 = ROW-BANDING COLLAPSE in snap_pages, NOT the header skip: the washed
+  first row's detections had low tops, so row 2 fell inside the page-height
+  span band -> one band, every cell y-anchored on row 2, a whole page row
+  uncovered - at quality 100.0. Fixed by transitive y-OVERLAP row
+  clustering + bottom-anchoring for anchor-less rows + the C16 coverage
+  guard (which alone would have exposed it).
+- 111 = the same banding built a phantom second row from bottom fragments;
+  overlap clustering folds them into their own row's cells.
+- 098 = half a row of small rests died in the min-size filter before the
+  snap could see them -> position witnesses (C15 addendum, with the
+  0.5%-of-a-page mass floor measured against a real 20x10 dirt speck that
+  claimed a phantom cell).
+- 135's faded pages = clearly visible contrast, below the one-sided global
+  threshold -> C17 background-first (flagged; validated against the blank
+  fasit, a synthetic faded card and pasted-page substrates; A/B in
+  production via RAPPORT.command --background-first).
+Also: the over-repair limit now counts only SUBSTANTIAL repairs (>=3%
+invented, minimum 3 of them) - split-then-remerge churn at 0% invented is
+bookkeeping, and a single repair on a two-page card is not "most of the
+card".
+
 ### Tests
 
-154 tests, ~19 s (was 32 when this was written). Unit tests for box
+172 tests, ~19 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 

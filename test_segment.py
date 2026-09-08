@@ -267,6 +267,7 @@ def test_too_many_rows_warns(tmp_path):
 # A small generated card exercises the real CLI in a second or two, so the
 # folder-lifecycle contract is covered without the gigapixel scan.
 
+import shutil
 import subprocess
 import sys
 
@@ -2303,13 +2304,15 @@ def test_snap_splits_a_multi_member_fused_slot_on_the_pitch():
 
 def test_snap_single_strip_row_uses_pitch_from_other_rows():
     """A row holding only ONE narrow strip: phase comes from itself, pitch
-    from the healthy rows, and the strip still becomes a full page."""
+    from the healthy rows, and the strip still becomes a full page -
+    BOTTOM-anchored, because an anchor-less row has washed tops by
+    definition (the 036 rule)."""
     boxes = [(2010 + i * 2180, 6710, 2040, 2790) for i in range(4)]
     boxes.append((4190, 10500, 700, 2100))
     snapped, flags, notes, refused = snap_pages(boxes, 2050, 2780)
     assert refused == []
     strip_page = [b for b in snapped if b[1] >= 9000]
-    assert strip_page == [(4190, 10500, 2050, 2780)], snapped
+    assert strip_page == [(4190, 12600 - 2780, 2050, 2780)], snapped
 
 
 def test_snap_first_and_last_strip_of_a_row_get_full_pages():
@@ -2389,7 +2392,8 @@ def test_snap_regression_against_both_field_reports():
     uniform page sizes, and the quality never drops. Card 612130000135
     (strips, quality 20.5 in -4) must come up measurably."""
     checked = 0
-    for report in ("RAPPORT-2026-09-08-3", "RAPPORT-2026-09-08-4"):
+    for report in ("RAPPORT-2026-09-08-3", "RAPPORT-2026-09-08-4",
+                   "RAPPORT-2026-09-08-5"):
         for stem, boxes, was_ok, q_before in _field_cards(report):
             pw, ph, note = resolve_page_size(boxes)
             assert note is None, (report, stem, "production card off-prior?")
@@ -2407,4 +2411,341 @@ def test_snap_regression_against_both_field_reports():
             if stem == "612130000135_00012" and report.endswith("-4"):
                 assert q_after > 50, (q_before, q_after)
             checked += 1
-    assert checked >= 26, checked
+    assert checked >= 42, checked
+
+
+# --- Coverage guard (mandatory, all modes) ----------------------------------
+# Field card 612130000036 scored 100.0 with its entire first page row OUTSIDE
+# every box (row-banding collapse dropped all cells onto row 2) - the worst
+# "wrong that looks normal" so far. Foreground mass outside all page boxes
+# must cap the score and warn loudly, in legacy and background-first alike.
+
+from segment_microfiche import COVERAGE_WARN_SHARE, foreground_outside_boxes
+
+
+def test_foreground_outside_boxes_measures_the_uncovered_share():
+    b = np.zeros((100, 200), np.uint8)
+    b[10:30, 10:90] = 255     # covered blob
+    b[60:80, 10:90] = 255     # uncovered blob, same mass
+    share = foreground_outside_boxes(b, [(5, 5, 100, 35)])
+    assert abs(share - 0.5) < 0.02, share
+
+
+def test_foreground_outside_boxes_is_zero_when_boxes_cover_all():
+    b = np.zeros((100, 200), np.uint8)
+    b[10:30, 10:90] = 255
+    assert foreground_outside_boxes(b, [(0, 0, 200, 100)]) == 0.0
+    assert foreground_outside_boxes(np.zeros((50, 50), np.uint8), []) == 0.0
+
+
+def test_uncovered_foreground_caps_the_quality_score(tmp_path):
+    """A card where a whole page row ends up outside the boxes must never
+    score GOOD. Forced here with --no-split and a fused undetectable row?
+    No - simplest honest reproduction: pages exist in two rows but boxes
+    only cover one (we drive main with a fixture whose second row is all
+    small rests below min size, so detection sees row 1 only while the
+    binary holds row 2's mass)."""
+    src = tmp_path / "612130000012_00016.jpg"
+    a = np.full((3000, 6400), 180, 'uint8')
+    for c in range(12):
+        a[350:1050, 100 + c * 520:500 + c * 520] = 110       # row 1: real
+    for c in range(12):
+        a[1600:2300, 100 + c * 520:500 + c * 520] = 112      # row 2: real!
+    # row 2 becomes vertical bars: wide enough to survive the detect-scale
+    # erosion (200px -> 8px left), narrow enough to fail the min-size
+    # filter - mass in the binary, but no boxes
+    a[1600:2300, :] = 180
+    for c in range(12):
+        x = 100 + c * 520
+        a[1600:2300, x + 100:x + 300] = 110
+    pyvips.Image.new_from_memory(a.tobytes(), 6400, 3000, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "outside every page box" in (proc.stdout + proc.stderr).lower(), \
+        proc.stdout
+    m = re.search(r"Card Quality: ([\d.]+)/100", proc.stdout)
+    assert float(m.group(1)) < 80, "uncovered content must cost the score"
+
+
+# --- Robust row building (root causes 036 and 111, field 2026-09-08-5) ------
+# 036: washed row-1 detections have LOW tops, so row 2 fell inside the
+# span-limited top band -> ONE band, every cell y-anchored at row 2, twelve
+# boxes with a whole page row uncovered (at quality 100). 111: bottom
+# fragments formed their own band -> two overlapping "rows" of full pages.
+# Rows are now built by transitive y-OVERLAP clustering: same-row members
+# overlap each other (fragments overlap their anchors), different rows do
+# not overlap at all.
+
+
+def test_snap_keeps_a_washed_row_separate_from_the_row_below():
+    """The 036 mechanism: row-1 detections are bottom-heavy (tops washed),
+    row-2 tops lie within one page height of row-1's first top. Two rows
+    must come out - with row 1 bottom-anchored ABOVE row 2, no overlap."""
+    row1 = [(2340 + k * 2170, 4400, 2050, 1700) for k in range(6)]  # washed
+    row2 = [(2340 + k * 2170, 6700, 2050, 2780) for k in range(4)]  # whole
+    snapped, flags, notes, refused = snap_pages(row1 + row2, 2050, 2780)
+
+    assert refused == [], notes
+    assert len(snapped) == 10, snapped
+    ys = sorted({b[1] for b in snapped})
+    assert len(ys) == 2, f"row-banding collapse: {ys}"
+    assert ys[1] - ys[0] >= 2000, f"rows overlap: {ys}"
+    assert ys[0] + 2780 <= ys[1] + 100, f"row 1 overlaps row 2: {ys}"
+
+
+def test_snap_folds_bottom_fragments_into_their_own_row():
+    """The 111 mechanism: bottom fragments (top ~half a page below the row
+    top) must join their row's cells - not form a second row of full pages
+    stacked on the first."""
+    fulls = [(2020 + k * 2180, 3295, 2040, 2780) for k in range(6)]
+    frags = [(2225 + k * 2180, 4690, 1800, 1300) for k in range(6)]
+    snapped, flags, notes, refused = snap_pages(fulls + frags, 2050, 2780)
+
+    assert refused == [], notes
+    assert len(snapped) == 6, ("fragments must merge into their pages, "
+                               "not stack a second row", snapped)
+
+
+def test_first_page_row_survives_the_header_mask(tmp_path):
+    """A card whose first row crosses the 8% header band: masking cuts the
+    detections' tops, but bottoms survive - the snap must give row 1 full
+    pages again (extraction crops from the unmasked original)."""
+    src = tmp_path / "612130000012_00016.jpg"
+    a = np.full((3000, 6400), 180, 'uint8')
+    for r in range(2):
+        for c in range(12):
+            y = 100 + r * 900          # row 1 starts INSIDE the 8% band
+            a[y:y + 700, 100 + c * 520:500 + c * 520] = 110
+    pyvips.Image.new_from_memory(a.tobytes(), 6400, 3000, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rows_csv = [l for l in (out / "page_coordinates.csv").read_text().splitlines()[2:] if l]
+    assert len(rows_csv) == 24, rows_csv
+    tops = sorted({int(l.split(",")[2]) for l in rows_csv})
+    heights = {int(l.split(",")[4]) for l in rows_csv}
+    assert min(tops) <= 250, f"first row's top was eaten: {tops}"
+    assert max(heights) >= 630, heights
+
+
+# --- Position witnesses (field card 098) ------------------------------------
+# The left half of 098's row 2 vanished: small detection rests were killed
+# by the min-size filter BEFORE the snap could see them. A small blob in an
+# empty grid cell proves the cell holds a page. Witnesses never create
+# rows (a specks-only card still exits 2) and never vote on phase, pitch
+# or row edges - they only claim cells.
+
+
+def test_detect_can_collect_sub_min_witnesses():
+    from segment_microfiche import detect_page_boxes
+    b = np.zeros((1500, 2000), np.uint8)
+    b[200:540, 60:460] = 255      # a real page
+    b[220:280, 600:660] = 255     # a small rest - fails min size
+    boxes, contours, _, _, witnesses = detect_page_boxes(
+        b, 0, 100, 100, collect_witnesses=True)
+    assert len(boxes) == 1
+    assert len(witnesses) == 1
+    wx, wy, ww, wh = witnesses[0]
+    assert 550 <= wx <= 660 and ww < 100
+
+
+def test_snap_gives_a_witnessed_empty_cell_a_page():
+    """The 098 mechanism: an anchored row with an empty cell, plus a tiny
+    rest inside that cell - the cell gets a full page, marked and logged."""
+    boxes = [(2010, 6710, 2040, 2790), (6370, 6710, 2040, 2790),
+             (8550, 6710, 2040, 2790)]
+    witnesses = [(4600, 7400, 250, 300)]   # inside the gap cell at 4190
+    snapped, flags, notes, refused = snap_pages(
+        boxes, 2050, 2780, witnesses=witnesses)
+
+    assert refused == []
+    assert len(snapped) == 4, snapped
+    witness_page = [b for b, f in zip(snapped, flags) if f]
+    assert len(witness_page) == 1, snapped
+    x, y, w, h = witness_page[0]
+    assert (x, w, h) == (4190, 2050, 2780) and abs(y - 6710) <= 30, snapped
+    assert any("witness" in n for n in notes), notes
+
+
+def test_witnesses_never_create_rows_or_pages_outside_rows():
+    boxes = [(2010, 6710, 2040, 2790), (4190, 6710, 2040, 2790)]
+    witnesses = [(3000, 12000, 200, 200)]   # far below any row
+    snapped, flags, notes, refused = snap_pages(
+        boxes, 2050, 2780, witnesses=witnesses)
+    assert len(snapped) == 2, snapped
+
+
+def test_witnesses_in_occupied_cells_change_nothing():
+    boxes = [(2010, 6710, 2040, 2790), (4190, 6710, 2040, 2790)]
+    witnesses = [(2500, 7000, 200, 200)]
+    snapped, flags, notes, refused = snap_pages(
+        boxes, 2050, 2780, witnesses=witnesses)
+    assert len(snapped) == 2 and not any(flags), (snapped, flags)
+
+
+def test_half_a_row_of_rests_becomes_pages_end_to_end(tmp_path):
+    """The 098 scenario: right half of a row detects normally, left half
+    leaves only small rests. Every cell must come out as a page."""
+    src = tmp_path / "612130000012_00016.jpg"
+    a = np.full((3000, 6400), 180, 'uint8')
+    for c in range(12):
+        x = 100 + c * 520
+        if c < 6:
+            a[350:1050, x + 100:x + 300] = 110   # rests: survive erosion,
+        else:                                     # fail min size
+            a[350:1050, x:x + 400] = 110          # whole pages
+    pyvips.Image.new_from_memory(a.tobytes(), 6400, 3000, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rows_csv = [l for l in (out / "page_coordinates.csv").read_text().splitlines()[2:] if l]
+    assert len(rows_csv) == 12, (rows_csv, proc.stdout)
+    assert "position witness" in proc.stdout, proc.stdout
+
+
+# --- Background-first binarization (--background-first, flagged) ------------
+# Trond's Photoshop principle: the jacket is the only stable class - select
+# the BACKGROUND and invert. Foreground = deviation from the local jacket
+# level in EITHER direction, so faded, washed and half-dark content all
+# count. Behind a flag until field-validated A/B against legacy on
+# m4-studio. Calibration: band ratio 0.22 of local level - the blank fasit
+# jacket (texture and all) stays within ~0.25, real content sits at 0.35+,
+# and the faded-page fasit (28% darker than jacket, INVISIBLE to the global
+# Otsu which lands below it) is caught from 0.18 up.
+
+
+def _faded_card_file(tmp_path):
+    """The 135 mechanism on the blank fasit: one clearly visible faded page
+    that the global threshold cannot see."""
+    img = pyvips.Image.new_from_file(
+        str(REPO / "testdata" / "real_card_blank_10pct.jpg")).colourspace('b-w')
+    a = np.ndarray(buffer=img.write_to_memory(), dtype=np.uint8,
+                   shape=[img.height, img.width]).astype(np.float32)
+    a[700:1000, 500:710] *= 0.72
+    src = tmp_path / "612130000012_00016.jpg"
+    pyvips.Image.new_from_memory(a.astype(np.uint8).tobytes(), img.width,
+                                 img.height, 1, 'uchar').write_to_file(str(src))
+    return src
+
+
+def test_background_first_finds_the_faded_page_legacy_misses(tmp_path):
+    src = _faded_card_file(tmp_path)
+
+    legacy = run_segmenter("-i", str(src), "-O", str(tmp_path / "card_legacy"),
+                           "--skip-extraction")
+    assert legacy.returncode == 2, ("fixture drift: legacy suddenly sees "
+                                    "the faded page", legacy.stdout)
+
+    bg = run_segmenter("-i", str(src), "-O", str(tmp_path / "card_bg"),
+                       "--skip-extraction", "--background-first")
+    assert bg.returncode == 0, bg.stdout + bg.stderr
+    rows_csv = [l for l in (tmp_path / "card_bg" / "page_coordinates.csv")
+                .read_text().splitlines()[2:] if l]
+    assert len(rows_csv) >= 1, bg.stdout
+
+
+def test_background_first_on_the_blank_fasit_still_exits_2(tmp_path):
+    """The blank jacket is ALL background: nothing may survive - header
+    remnants and stripe edges must die in the structure/band filters."""
+    src = tmp_path / "612130000012_00016.jpg"
+    shutil.copyfile(REPO / "testdata" / "real_card_blank_10pct.jpg", src)
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction", "--background-first")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+
+
+def test_background_first_matches_legacy_on_a_healthy_card(tmp_path):
+    src = tmp_path / "612130000012_00016.jpg"
+    make_journal_card(src)
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction", "--background-first")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Found 36 potential pages" in proc.stdout, proc.stdout
+
+
+def test_background_first_finds_pages_pasted_on_the_blank_fasit(tmp_path):
+    """Component 5's synthetic substrate: blank jacket + real page regions
+    pasted at known cells = a position fasit for background-first."""
+    blank = pyvips.Image.new_from_file(
+        str(REPO / "testdata" / "real_card_blank_10pct.jpg")).colourspace('b-w')
+    real = pyvips.Image.new_from_file(
+        str(REPO / "testdata" / "real_card_10pct.jpg")).colourspace('b-w')
+    a = np.ndarray(buffer=blank.write_to_memory(), dtype=np.uint8,
+                   shape=[blank.height, blank.width]).copy()
+    r = np.ndarray(buffer=real.write_to_memory(), dtype=np.uint8,
+                   shape=[real.height, real.width])
+    page = r[250:550, 2170:2380]          # one real (tape) page
+    for x in (500, 1200, 1900):
+        a[650:950, x:x + 210] = page
+    src = tmp_path / "612130000012_00016.jpg"
+    pyvips.Image.new_from_memory(a.tobytes(), blank.width, blank.height,
+                                 1, 'uchar').write_to_file(str(src))
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction", "--background-first")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rows_csv = [l for l in (tmp_path / "card" / "page_coordinates.csv")
+                .read_text().splitlines()[2:] if l]
+    assert len(rows_csv) == 3, (rows_csv, proc.stdout)
+    xs = sorted(int(l.split(",")[1]) for l in rows_csv)
+    for got, want in zip(xs, (500, 1200, 1900)):
+        assert abs(got - want) <= 120, (xs, proc.stdout)
+
+
+def test_background_first_splits_touching_pages(tmp_path):
+    """The deviation rule must flow into the split pass: two touching pages
+    form one blob, and the valley between them only reads as background
+    with the same background-first logic applied to the crop."""
+    src = tmp_path / "612130000012_00016.jpg"
+    h, w = 1500, 6400
+    a = np.full((h, w), 180, 'float32')
+    for c in range(12):
+        x = 100 + c * 520
+        if c == 5:
+            x -= 60   # page 6 slides against page 5: gap 60 -> touching-ish
+        a[200:900, x:x + 400] = 110
+    pyvips.Image.new_from_memory(a.astype('uint8').tobytes(), w, h, 1,
+                                 'uchar').write_to_file(str(src))
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction", "--background-first")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rows_csv = [l for l in (tmp_path / "card" / "page_coordinates.csv")
+                .read_text().splitlines()[2:] if l]
+    assert len(rows_csv) == 12, (rows_csv, proc.stdout)
+
+
+def test_rapport_passes_extra_flags_through(tmp_path, monkeypatch):
+    calls = []
+    real_run = rapport.subprocess.run
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(rapport.subprocess, "run", fake_run)
+    src = tmp_path / "arkiv"
+    src.mkdir()
+    make_card(src / "612130000012_00001.jpg")
+    rapport.run_report(src, tmp_path / "R", open_finder=False,
+                       extra_args=["--background-first"])
+    seg_calls = [c for c in calls if any("segment_microfiche" in str(p) for p in c)]
+    assert seg_calls and "--background-first" in seg_calls[0]
+
+
+def test_a_speck_is_not_a_position_witness():
+    """Measured on the real fasit: a 20x10 rest of dirt claimed a phantom
+    page cell. Witnesses need real mass (genuine rests are 1.5-2.5% of a
+    page)."""
+    boxes = [(2010, 6710, 2040, 2790), (6370, 6710, 2040, 2790),
+             (8550, 6710, 2040, 2790)]
+    snapped, flags, notes, refused = snap_pages(
+        boxes, 2050, 2780, witnesses=[(4600, 7400, 20, 10)])
+    assert len(snapped) == 3, snapped

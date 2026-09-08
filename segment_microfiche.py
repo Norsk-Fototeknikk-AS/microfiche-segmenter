@@ -13,6 +13,7 @@ import numpy as np
 from pathlib import Path
 import argparse
 import platform
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import shutil
@@ -139,6 +140,21 @@ ILLUM_FIELD_FLOOR = 0.4        # of field max: the dark surround around the
 # with a synthetic blotch over the pages 0.93% - warn between, with margin
 # both ways.
 ILLUM_WARN_SHARE = 0.005
+
+# Background-first binarization (--background-first, 2026-09-09, flagged
+# until A/B-validated in production): the jacket is the only STABLE class -
+# content varies wildly (faded, washed, half-dark), so select background
+# and take the complement. Foreground = |pixel - local jacket level| above
+# a relative band; deviation in EITHER direction counts, which is what
+# catches faded pages sitting between the jacket and a global threshold.
+# Mechanism choice (documented per Trond's component 5): a STATISTICAL band
+# around the per-card p90 level field, not a direct diff against the blank
+# card - jackets vary physically card to card (brown/gray stripes), so the
+# blank card serves as CALIBRATION fasit instead: its jacket (texture and
+# all) stays within ~0.25 of the local level, real content sits at 0.35+,
+# and the faded-page fasit (28% darker than jacket, invisible to global
+# Otsu) is caught from 0.18 up. Hence 0.22.
+BG_BAND_RATIO = 0.22
 
 
 def estimate_illumination_field(thumb):
@@ -400,12 +416,17 @@ def clear_border_connected(binary_img):
     return 1.0 - np.count_nonzero(binary_img) / before
 
 
-def detect_page_boxes(binary_img, header_skip_px, min_w, min_h):
+def detect_page_boxes(binary_img, header_skip_px, min_w, min_h,
+                      collect_witnesses=False):
     """The detect-scale pipeline: mask header, remove card structure, erode,
     drop border-connected foreground, find and size-filter contours.
 
     Mutates and returns binary_img (the processed view is what the
-    visualization shows). Returns (boxes, contours, binary_img, log_lines).
+    visualization shows). Returns (boxes, contours, binary_img, log_lines);
+    with collect_witnesses=True a fifth element holds the sub-min-size
+    boxes - too small to be pages, but survivors of the erosion, so they
+    witness that their grid cell holds SOMETHING (field card 612130000098:
+    half a row of small rests was silently discarded here).
     """
     log_lines = []
     if header_skip_px > 0:
@@ -429,11 +450,16 @@ def detect_page_boxes(binary_img, header_skip_px, min_w, min_h):
                                    cv2.CHAIN_APPROX_SIMPLE)
     boxes = []
     kept_contours = []
+    witnesses = []
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         if w >= min_w and h >= min_h:
             boxes.append((x, y, w, h))
             kept_contours.append(c)
+        else:
+            witnesses.append((x, y, w, h))
+    if collect_witnesses:
+        return boxes, kept_contours, binary_img, log_lines, witnesses
     return boxes, kept_contours, binary_img, log_lines
 
 
@@ -521,7 +547,8 @@ def find_projection_valleys(share, min_gap):
 SPLIT_SCAN_SCALE = 0.2
 
 
-def split_box_by_projection(input_file, box, otsu_thresh, invert, min_w, min_h):
+def split_box_by_projection(input_file, box, otsu_thresh, invert, min_w,
+                            min_h, deviation=None):
     """Split one detection into the pages it contains, by projection valleys.
 
     Loads the box region, downsamples to SPLIT_SCAN_SCALE and thresholds
@@ -543,9 +570,15 @@ def split_box_by_projection(input_file, box, otsu_thresh, invert, min_w, min_h):
     small = region.resize(SPLIT_SCAN_SCALE)
     a = np.ndarray(buffer=small.write_to_memory(), dtype=np.uint8,
                    shape=[small.height, small.width])
-    fg = a >= otsu_thresh
-    if invert:
-        fg = ~fg
+    if deviation is not None:
+        # Background-first: content is any deviation from the local jacket
+        # level - same rule as the main pass, scalar per crop.
+        level, band = deviation
+        fg = np.abs(a.astype(np.float32) - level) > band
+    else:
+        fg = a >= otsu_thresh
+        if invert:
+            fg = ~fg
 
     min_gap = max(2, int(10 * SPLIT_SCAN_SCALE))
     col_cuts = find_projection_valleys(fg.mean(axis=0), min_gap)
@@ -830,6 +863,35 @@ PAGE_SIZE_TOLERANCE = 0.10      # per-card fine-tune bound around the prior
 SNAP_PITCH_TOLERANCE = 0.15     # of the pitch: max offset from a grid slot
 SNAP_GROWTH_MARK = 0.05         # area growth share that marks a page blue
 
+# Coverage guard (mandatory, 2026-09-09): field card 612130000036 scored
+# 100.0 with its whole first page row OUTSIDE every box. Foreground mass
+# outside all page boxes caps the quality score and warns loudly - in every
+# mode, because it is the one signal that survives any upstream mistake.
+COVERAGE_WARN_SHARE = 0.15      # of total foreground mass
+
+# A position witness must carry real mass: a 20x10 speck of dirt beside the
+# pages on the REAL fasit card claimed a phantom page cell before this
+# floor existed. Genuine detection rests measure 1.5-2.5% of a page.
+WITNESS_MIN_AREA_SHARE = 0.005  # of the page area
+
+
+def foreground_outside_boxes(binary_img, boxes):
+    """Share of the binary's foreground mass not covered by any box
+    (detect-scale boxes). The operator-facing 'did the boxes cover what the
+    threshold saw' number."""
+    total = int(np.count_nonzero(binary_img))
+    if total == 0:
+        return 0.0
+    h, w = binary_img.shape
+    mask = np.zeros((h, w), np.uint8)
+    for (x, y, bw, bh) in boxes:
+        x0, y0 = max(0, int(x)), max(0, int(y))
+        x1, y1 = min(w, int(x + bw)), min(h, int(y + bh))
+        if x1 > x0 and y1 > y0:
+            mask[y0:y1, x0:x1] = 1
+    outside = int(np.count_nonzero(binary_img[mask == 0]))
+    return outside / total
+
 
 def resolve_page_size(boxes):
     """Card-level page size: the prior, fine-tuned by the detections that
@@ -864,7 +926,7 @@ def resolve_page_size(boxes):
                     f"using per-card estimate {pw}x{ph}")
 
 
-def snap_pages(boxes, page_w, page_h, flags=None):
+def snap_pages(boxes, page_w, page_h, flags=None, witnesses=()):
     """The final geometry pass: every accepted detection becomes a full page
     box. The blob gives position, the page size gives the dimensions, and
     the row's grid (phase + pitch) decides which page a partial detection
@@ -877,6 +939,11 @@ def snap_pages(boxes, page_w, page_h, flags=None):
     spans beyond tolerance) - the one geometry no page explains. Their raw
     box is kept in the output so the failing card can be inspected.
 
+    Witnesses are sub-min-size blobs: they never build rows and never vote
+    on phase, pitch or row edges - but a witness inside an otherwise EMPTY
+    cell of an existing row claims a full page there (field card
+    612130000098 lost half a row to the min-size filter).
+
     Returns (snapped_boxes, flags, notes, refused).
     """
     n = len(boxes)
@@ -884,20 +951,32 @@ def snap_pages(boxes, page_w, page_h, flags=None):
     if n == 0:
         return [], [], [], []
 
-    # Rows, span-limited on tops: every top in a row - fragment tops
-    # included - lies within one page height of the row's first top, while
-    # the next row's top lies at least a row gap beyond it. (Gap-chaining
-    # cannot do this: bottom-fragment tops sit closer to the next row than
-    # to their own anchors.)
+    # Rows by transitive y-OVERLAP clustering (2026-09-09, after field card
+    # 612130000036): same-row members overlap each other substantially -
+    # fragments overlap their full-height anchors - while different rows do
+    # not overlap at all. Top-banding cannot do this: a washed row's
+    # detections have LOW tops, so the next row fell inside its page-height
+    # span and every cell got y-anchored one row down (036); and bottom
+    # fragments formed their own band, stacking a phantom row of full pages
+    # on the real one (111).
+    def y_overlap(a, b):
+        lo = max(a[1], b[1])
+        hi = min(a[1] + a[3], b[1] + b[3])
+        return hi - lo
+
     order = sorted(range(n), key=lambda i: boxes[i][1])
-    rows = [[order[0]]]
-    row_start = boxes[order[0]][1]
-    for i in order[1:]:
-        if boxes[i][1] <= row_start + page_h:
-            rows[-1].append(i)
-        else:
+    rows = []
+    for i in order:
+        placed = False
+        for row in rows:
+            if any(y_overlap(boxes[i], boxes[j])
+                   >= 0.4 * min(boxes[i][3], boxes[j][3]) for j in row):
+                row.append(i)
+                placed = True
+                break
+        if not placed:
             rows.append([i])
-            row_start = boxes[i][1]
+    rows.sort(key=lambda row: min(boxes[i][1] for i in row))
 
     # A SINGLE detection spanning well over one page in either direction is
     # merged content the split pass could not separate (bridged gaps, no
@@ -909,11 +988,14 @@ def snap_pages(boxes, page_w, page_h, flags=None):
 
     # Pitch is a property of the physical jacket, shared by all rows (rows
     # start where they start, but the frame raster is one grid).
+    # A neighbour distance smaller than the page width is physically
+    # impossible as a pitch (pages would overlap) - offset fragments
+    # interleaved with their pages produce exactly such false diffs.
     diffs = []
     for row in rows:
         xs = sorted(boxes[i][0] for i in row)
         diffs += [b - a for a, b in zip(xs, xs[1:])
-                  if page_w * 0.8 <= b - a <= page_w * 1.6]
+                  if page_w * 1.0 <= b - a <= page_w * 1.45]
     pitch = float(np.median(diffs)) if diffs else page_w * 1.05
     tol = SNAP_PITCH_TOLERANCE * pitch
 
@@ -940,7 +1022,7 @@ def snap_pages(boxes, page_w, page_h, flags=None):
         # such witness anchors on the strips' left edges instead (logged
         # implicitly by their growth notes).
         trusted = [b for b in row_boxes
-                   if abs(b[2] - page_w) <= 0.15 * page_w]
+                   if abs(b[2] - page_w) <= 0.08 * page_w]
         phase_src = trusted or row_boxes
         ref = phase_src[0][0]
         offsets = []
@@ -982,7 +1064,13 @@ def snap_pages(boxes, page_w, page_h, flags=None):
             # own edge rather than one row-wide y).
             top_err = abs(g_top - row_top)
             bottom_err = abs(g_bottom - row_bottom)
-            y = g_top if top_err <= bottom_err else g_bottom - page_h
+            # An anchor-less row (no full-height member) has, by definition,
+            # washed tops - bottoms are the surviving edge (036: every
+            # top-anchored cell landed a full row too low).
+            if not fulls:
+                y = g_bottom - page_h
+            else:
+                y = g_top if top_err <= bottom_err else g_bottom - page_h
             y = int(min(max(y, y_lo), y_hi))
             covered = sum(boxes[i][2] * boxes[i][3] for i in group)
             grown = 1.0 - min(1.0, covered / (page_w * page_h))
@@ -994,6 +1082,29 @@ def snap_pages(boxes, page_w, page_h, flags=None):
                 notes.append(f"snapped detections {dets} to full page at "
                              f"({x}, {y}) - {grown:.0%} of the page area "
                              "grown to the known size")
+
+        # Position witnesses: a sub-min blob whose center falls inside this
+        # row's y-envelope and inside an otherwise EMPTY cell proves the
+        # cell holds a page.
+        row_y0 = min(boxes[i][1] for i in members)
+        row_y1 = max(boxes[i][1] + boxes[i][3] for i in members)
+        witness_ks = set()
+        for (wx, wy, ww, wh) in witnesses:
+            if ww * wh < WITNESS_MIN_AREA_SHARE * page_w * page_h:
+                continue
+            cy = wy + wh / 2
+            if not (row_y0 <= cy <= row_y1):
+                continue
+            k = round((wx + ww / 2 - phase - page_w / 2) / pitch)
+            if k in cells or k in witness_ks:
+                continue
+            witness_ks.add(k)
+            x = int(round(phase + k * pitch))
+            y = int(round((y_lo + y_hi) / 2))
+            snapped.append((x, y, page_w, page_h))
+            out_flags.append(True)
+            notes.append(f"page from position witness at ({x}, {y}) - a "
+                         f"{ww}x{wh} rest proves the cell holds a page")
     return snapped, out_flags, notes, refused
 
 
@@ -1249,7 +1360,7 @@ def compute_card_quality(boxes, contours):
 
 
 def refine_box_local(input_file, box, otsu_thresh, orig_w, orig_h,
-                     invert=False, header_skip_px=0):
+                     invert=False, header_skip_px=0, deviation=None):
     """Refine a bounding box by re-detecting the page at higher local resolution.
 
     Extracts a padded region around the approximate box (capturing edges of
@@ -1283,10 +1394,15 @@ def refine_box_local(input_file, box, otsu_thresh, orig_w, orig_h,
         shape=[region_small.height, region_small.width]
     )
 
-    # Threshold (same Otsu value as global pass)
-    binary = (region_np >= otsu_thresh).astype(np.uint8) * 255
-    if invert:
-        binary = cv2.bitwise_not(binary)
+    # Threshold (same rule as the global pass)
+    if deviation is not None:
+        level, band = deviation
+        binary = ((np.abs(region_np.astype(np.float32) - level) > band)
+                  .astype(np.uint8) * 255)
+    else:
+        binary = (region_np >= otsu_thresh).astype(np.uint8) * 255
+        if invert:
+            binary = cv2.bitwise_not(binary)
 
     # Mask out header region (same as global pass)
     if header_skip_px > 0 and ry < header_skip_px:
@@ -1420,6 +1536,13 @@ def main():
                              'as of 2026-08-23. Still accepted so existing callers '
                              'do not fail — argparse exits 2 on an unknown flag, '
                              'which collides with EXIT_NO_PAGES.')
+    parser.add_argument('--background-first', action='store_true',
+                        help='Binarize by selecting the BACKGROUND (jacket) '
+                             'and taking the complement: foreground is any '
+                             'deviation from the local jacket level, in '
+                             'either direction. Catches faded/washed pages '
+                             'a global threshold cannot see. Flagged until '
+                             'field-validated against the default mode.')
     parser.add_argument('--anon-viz', action='store_true',
                         help='Also write _debug/anon_viz.jpg: detected blobs as '
                              'solid black/white silhouettes with boxes and the '
@@ -1508,23 +1631,33 @@ def main():
         degenerate = (f"degenerate Otsu threshold {otsu_thresh} "
                       "(near-uniform image, everything is foreground)")
 
-    # Apply the threshold SURFACE (otsu * field / norm) to the full image.
-    # Still full-res-threshold-then-resize: the detect pass depends on that
-    # order (see the resize/threshold duality note in HANDOFF).
-    print("Applying illumination-corrected threshold to full image...")
-    surface = illum_field * (otsu_thresh / illum_norm)
-    fh, fw = surface.shape
-    surface_img = pyvips.Image.new_from_memory(
-        np.ascontiguousarray(surface).tobytes(), fw, fh, 1, 'float')
-    surface_img = surface_img.resize(original_width / fw,
-                                     vscale=original_height / fh,
-                                     kernel='linear')
-    if (surface_img.width, surface_img.height) != (original_width, original_height):
-        surface_img = surface_img.embed(
-            0, 0, max(surface_img.width, original_width),
-            max(surface_img.height, original_height),
-            extend='copy').crop(0, 0, original_width, original_height)
-    binary = gray >= surface_img
+    # Apply the threshold to the full image - still full-res-threshold-
+    # then-resize: the detect pass depends on that order (see the
+    # resize/threshold duality note in HANDOFF).
+    def full_res_surface(values):
+        fh, fw = values.shape
+        img = pyvips.Image.new_from_memory(
+            np.ascontiguousarray(values.astype(np.float32)).tobytes(),
+            fw, fh, 1, 'float')
+        img = img.resize(original_width / fw, vscale=original_height / fh,
+                         kernel='linear')
+        if (img.width, img.height) != (original_width, original_height):
+            img = img.embed(0, 0, max(img.width, original_width),
+                            max(img.height, original_height),
+                            extend='copy').crop(0, 0, original_width,
+                                                original_height)
+        return img
+
+    if args.background_first:
+        # Foreground = deviation from the local jacket level, either way.
+        print("Background-first mode: foreground = deviation beyond "
+              f"{BG_BAND_RATIO:.0%} of the local jacket level")
+        level_img = full_res_surface(illum_field)
+        binary = (gray - level_img).abs() > (level_img * BG_BAND_RATIO)
+    else:
+        print("Applying illumination-corrected threshold to full image...")
+        binary = gray >= full_res_surface(
+            illum_field * (otsu_thresh / illum_norm))
 
     # Downsample for contour detection (OpenCV has pixel limits)
     # Use 10% scale for detection, then scale coordinates back
@@ -1562,7 +1695,12 @@ def main():
     min_h = int(original_height * detect_scale * MIN_PAGE_HEIGHT_RATIO)
     header_skip_px_small = int(original_height * detect_scale * args.header_skip)
 
-    if args.no_invert:
+    if args.background_first:
+        # The deviation mask IS the content, regardless of which side of
+        # the jacket level it sits on - polarity does not exist here.
+        do_invert = False
+        print("Polarity: not applicable (background-first deviation mask)")
+    elif args.no_invert:
         do_invert = False
     elif args.invert:
         do_invert = True
@@ -1587,8 +1725,9 @@ def main():
     # === STEP 3: Detect, filter and sort bounding boxes ===
     print(f"Skipping top {header_skip_px_small} pixels in downsampled image (header region)")
     print(f"Detecting pages (erosion kernel={DETECT_ERODE_KERNEL})...")
-    boxes, filtered_contours, binary_img, det_log = detect_page_boxes(
-        binary_img, header_skip_px_small, min_w, min_h)
+    boxes, filtered_contours, binary_img, det_log, small_witnesses = \
+        detect_page_boxes(binary_img, header_skip_px_small, min_w, min_h,
+                          collect_witnesses=True)
     for line in det_log:
         print(line)
 
@@ -1682,8 +1821,14 @@ def main():
         min_h_full = int(original_height * MIN_PAGE_HEIGHT_RATIO)
 
         def _split_one(box):
-            # Same flattened view as the main pass: the global threshold
-            # scaled by the local illumination field over this box.
+            # Same view as the main pass: local scalars from the same field.
+            local_level = illumination_local_threshold(
+                illum_norm, illum_field, illum_norm, box,
+                original_width, original_height)
+            if args.background_first:
+                return split_box_by_projection(
+                    input_file, box, 0, False, min_w_full, min_h_full,
+                    deviation=(local_level, BG_BAND_RATIO * local_level))
             local_thresh = illumination_local_threshold(
                 otsu_thresh, illum_field, illum_norm, box,
                 original_width, original_height)
@@ -1753,6 +1898,14 @@ def main():
         header_skip_fullres = int(original_height * args.header_skip)
 
         def _refine_one(box):
+            local_level = illumination_local_threshold(
+                illum_norm, illum_field, illum_norm, box,
+                original_width, original_height)
+            if args.background_first:
+                return refine_box_local(
+                    input_file, box, 0, original_width, original_height,
+                    header_skip_px=header_skip_fullres,
+                    deviation=(local_level, BG_BAND_RATIO * local_level))
             local_thresh = illumination_local_threshold(
                 otsu_thresh, illum_field, illum_norm, box,
                 original_width, original_height)
@@ -1804,10 +1957,19 @@ def main():
 
     # Card-level sanity: when geometry has to save more than half the card,
     # the card is genuinely sick - repair must not become silent success.
-    geo_overload = repaired_count > GEOMETRY_MAX_REPAIR_SHARE * len(boxes_fullres)
+    # Only SUBSTANTIAL repairs count toward condemning a card: a merge
+    # that tiles its union perfectly (0% invented - split-pass churn, clean
+    # fragment pairs) is bookkeeping, not fabrication. And at least 3 of
+    # them - on a one- or two-page card any single repair is already "most
+    # of the card".
+    substantial = sum(1 for m in re.findall(r"(\d+)% invented",
+                                            "\n".join(geo_notes))
+                      if int(m) >= 3)
+    geo_overload = (substantial >= 3 and
+                    substantial > GEOMETRY_MAX_REPAIR_SHARE * len(boxes_fullres))
     if geo_overload:
-        print(f"\nERROR: geometry had to repair {repaired_count} of "
-              f"{len(boxes_fullres)} pages "
+        print(f"\nERROR: geometry had to repair {substantial} of "
+              f"{len(boxes_fullres)} pages substantially "
               f"(limit {GEOMETRY_MAX_REPAIR_SHARE:.0%}) - card is sick, "
               "not repairable", file=sys.stderr)
 
@@ -1827,8 +1989,13 @@ def main():
         page_w, page_h, size_note = resolve_page_size(boxes_fullres)
         if size_note:
             print(f"\n{size_note}")
+        witnesses_fullres = [
+            (int(x / detect_scale), int(y / detect_scale),
+             int(w / detect_scale), int(h / detect_scale))
+            for (x, y, w, h) in small_witnesses]
         boxes_fullres, snap_flags, snap_notes, snap_refused = snap_pages(
-            boxes_fullres, page_w, page_h, flags=geo_flags_list)
+            boxes_fullres, page_w, page_h, flags=geo_flags_list,
+            witnesses=witnesses_fullres)
         snapped_count = sum(1 for note in snap_notes
                             if note.startswith("snapped"))
         if snap_notes:
@@ -1865,6 +2032,25 @@ def main():
             pages = "+".join(str(i + 1) for i in group)
             coords = ", ".join(str(boxes_fullres[i]) for i in group)
             print(f"  pages {pages}: {coords}", file=sys.stderr)
+
+    # Coverage guard: did the boxes cover what the threshold saw? The one
+    # signal that survives any upstream mistake (row-banding collapse put a
+    # whole page row outside every box on card 612130000036 - at quality
+    # 100). Mandatory in every mode.
+    coverage_note = None
+    boxes_detect = [(x * detect_scale, y * detect_scale,
+                     w * detect_scale, h * detect_scale)
+                    for (x, y, w, h) in boxes_fullres]
+    outside_share = foreground_outside_boxes(binary_img, boxes_detect)
+    if outside_share > COVERAGE_WARN_SHARE:
+        coverage_note = (f"COVERAGE: {outside_share:.0%} of foreground "
+                         "outside all boxes")
+        cap = round(100.0 * (1.0 - outside_share), 1)
+        print(f"\nWARNING: {outside_share:.0%} of the foreground mass lies "
+              f"outside every page box - content the boxes do not cover. "
+              f"Quality capped at {cap}.", file=sys.stderr)
+        if quality['total'] > cap:
+            quality['total'] = cap
 
     # Output coordinates
     print("\n=== PAGE COORDINATES (full resolution) ===")
@@ -1937,6 +2123,8 @@ def main():
         label += f"  |  {illum_note}"
     if repaired_count:
         label += f"  |  {repaired_count} geometry-completed"
+    if coverage_note:
+        label += f"  |  {coverage_note}"
     if fragment_groups or refused_groups or geo_overload or snap_refused:
         n_suspect = len(fragment_groups) + len(refused_groups) + len(snap_refused)
         label = f"SUSPECT FRAGMENTS ({n_suspect} group(s))  |  " + label
