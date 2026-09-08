@@ -4904,3 +4904,59 @@ def test_the_cards_with_coordinates_still_carry_them():
     assert with_boxes == {"612130000098_00012", "612130000111_00012",
                           "612130000135_00012", "612130000432_00024"}, \
         with_boxes
+
+
+# --- Steg 10A (2026-09-08): the quality regression from 9A ----------------
+# 9A meant to make quality describe the boxes that ship. It made it worse:
+# `boxes` had already been rebound by snap_pages on the line above, so the
+# comparison held the sorted snapped boxes against the UNSORTED snapped
+# boxes and saw no change whenever the snap did not reorder. Cards WITH snap
+# notes stopped recomputing too, which the old rule at least did. Two
+# healthy controls went SVAK: 487 99.2 -> 82.2, 531 99.3 -> 59.4, 418
+# 100 -> 14.1 - all three shipping byte-identical coordinates to round 2.
+
+REPLAY_R3 = REPO / "testdata" / "replay_runde3_2026-09-08.txt"
+
+
+def _replay_round3():
+    out = []
+    for line in REPLAY_R3.read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        stem, pre, wit, stripes, q, grid = [p.strip()
+                                            for p in line.split(" | ")]
+        boxes = [tuple(int(v) for v in b.split(","))
+                 for b in pre.split("; ")] if pre else []
+        wits = [tuple(int(v) for v in b.split(","))
+                for b in wit.split("; ")] if wit else []
+        runs = [tuple(int(v) for v in r.split("-"))
+                for r in stripes.split(", ")] if stripes else []
+        out.append((stem, boxes, wits, runs, float(q), grid))
+    return out
+
+
+def test_quality_and_grid_describe_the_shipped_boxes_on_real_cards():
+    """The three field cards, replayed from their own PRE-REPAIR lines."""
+    checked = 0
+    for stem, boxes, wits, runs, q, grid in _replay_round3():
+        chain = repair_and_snap(boxes, wits, runs, 29071, 21505,
+                                header_px=1720)
+        shipped = compute_card_quality(chain.boxes, None)
+        assert shipped["grid"] == grid, (stem, shipped["grid"], grid)
+        assert abs(shipped["total"] - q) < 1.0, (stem, shipped["total"], q)
+        # ...and what the chain REPORTS must be the same thing
+        assert chain.quality is not None, (stem, "boxes changed")
+        assert chain.quality["grid"] == grid, (stem, chain.quality["grid"])
+        assert abs(chain.quality["total"] - q) < 1.0, (stem,
+                                                       chain.quality["total"])
+        checked += 1
+    assert checked == 3, checked
+
+
+def test_an_unchanged_card_keeps_the_callers_quality():
+    """Nothing changed, nothing to recompute - main's contour-based score
+    (which carries a real shape component) must stand."""
+    boxes = _row_of(12)
+    chain = repair_and_snap(boxes, (), (), 29071, 21505)
+    assert chain.boxes == boxes, chain.boxes
+    assert chain.quality is None, chain.quality

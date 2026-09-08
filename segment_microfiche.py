@@ -1591,7 +1591,7 @@ class ChainResult(NamedTuple):
     snap_refused: list
     geo_overload: bool
     substantial: int       # substantial repairs, for the overload message
-    quality: dict          # None when nothing changed the boxes
+    quality: dict          # of the FINAL boxes; None when nothing changed
     output: list           # (stream, text) in the order they were printed
     card_refusals: list    # reasons this card must not ship (steg 6A/6B)
     layout_refused: bool   # ...and whether a LAYOUT invariant was broken:
@@ -1622,6 +1622,7 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None,
     out = []
     refusals = []
     evidence_refusals = []
+    boxes_in = list(boxes)
 
     # Header content is not a page row (steg 9B). Dropped BEFORE anything
     # counts detections, so the evidence guard judges pages against pages.
@@ -1641,7 +1642,6 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None,
 
     boxes, geo_flags, geo_notes, refused_groups = complete_geometry(boxes)
     repaired_count = sum(geo_flags)
-    quality = None
     if geo_notes:
         out.append((1, f"\n{repaired_count} pages geometry-completed:"))
         for note in geo_notes:
@@ -1653,7 +1653,6 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None,
             [b + (f,) for b, f in zip(boxes, geo_flags)])
         boxes = [t[:4] for t in tagged]
         geo_flags = [t[4] for t in tagged]
-        quality = compute_card_quality(boxes, None)
     geo_indices = {i for i, f in enumerate(geo_flags) if f}
 
     # Card-level sanity: when geometry has to save more than half the card,
@@ -1703,15 +1702,8 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None,
                 out.append((1, f"  {note}"))
         tagged = sort_boxes_by_rows(
             [b + (fl,) for b, fl in zip(boxes, snap_flags)])
-        snapped_boxes = [t[:4] for t in tagged]
+        boxes = [t[:4] for t in tagged]
         geo_indices = {i for i, t in enumerate(tagged) if t[4]}
-        # Recompute whenever the BOXES changed, not when the snap happened
-        # to have something to say (steg 9A): card 432_00024 shipped 5 clean
-        # rows of 12 at a true 99.5 and reported "6 rows ... 71.1" from
-        # before the snap, because the snap tidied it without a note.
-        if snapped_boxes != boxes:
-            quality = compute_card_quality(snapped_boxes, None)
-        boxes = snapped_boxes
         if snap_refused:
             out.append((2, f"\nERROR: {len(snap_refused)} suspected page "
                            "fragment group(s) - detections irreconcilable "
@@ -1769,6 +1761,14 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None,
     refusals.extend(layout_refusals)
     for reason in refusals:
         out.append((2, f"\nERROR: {reason}"))
+
+    # Quality is computed ONCE, here, on the boxes that actually ship (steg
+    # 10A). Recomputing it at each step invited staleness: 9A compared
+    # against a name the snap had already rebound and silently kept the
+    # pre-snap score, sending two healthy controls to SVAK. One place, one
+    # answer, and the caller's contour-based score stands when nothing
+    # changed.
+    quality = compute_card_quality(boxes, None) if boxes != boxes_in else None
 
     return ChainResult(boxes, geo_indices, fragment_groups, refused_groups,
                        snap_refused, geo_overload, substantial, quality, out,
