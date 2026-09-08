@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 import argparse
+import platform
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import shutil
@@ -83,6 +84,86 @@ FRAGMENT_MARK_COLOR = (0, 165, 255)  # orange boxes in both visualizations
 # washed-out scan) and the run fails loudly instead of emitting one giant
 # "page". Real cards run well below this, even with narrow gaps.
 FOREGROUND_SANE_MAX = 0.97
+
+# Illumination flattening (production 2026-09-08: mottled panoramas after a
+# machine upgrade - patchy brightness, content intact - put patches on the
+# wrong side of the global Otsu threshold and silently ate pages). The
+# low-frequency field is estimated per cell as a HIGH percentile: that tracks
+# the bright class (jacket on journal cards, pages on Yamaha type), which
+# mottling scales along with everything else, while page content does not
+# read as lighting. Cell count is relative to width so a cell (~2400 px on a
+# real panorama) stays coarser than a page and cannot hollow page interiors.
+ILLUM_FIELD_CELLS = 12
+# The planning thumbnail needs page/jacket structure RESOLVED, so its size is
+# a target width, not a fixed scale - at a fixed 1% a test-sized card is a
+# 64px mush where the field reads noise. 600px keeps real-panorama pages
+# ~44px wide with visible jacket between rows.
+ILLUM_THUMB_WIDTH = 600
+ILLUM_FIELD_P = 90
+ILLUM_FIELD_BLUR_SIGMA = 1.0   # in cells
+ILLUM_FIELD_FLOOR = 0.4        # of field max: the dark surround around the
+                               # card must not be boosted into fake foreground
+# Flattening a flat image is ~identity, so the share of thumbnail pixels the
+# flattening RE-CLASSIFIES is the mottle detector (field ratio is not - the
+# dark surround dominates it even on healthy cards, measured 1.9 on the clean
+# fasit vs 2.1 mottled). Measured: clean fasit cards 0.15-0.19%, the fasit
+# with a synthetic blotch over the pages 0.93% - warn between, with margin
+# both ways.
+ILLUM_WARN_SHARE = 0.005
+
+
+def estimate_illumination_field(thumb):
+    """Low-frequency illumination field from a small grayscale thumbnail,
+    as a float32 grid of ILLUM_FIELD_CELLS across."""
+    h, w = thumb.shape
+    cw = ILLUM_FIELD_CELLS
+    ch = max(3, round(cw * h / w))
+    ys = np.linspace(0, h, ch + 1).astype(int)
+    xs = np.linspace(0, w, cw + 1).astype(int)
+    field = np.empty((ch, cw), np.float32)
+    for i in range(ch):
+        for j in range(cw):
+            field[i, j] = np.percentile(
+                thumb[ys[i]:ys[i + 1], xs[j]:xs[j + 1]], ILLUM_FIELD_P)
+    field = cv2.GaussianBlur(field, (0, 0), ILLUM_FIELD_BLUR_SIGMA)
+    return np.maximum(field, max(1.0, ILLUM_FIELD_FLOOR * float(field.max())))
+
+
+def illumination_plan(thumb):
+    """(field, norm, otsu_thresh, reclassified_share) from a small thumbnail.
+
+    Every threshold downstream derives from otsu * field / norm: the full-res
+    binary via a threshold SURFACE (preserving the threshold-first-then-resize
+    order the detect pass depends on), the crop passes via local scalars - so
+    all passes see the same flattened view without ever materializing a
+    flattened gigapixel image.
+    """
+    field = estimate_illumination_field(thumb)
+    norm = float(np.median(field))
+    field_up = cv2.resize(field, (thumb.shape[1], thumb.shape[0]),
+                          interpolation=cv2.INTER_LINEAR)
+    flat = np.clip(thumb.astype(np.float32) * (norm / field_up),
+                   0, 255).astype(np.uint8)
+    thresh, _ = cv2.threshold(flat, 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    raw_thresh, _ = cv2.threshold(thumb, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    share = float(np.mean((flat >= thresh) != (thumb >= raw_thresh)))
+    return field, norm, float(thresh), share
+
+
+def illumination_local_threshold(otsu_thresh, field, norm, box,
+                                 full_w, full_h):
+    """Scalar threshold for a full-res crop: otsu scaled by the mean field
+    over the box. Exactly equivalent to flattening where the field is locally
+    constant - and the field is smoother than any single detection."""
+    fh, fw = field.shape
+    x, y, w, h = box
+    x0 = min(fw - 1, max(0, int(x * fw / full_w)))
+    y0 = min(fh - 1, max(0, int(y * fh / full_h)))
+    x1 = max(x0 + 1, min(fw, -(-(x + w) * fw // full_w)))
+    y1 = max(y0 + 1, min(fh, -(-(y + h) * fh // full_h)))
+    return otsu_thresh * float(field[y0:y1, x0:x1].mean()) / norm
 
 
 def prepare_card_dir(out_dir):
@@ -651,18 +732,6 @@ def expand_boxes(boxes, radius, max_width, max_height):
     return expanded
 
 
-def compute_otsu_threshold(gray_image, sample_scale=0.01):
-    """Compute Otsu threshold from a thumbnail sample."""
-    thumb = gray_image.resize(sample_scale)
-    thumb_np = np.ndarray(
-        buffer=thumb.write_to_memory(),
-        dtype=np.uint8,
-        shape=[thumb.height, thumb.width]
-    )
-    thresh, _ = cv2.threshold(thumb_np, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return thresh
-
-
 def sort_boxes_by_columns(boxes, tolerance_ratio=0.5):
     """Sort boxes: left-to-right by column, top-to-bottom within each column."""
     if not boxes:
@@ -934,6 +1003,10 @@ def refine_box_local(input_file, box, otsu_thresh, orig_w, orig_h,
 
 
 def main():
+    # One line per run so every captured log documents the environment it ran
+    # in - environment drift on the offline machine was once a suspect.
+    print(f"Env: python {platform.python_version()}, numpy {np.__version__}, "
+          f"opencv {cv2.__version__}, pyvips {pyvips.__version__}")
     parser = argparse.ArgumentParser(description='Segment microfiche pages')
     # Not argparse-required: a missing input must exit 1 (generic failure),
     # while argparse errors exit 2 and would collide with EXIT_NO_PAGES.
@@ -1047,10 +1120,20 @@ def main():
     else:
         gray = image
 
-    # Compute Otsu threshold from thumbnail
-    print("Computing Otsu threshold from thumbnail...")
-    otsu_thresh = compute_otsu_threshold(gray)
-    print(f"Otsu threshold: {otsu_thresh}")
+    # Compute illumination field + Otsu threshold from a thumbnail
+    print("Computing illumination field and Otsu threshold from thumbnail...")
+    thumb_vips = gray.resize(min(1.0, ILLUM_THUMB_WIDTH / gray.width))
+    thumb = np.ndarray(buffer=thumb_vips.write_to_memory(), dtype=np.uint8,
+                       shape=[thumb_vips.height, thumb_vips.width])
+    illum_field, illum_norm, otsu_thresh, reclassified = illumination_plan(thumb)
+    print(f"Otsu threshold: {otsu_thresh:.0f} (illumination-flattened; "
+          f"flattening re-classified {reclassified:.1%} of thumbnail pixels)")
+    illum_note = None
+    if reclassified > ILLUM_WARN_SHARE:
+        illum_note = f"UNEVEN ILLUMINATION ({reclassified:.0%} re-classified)"
+        print(f"WARNING: uneven illumination - flattening re-classified "
+              f"{reclassified:.1%} of pixels (mottled panorama). Detection "
+              "compensates; the source may want re-stitching review.")
 
     # A (nearly) uniform surface gives Otsu threshold 0, which makes the ENTIRE
     # image foreground and the whole card come back as one giant "page" -
@@ -1061,9 +1144,23 @@ def main():
         degenerate = (f"degenerate Otsu threshold {otsu_thresh} "
                       "(near-uniform image, everything is foreground)")
 
-    # Apply threshold to full image
-    print("Applying threshold to full image...")
-    binary = gray >= otsu_thresh
+    # Apply the threshold SURFACE (otsu * field / norm) to the full image.
+    # Still full-res-threshold-then-resize: the detect pass depends on that
+    # order (see the resize/threshold duality note in HANDOFF).
+    print("Applying illumination-corrected threshold to full image...")
+    surface = illum_field * (otsu_thresh / illum_norm)
+    fh, fw = surface.shape
+    surface_img = pyvips.Image.new_from_memory(
+        np.ascontiguousarray(surface).tobytes(), fw, fh, 1, 'float')
+    surface_img = surface_img.resize(original_width / fw,
+                                     vscale=original_height / fh,
+                                     kernel='linear')
+    if (surface_img.width, surface_img.height) != (original_width, original_height):
+        surface_img = surface_img.embed(
+            0, 0, max(surface_img.width, original_width),
+            max(surface_img.height, original_height),
+            extend='copy').crop(0, 0, original_width, original_height)
+    binary = gray >= surface_img
 
     # Downsample for contour detection (OpenCV has pixel limits)
     # Use 10% scale for detection, then scale coordinates back
@@ -1160,7 +1257,10 @@ def main():
                            int(w / detect_scale), int(h / detect_scale))
                           for (x, y, w, h) in boxes]
             anon_viz = render_anon_viz(anon_mask, fail_boxes, detect_scale,
-                                       f"FAILED: {reason}", (0, 0, 200))
+                                       f"FAILED: {reason}"
+                                       + (f"  |  {illum_note}" if illum_note
+                                          else ""),
+                                       (0, 0, 200))
             anon_path = debug_dir / "anon_viz.jpg"
             cv2.imwrite(str(anon_path), anon_viz)
             print(f"  Anonymized view saved to {anon_path}", file=sys.stderr)
@@ -1218,8 +1318,13 @@ def main():
         min_h_full = int(original_height * MIN_PAGE_HEIGHT_RATIO)
 
         def _split_one(box):
+            # Same flattened view as the main pass: the global threshold
+            # scaled by the local illumination field over this box.
+            local_thresh = illumination_local_threshold(
+                otsu_thresh, illum_field, illum_norm, box,
+                original_width, original_height)
             return split_box_by_projection(
-                input_file, box, otsu_thresh, do_invert, min_w_full, min_h_full)
+                input_file, box, local_thresh, do_invert, min_w_full, min_h_full)
 
         pieces = [None] * len(boxes_fullres)
         with ThreadPoolExecutor(max_workers=5) as executor:
@@ -1284,8 +1389,11 @@ def main():
         header_skip_fullres = int(original_height * args.header_skip)
 
         def _refine_one(box):
+            local_thresh = illumination_local_threshold(
+                otsu_thresh, illum_field, illum_norm, box,
+                original_width, original_height)
             return refine_box_local(
-                input_file, box, otsu_thresh,
+                input_file, box, local_thresh,
                 original_width, original_height,
                 invert=do_invert, header_skip_px=header_skip_fullres)
 
@@ -1388,6 +1496,8 @@ def main():
     label = f"Card Quality: {q}/100 ({grade})  |  {quality['grid']}  |  size={quality['size']}  align={quality['alignment']}  spacing={quality['spacing']}  shape={quality['shape']}"
     if do_invert:
         label += "  |  inverted" + ("" if args.invert else " (auto)")
+    if illum_note:
+        label += f"  |  {illum_note}"
     if fragment_groups:
         label = f"SUSPECT FRAGMENTS ({len(fragment_groups)} group(s))  |  " + label
         banner_color = (0, 0, 200)

@@ -329,9 +329,41 @@ SAMMENDRAG additionally warns `ADVARSEL LAV KVALITET` on any card scoring
 below 50 regardless of exit code - in the field run every sick card was
 below 50, every healthy one above 74.
 
+### Illumination-robust thresholding (2026-09-08)
+
+Production panoramas came out MOTTLED after a machine upgrade (patchy
+brightness, deterministic, content intact). The global Otsu threshold put
+patches on the wrong side - swiss-cheese binaries; the chain guard fired
+correctly on bad binaries, and the old path silently ATE pages (measured:
+half of 36 gone on the synthetic fixture, 4 of 12 on the first probe).
+Fix: illumination flattening. Field = per-cell p90 of a ~600px planning
+thumbnail (tracks the bright class; content does not read as lighting),
+blurred, floored at 0.4x max (dark surround must not boost). Otsu on the
+flattened thumbnail, applied full-res as a threshold SURFACE otsu*field/norm
+- the threshold-first-then-resize duality is preserved. Split/refine use
+local scalar thresholds from the same field. Mottle detector = share of
+thumbnail pixels flattening re-classifies (field ratio does NOT work - the
+dark surround gives 1.9 even on clean cards): clean 0.15-0.19%, blotched
+fasit 0.93%, warn at 0.5% -> loud stdout warning + UNEVEN ILLUMINATION in
+both banners. Two things the estimator depends on: field cells (12 across)
+must stay COARSER than a page - real pages are ~1/14 of card width - and
+the planning thumb is a target WIDTH (600px), not a fixed scale, so
+structure stays resolved on small images. Clean real panorama re-measured
+after the change: same two pages, 0.2% re-classified, no warning; the tape
+pair now separates already at detect (the knife-edge gap flips with any
+epsilon threshold change - final result identical).
+
+### VIS-PANORAMA.command (2026-09-08)
+
+Lossless LZW viewing copies of the zstd-TIFF panoramas, written beside the
+sources, never overwriting. On-machine only (journal data). pyvips in the
+venv reads the production zstd files - proven by the segmenter reading them
+- even though the LOCAL libvips here lacks zstd write support (why the test
+uses a deflate source).
+
 ### Tests
 
-117 tests, ~19 s (was 32 when this was written). Unit tests for box
+124 tests, ~19 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 

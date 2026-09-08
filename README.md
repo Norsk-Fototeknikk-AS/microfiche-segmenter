@@ -345,9 +345,35 @@ whitelist on every copy and re-scans the finished folder; `visualization.jpg`,
 binaries and page crops can never end up there. Cards that fail inspection
 appear loudly as `FEIL` lines in the summary.
 
+### VIS-PANORAMA.command (m4-studio)
+
+The production panoramas are zstd-TIFFs that Preview cannot open.
+Double-click, pick a TIFF (or Cancel to pick a folder), and a **lossless**
+LZW viewing copy `<navn>_visning.tif` is written **beside** each source —
+never overwriting, suffixed on collision — so real pixel values can be
+measured with Digital Color Meter. Viewing copies contain journal data and
+stay on the machine; they are never report artifacts.
+
+Every segmenter run starts with an `Env:` line (python/numpy/opencv/pyvips
+versions) so each captured rapport.txt documents the environment it ran in.
+
 ## How detection works
 
-1. Otsu threshold from a 1 % thumbnail, applied to the full image.
+1. Illumination-flattened Otsu threshold (2026-09-08, after mottled
+   production panoramas silently lost pages to a global threshold): a
+   ~600 px planning thumbnail yields a low-frequency illumination field
+   (per-cell 90th percentile tracks the bright class — jacket or Yamaha
+   pages — so page content does not read as lighting; floored so the dark
+   surround cannot boost into fake foreground). Otsu is computed on the
+   flattened thumbnail and applied to the full image as a threshold
+   *surface* (`otsu × field / norm`), preserving the full-res
+   threshold-then-resize order the detect pass depends on. The split and
+   refine passes use the same field via local scalar thresholds. Flattening
+   a flat image is ~identity; the share of thumbnail pixels it re-classifies
+   is the mottle detector — above `ILLUM_WARN_SHARE` (0.5 %; clean cards
+   measure ~0.2 %) the run prints a loud warning and both visualization
+   banners say `UNEVEN ILLUMINATION`. Detection compensates either way; the
+   warning tells the operator the *source* is sick.
 2. Downscale to 10 %. Polarity is **auto-detected** per card (2026-09-04,
    decided cross-repo): the two known card types are opposite (Yamaha-type
    bright-on-dark, journal jackets dark-on-light) and the app sends no flag.

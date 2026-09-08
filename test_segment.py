@@ -1680,3 +1680,184 @@ def test_triple_seamed_card_fails_loudly_end_to_end(tmp_path):
 
     assert proc.returncode == EXIT_SUSPECT_FRAGMENTS, proc.stdout + proc.stderr
     assert not (out / DONE_SENTINEL).exists()
+
+
+# --- Illumination-robust thresholding --------------------------------------
+# Production 2026-09-08: panoramas came out MOTTLED (patchy brightness after a
+# machine upgrade) with content intact and readable. The global Otsu threshold
+# put patches on the wrong side -> swiss-cheese binaries, fragment guard fired
+# on every card (correctly - the binary WAS bad). Fix: estimate the
+# low-frequency illumination field (per-cell high percentile tracks the
+# bright class), flatten before thresholding. Clean images are ~unaffected.
+
+from segment_microfiche import (ILLUM_WARN_SHARE, estimate_illumination_field,
+                                illumination_plan)
+
+
+def make_journal_card(path, mottled=False):
+    """Low-contrast journal-type card (dark pages on a light jacket), with
+    REAL proportions: 12 pages per row, so a page is narrower than an
+    illumination-field cell - on physical cards a page is ~1/14 of the card
+    width, which is what lets the field's per-cell p90 track the jacket. The
+    mottle is a multiplicative low-frequency field strong enough that the
+    darkest jacket dips below the brightest page - measured to silently eat
+    pages under the old global threshold."""
+    h, w = 1500, 6400
+    a = np.full((h, w), 180, 'float32')
+    for r in range(3):
+        for c in range(12):
+            y = 200 + r * 420
+            x = 60 + c * 520
+            a[y:y + 340, x:x + 400] = 110
+    if mottled:
+        # Production mottling lives at stitch-tile scale (a panorama is 4x4
+        # tiles), so the blob size is relative to WIDTH on both axes - the
+        # field tracks patches of that scale, not arbitrarily sharp ones.
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        f = np.ones((h, w), np.float32)
+        for cx, cy, s, sign in [(0.25, 0.3, 0.22, -0.45),
+                                (0.7, 0.75, 0.28, +0.25)]:
+            f += sign * np.exp(-(((xx - cx * w) ** 2 + (yy - cy * h) ** 2)
+                                 / (2 * (s * w) ** 2)))
+        f += 0.1 * (xx / w - 0.5)
+        a = a * f
+    a = np.clip(a, 0, 255).astype('uint8')
+    pyvips.Image.new_from_memory(a.tobytes(), w, h, 1, 'uchar').write_to_file(str(path))
+
+
+def test_mottled_journal_card_segments_like_the_clean_one(tmp_path):
+    src = tmp_path / "612130000012_00016.jpg"
+    make_journal_card(src, mottled=True)
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Found 36 potential pages" in proc.stdout, proc.stdout
+    assert "uneven illumination" in proc.stdout.lower(), \
+        "operator must be told the card was mottled"
+
+
+def test_clean_journal_card_gets_no_illumination_warning(tmp_path):
+    src = tmp_path / "612130000012_00016.jpg"
+    make_journal_card(src, mottled=False)
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Found 36 potential pages" in proc.stdout, proc.stdout
+    assert "uneven illumination" not in proc.stdout.lower()
+
+
+def _mottle_thumb(a):
+    """The synthetic mottle from the coordinator's spec, on the real fasit."""
+    h, w = a.shape
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    f = np.ones((h, w), np.float32)
+    for cx, cy, s, sign in [(0.78, 0.15, 0.22, -0.5), (0.3, 0.7, 0.3, +0.3)]:
+        f += sign * np.exp(-(((xx / w - cx) ** 2 + (yy / h - cy) ** 2)
+                             / (2 * s ** 2)))
+    f += 0.15 * (xx / w - 0.5)
+    return np.clip(a.astype(np.float32) * f, 0, 255).astype(np.uint8)
+
+
+def test_mottled_real_card_detects_the_tape_pages():
+    """Replica of the main pass on the committed fasit with a dark blotch
+    right over the tape pages: plan from a small thumb, threshold surface at
+    full (thumb) resolution, then the ordinary detect pipeline."""
+    img = pyvips.Image.new_from_file(
+        str(REPO / "testdata" / "real_card_10pct.jpg")).colourspace('b-w')
+    gray = np.ndarray(buffer=img.write_to_memory(), dtype=np.uint8,
+                      shape=[img.height, img.width])
+    gray = _mottle_thumb(gray)
+    h, w = gray.shape
+
+    from segment_microfiche import detect_page_boxes
+    small = cv2.resize(gray, (w // 10, h // 10), interpolation=cv2.INTER_AREA)
+    field, norm, thresh, share = illumination_plan(small)
+    assert share > ILLUM_WARN_SHARE, "this mottle must trip the warning"
+
+    surface = cv2.resize(field * (thresh / norm), (w, h),
+                         interpolation=cv2.INTER_LINEAR)
+    b = cv2.bitwise_not(((gray >= surface) * 255).astype(np.uint8))
+    boxes, _, _, _ = detect_page_boxes(
+        b, int(h * 0.08), int(w * MIN_PAGE_WIDTH_RATIO),
+        int(h * MIN_PAGE_HEIGHT_RATIO))
+    boxes = sorted(boxes, key=lambda bb: (bb[1], bb[0]))
+
+    # The clean fasit detects the tape pair at (2167, 244, 426, 301); the
+    # blotch sits right on top of it. One merged box or the two pages split
+    # at the tape gap are both faithful detections.
+    assert 1 <= len(boxes) <= 2, boxes
+    x0 = min(bb[0] for bb in boxes)
+    x1 = max(bb[0] + bb[2] for bb in boxes)
+    assert abs(x0 - 2167) <= 15 and abs(x1 - 2593) <= 15, boxes
+    assert all(abs(bb[1] - 247) <= 15 and abs(bb[3] - 297) <= 15
+               for bb in boxes), boxes
+
+
+def test_env_versions_are_logged_at_startup(tmp_path):
+    """Every rapport.txt from the air-gapped machine must document the
+    environment it ran in (environment drift was once a suspected culprit)."""
+    src = tmp_path / "612130000012_00016.jpg"
+    make_card(src)
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    assert proc.returncode == 0
+    assert "Env: python " in proc.stdout, proc.stdout
+    for lib in ("numpy", "opencv", "pyvips"):
+        assert lib in proc.stdout, proc.stdout
+
+
+# --- VIS-PANORAMA.command / vis_panorama.py --------------------------------
+# Preview cannot open the zstd-TIFF panoramas on m4-studio; Trond needs
+# LOSSLESS viewing copies (Digital Color Meter on real pixel values) written
+# next to the sources. On-machine only - journal data stays put.
+
+import vis_panorama
+
+
+def test_view_path_never_overwrites(tmp_path):
+    src = tmp_path / "612130000012_00001 Panorama.tif"
+    src.write_bytes(b"x")
+    first = vis_panorama.view_path(src)
+    assert first.name == "612130000012_00001 Panorama_visning.tif"
+    first.write_bytes(b"existing")
+    second = vis_panorama.view_path(src)
+    assert second.name == "612130000012_00001 Panorama_visning-2.tif"
+    assert second.parent == src.parent
+
+
+def test_sources_takes_files_and_direct_folder_children(tmp_path):
+    (tmp_path / "a.tif").write_bytes(b"x")
+    (tmp_path / "b.tiff").write_bytes(b"x")
+    (tmp_path / "c.jpg").write_bytes(b"x")          # not a panorama TIFF
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "nested.tif").write_bytes(b"x")           # never subfolders
+
+    from_folder = vis_panorama.sources([str(tmp_path)])
+    assert [p.name for p in from_folder] == ["a.tif", "b.tiff"]
+
+    single = vis_panorama.sources([str(tmp_path / "a.tif")])
+    assert [p.name for p in single] == ["a.tif"]
+
+
+def test_convert_writes_a_lossless_lzw_copy(tmp_path):
+    """Digital Color Meter on the copy must read the SOURCE's pixel values.
+    (Source uses deflate here - the local libvips lacks zstd write support -
+    but the conversion path is identical, and m4-studio's pyvips provably
+    reads the production zstd panoramas: the segmenter does.)"""
+    rng = np.random.RandomState(7)
+    a = rng.randint(0, 255, (64, 80), dtype=np.uint8)
+    src = tmp_path / "612130000012_00001 Panorama.tif"
+    pyvips.Image.new_from_memory(a.tobytes(), 80, 64, 1, 'uchar').write_to_file(
+        str(src), compression='deflate')
+
+    dst = vis_panorama.convert(src)
+
+    assert dst.name.endswith("_visning.tif") and dst.parent == tmp_path
+    out = pyvips.Image.new_from_file(str(dst))
+    b = np.ndarray(buffer=out.write_to_memory(), dtype=np.uint8, shape=[64, 80])
+    assert np.array_equal(a, b), "viewing copy must be lossless"
