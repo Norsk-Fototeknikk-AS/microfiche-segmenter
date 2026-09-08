@@ -341,10 +341,157 @@ def drop_band_detections(boxes, contours, band_ratio):
 # A row of the binary counts as "full width" above this foreground share.
 # Measured on the first real journal card (2026-09-04): structure rows (stripes,
 # header/bottom bands) run 0.86-1.0 coverage, rows holding separated pages ~0.2.
+# It stays 0.85 as the CANDIDATE threshold (steg 4A): a thin real stripe can
+# fall below a higher bar at its edges. What a candidate must then prove is
+# below.
 STRIPE_COVERAGE = 0.85
 
+# Stripe geometry, measured full-res on the 21505 px tall production card -
+# all 16 field cards in BOTH A/B modes 2026-09-08, plus the committed fasit.
+# Kept as ratios of image height so the same numbers hold at detect scale.
+# The jacket is constant: every card carries seven structure runs - a top
+# band, five stripes and a bottom band - on a per-card raster of pitch
+# 3360-3470. A row of 12 pages covers 84.6 % of the width, which is why a
+# coverage dip inside a row used to be deleted as "structure" (card 111
+# lost the bottom of row 2 that way; 036, 050, 098, 104 and 029 the same).
+STRIPE_REF_HEIGHT = 21505.0
+STRIPE_MIN_H = 80 / STRIPE_REF_HEIGHT        # real stripes 100-420 px; the
+                                             # false slivers 10-20 px
+STRIPE_MERGE_GAP = 60 / STRIPE_REF_HEIGHT    # card 074's stripe is cut in
+                                             # two 40 px apart; real stripes
+                                             # sit 3400 px apart
+STRIPE_RASTER_TOL = 150 / STRIPE_REF_HEIGHT  # false runs sit 400-600 px off
+STRIPE_SOLID_COVERAGE = 0.95                 # fasit stripes measure
+                                             # 0.99-1.00; a 12-page row 0.846
 
-def remove_structure_rows(binary_img, min_page_h, top_boundary):
+
+def coalesce_runs(runs, max_gap):
+    """Merge runs separated by at most max_gap. A stripe cut in two by noise
+    is one stripe (card 074: 6100-6110 + 6150-6400)."""
+    merged = []
+    for a, b in sorted(runs):
+        if merged and a - merged[-1][1] <= max_gap:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
+def fit_stripe_raster(centers, min_pitch, tol):
+    """(anchor, pitch) of the jacket's stripe raster, or None when there is
+    too little evidence to fit one. Fitted per card, not assumed: the first
+    stripe measures 5820-6370 across the field cards.
+
+    Scored on how COMPLETELY the raster is filled, then on how many
+    candidates it explains. Support alone is not enough - a dense cluster of
+    false runs inside one row (card 098 had eight) supports a finer pitch
+    that hits more candidates while leaving most of its own positions empty.
+    The jacket's stripes are periodic AND complete, so the raster that
+    fills every position between its first and last hit is the real one.
+    """
+    best = ((0.0, 0), None, None)
+    if len(centers) >= 3:
+        for anchor in centers:
+            for other in centers:
+                pitch = other - anchor
+                if pitch < min_pitch:
+                    continue
+                hits = [c for c in centers
+                        if min((c - anchor) % pitch,
+                               pitch - (c - anchor) % pitch) <= tol]
+                if len(hits) < 3:
+                    continue
+                first = round((min(hits) - anchor) / pitch)
+                last = round((max(hits) - anchor) / pitch)
+                positions = last - first + 1
+                score = (len(hits) / positions, len(hits))
+                if score > best[0]:
+                    best = (score, anchor, pitch)
+    return (best[1], best[2]) if best[0][1] >= 3 else None
+
+
+def classify_structure_runs(runs, coverages, height, min_page_h,
+                            top_boundary, report_scale=1.0):
+    """Which full-width runs are card structure (row boundaries), and why the
+    others are not.
+
+    A run is structure only if it is the top band (starts at or above the
+    header mask), the bottom band (reaches the image edge), or a stripe:
+    thick enough, solid enough, and sitting on the card's stripe raster.
+    Everything else is page content and must be left alone - deleting it is
+    what ate rows in the field.
+
+    Returns (structure_runs, rejected) with rejected as [(run, reason)].
+    Numbers in the reasons are multiplied by report_scale so the log speaks
+    full-res while the work happens at detect scale.
+    A raster position with no candidate is reported the same way as a
+    zero-length run, so a missing stripe is visible in the log; the slot
+    then spans two rows and the snap invariants still hold.
+    """
+    min_h = STRIPE_MIN_H * height
+    tol = STRIPE_RASTER_TOL * height
+    R = report_scale
+    structure, rejected, candidates = [], [], []
+    for run, cov in zip(runs, coverages):
+        a, b = run
+        thick = b - a
+        if a <= top_boundary:
+            structure.append(run)
+        elif b >= height:
+            structure.append(run)
+        elif thick >= min_page_h:
+            rejected.append((run, f"kept run {a * R:.0f}-{b * R:.0f}: "
+                                  f"{thick * R:.0f} px, coverage {cov:.2f} - "
+                                  "page-height (a merged page row, not a "
+                                  "stripe)"))
+        elif thick < min_h:
+            rejected.append((run, f"kept run {a * R:.0f}-{b * R:.0f}: "
+                                  f"{thick * R:.0f} px, coverage {cov:.2f} - "
+                                  f"too thin for a stripe (needs "
+                                  f"{min_h * R:.0f} px)"))
+        elif cov < STRIPE_SOLID_COVERAGE:
+            rejected.append((run, f"kept run {a * R:.0f}-{b * R:.0f}: "
+                                  f"{thick * R:.0f} px, coverage {cov:.2f} - "
+                                  "not solid enough (a stripe measures "
+                                  f"{STRIPE_SOLID_COVERAGE:.2f}+)"))
+        else:
+            candidates.append((run, cov))
+
+    centers = [(a + b) / 2 for (a, b), _ in candidates]
+    raster = fit_stripe_raster(centers, 2 * min_page_h, tol)
+    for (run, cov), c in zip(candidates, centers):
+        a, b = run
+        if raster is None:
+            structure.append(run)
+            continue
+        anchor, pitch = raster
+        d = (c - anchor) % pitch
+        off = min(d, pitch - d)
+        if off <= tol:
+            structure.append(run)
+        else:
+            rejected.append((run, f"kept run {a * R:.0f}-{b * R:.0f}: "
+                                  f"{(b - a) * R:.0f} px, coverage {cov:.2f} "
+                                  f"- off-raster by {off * R:.0f} px"))
+
+    if raster is not None and candidates:
+        anchor, pitch = raster
+        on = sorted(c for c in centers
+                    if min((c - anchor) % pitch,
+                           pitch - (c - anchor) % pitch) <= tol)
+        pos = anchor + round((on[0] - anchor) / pitch) * pitch
+        while pos <= on[-1] + tol:
+            if all(abs(c - pos) > tol for c in on):
+                rejected.append(((int(pos), int(pos)),
+                                 f"MISSING stripe at raster position "
+                                 f"{pos * R:.0f} - its slot spans two rows"))
+            pos += pitch
+
+    return sorted(structure), rejected
+
+
+def remove_structure_rows(binary_img, min_page_h, top_boundary,
+                          report_scale=1.0):
     """Delete full-width row-runs that cannot be pages, in place.
 
     The light journal jackets have dark edge-to-edge stripes between rows and
@@ -355,9 +502,12 @@ def remove_structure_rows(binary_img, min_page_h, top_boundary):
     row of pages is full-width too, but page-HEIGHT and floating mid-card, so
     it survives (and is handled by the merged-pages warning downstream).
 
-    Returns (number of runs deleted, [(y_start, y_end), ...] of those runs).
-    The runs are the card's row boundaries (steg 2, 2026-09-08): a page
-    never crosses a stripe, so snap_pages uses them as row slots.
+    Returns (number of runs deleted, [(y_start, y_end), ...] of those runs,
+    [(run, reason)] for every candidate NOT deleted). The deleted runs are
+    the card's row boundaries (steg 2, 2026-09-08): a page never crosses a
+    stripe, so snap_pages uses them as row slots. Which runs are structure
+    at all is decided by classify_structure_runs (steg 4A) - full width is
+    not enough, because a row of 12 pages is 84.6 % wide.
     """
     h, w = binary_img.shape
     coverage = (binary_img > 0).sum(axis=1) / w
@@ -374,25 +524,25 @@ def remove_structure_rows(binary_img, min_page_h, top_boundary):
         else:
             y += 1
 
-    # ...coalesced across tiny gaps: noise can make a band's coverage straddle
-    # the threshold row by row, shredding it into 1-row "stripes" that each
-    # fall under the height floor and shave real pages. Judged as one band, it
-    # is page-height and survives. Real stripes sit hundreds of rows apart.
-    merged = []
-    for run in runs:
-        if merged and run[0] - merged[-1][1] <= 2:
-            merged[-1][1] = run[1]
-        else:
-            merged.append(run)
+    # ...coalesced across gaps: noise can make a band's coverage straddle the
+    # threshold row by row, shredding it into 1-row "stripes"; and a real
+    # stripe can be cut in two (card 074, 40 px apart). Real stripes sit
+    # thousands of rows apart, so bridging STRIPE_MERGE_GAP is safe.
+    merged = coalesce_runs([tuple(r) for r in runs],
+                           max(1, int(round(STRIPE_MERGE_GAP * h))))
+    covs = [float(coverage[a:b].mean()) for a, b in merged]
 
-    removed = 0
-    runs = []
-    for start, end in merged:
-        if (end - start) < min_page_h or start <= top_boundary or end >= h:
-            binary_img[start:end, :] = 0
-            removed += 1
-            runs.append((int(start), int(end)))
-    return removed, runs
+    structure, rejected = classify_structure_runs(
+        merged, covs, h, min_page_h, top_boundary, report_scale)
+    by_run = dict(zip(merged, covs))
+    notes = [(run, f"stripe {run[0] * report_scale:.0f}-"
+                   f"{run[1] * report_scale:.0f}: "
+                   f"{(run[1] - run[0]) * report_scale:.0f} px, "
+                   f"coverage {by_run.get(run, 1.0):.2f}")
+             for run in structure] + rejected
+    for start, end in structure:
+        binary_img[start:end, :] = 0
+    return len(structure), [(int(a), int(b)) for a, b in structure], notes
 
 
 def clear_border_connected(binary_img):
@@ -421,7 +571,8 @@ def clear_border_connected(binary_img):
 
 
 def detect_page_boxes(binary_img, header_skip_px, min_w, min_h,
-                      collect_witnesses=False, structure_rows_out=None):
+                      collect_witnesses=False, structure_rows_out=None,
+                      report_scale=1.0):
     """The detect-scale pipeline: mask header, remove card structure, erode,
     drop border-connected foreground, find and size-filter contours.
 
@@ -439,10 +590,14 @@ def detect_page_boxes(binary_img, header_skip_px, min_w, min_h,
         binary_img[:header_skip_px, :] = 0
 
     min_page_h = max(1, min_h)
-    removed_rows, structure_runs = remove_structure_rows(
-        binary_img, min_page_h, header_skip_px)
+    removed_rows, structure_runs, structure_notes = remove_structure_rows(
+        binary_img, min_page_h, header_skip_px, report_scale)
     if structure_rows_out is not None:
         structure_rows_out.extend(structure_runs)
+    # Thickness and coverage for the stripes we kept AND the reason for every
+    # run we refused: the next A/B calibrates the thresholds against these.
+    for _run, text in structure_notes:
+        log_lines.append("  " + text)
     if removed_rows:
         log_lines.append(f"Removed {removed_rows} full-width structure "
                          "row-run(s) (stripes / edge bands)")
@@ -1893,7 +2048,8 @@ def main():
     boxes, filtered_contours, binary_img, det_log, small_witnesses = \
         detect_page_boxes(binary_img, header_skip_px_small, min_w, min_h,
                           collect_witnesses=True,
-                          structure_rows_out=structure_rows)
+                          structure_rows_out=structure_rows,
+                          report_scale=1 / detect_scale)
     for line in det_log:
         print(line)
     # The stripes are the row boundaries (steg 2): full-res in the report so

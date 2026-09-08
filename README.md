@@ -421,6 +421,53 @@ kind has no whole page left to anchor the expected height. The generous union
 band covers the measured fasit case (1.6×), but proportions beyond that
 escape the guard.
 
+### C18. Full width is not enough — a stripe must prove itself
+
+`remove_structure_rows` used to delete every full-width run thinner than a
+page. That ate pages. A row of 12 inverted pages covers
+12 × 2050 / 29071 = **84.6 %** of the width and `STRIPE_COVERAGE` is 0.85 —
+the knife edge. Wherever the coverage dipped inside a row (a light band,
+washed text) the row broke into runs each shorter than a page, and every one
+of them was deleted as "structure".
+
+Measured in the real A/B run (16 cards × both modes, 2026-09-08, code
+`7eda4ed`): card 111 standard deleted 7470–9450 — *exactly* the missing
+bottom of row 2, the geometry that steg 2's slot refusal had flagged. The
+same mechanism hit 036 (3310–4400 inside row 1), 050 (6440–6870), 098
+(6670–9240 and 10580–12660), 104 (3280–3540, 5700–5980) and 029 in
+background mode (10 px runs at 4820 and 5520, which also dragged the card
+onto a per-card page size of 2040×2400).
+
+**The jacket is constant.** All 32 card runs carry the same seven structure
+runs — a top band, five stripes, a bottom band — regardless of how many
+pages the card holds or which mode produced it. So a run is structure only
+if it is the top band (starts at or above the header mask), the bottom band
+(reaches the image edge), or passes all three stripe tests:
+
+| test | value | what it is measured against |
+|---|---|---|
+| thickness | ≥ `STRIPE_MIN_H` (80 px full-res) | real stripes are 100–420 px; the false slivers 10–20 px (029, 111, 050) |
+| solidity | ≥ `STRIPE_SOLID_COVERAGE` (0.95) | fasit stripes measure 0.99–1.00, a 12-page row 0.846 |
+| position | within `STRIPE_RASTER_TOL` (150 px) of the card's stripe raster | the thick false runs (104's 260 and 280 px, 050's 340 px) sit 400–600 px off |
+
+Thickness alone convicts nothing — **position is what convicts**. The raster
+is fitted **per card** (`fit_stripe_raster`), never assumed: the first stripe
+measures 5820–6370 across the field cards, the pitch 3360–3470. It is scored
+on how **completely** it is filled and only then on how many candidates it
+explains — a dense cluster of false runs inside one row (098 had eight)
+otherwise supports a finer pitch that hits more candidates while leaving most
+of its own positions empty.
+
+Runs are coalesced across `STRIPE_MERGE_GAP` (60 px full-res) first: card 074
+carries one stripe cut in two 40 px apart, while real stripes sit ~3400 px
+apart. A raster position with no candidate is logged as a MISSING stripe —
+its slot then spans two rows, and the C15 invariants still hold.
+
+Every run is logged either way, thickness and coverage included, so the next
+A/B calibrates against real numbers rather than against these first ones.
+Constants are defined in full-res px and stored as ratios of image height, so
+they hold at detect scale too.
+
 ---
 
 ## Running it
@@ -531,9 +578,11 @@ double-click B side (calls `RAPPORT.command` with `--background-first`).
    the border ring reads background either way (measured). Auto-inversion is
    announced loudly in the log and in the viz banner; `--invert` /
    `--no-invert` force it.
-3. **Remove card structure.** Full-width row-runs that are thinner than any
-   possible page or touch the image boundary / header mask are stripes and
-   edge bands — deleted (`remove_structure_rows`). Then erosion, then any
+3. **Remove card structure.** Full-width row-runs that are *proven* to be
+   card structure are deleted (`remove_structure_rows` →
+   `classify_structure_runs`, C18): the top band, the bottom band, and runs
+   that are thick enough, solid enough and sitting on the card's stripe
+   raster. Then erosion, then any
    remaining foreground *connected to the image border* is removed
    (`clear_border_connected`): the frame always reaches the border, pages
    never do. Validated against the real blank jacket, which must detect as

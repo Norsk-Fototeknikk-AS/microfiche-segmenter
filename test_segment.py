@@ -975,7 +975,7 @@ def test_removes_a_thin_full_width_stripe():
     b = _canvas()
     b[500:520, :] = 255           # 2% of height, edge to edge
     b[100:250, 300:500] = 255     # a page, for contrast
-    removed, _ = remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    removed, _, _ = remove_structure_rows(b, min_page_h=40, top_boundary=0)
     assert b[510, 1000] == 0
     assert b[150, 400] == 255
     assert removed > 0
@@ -1012,7 +1012,7 @@ def test_coverage_oscillating_at_the_threshold_is_not_shredded():
     b = _canvas()
     b[300:500, 0:1695] = 255                       # a page band at 84.75%
     b[300:500:2, 1695:1706] = 255                  # alternate rows: 85.3%
-    removed, _ = remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    removed, _, _ = remove_structure_rows(b, min_page_h=40, top_boundary=0)
     assert removed == 0
     assert (b[300:500, 0:1695] == 255).all()
 
@@ -1022,7 +1022,7 @@ def test_page_rows_are_never_touched():
     b = _canvas()
     for c in range(4):
         b[100:300, 100 + c * 500:400 + c * 500] = 255
-    removed, _ = remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    removed, _, _ = remove_structure_rows(b, min_page_h=40, top_boundary=0)
     assert removed == 0
     assert b[200, 200] == 255
 
@@ -2877,7 +2877,7 @@ def test_remove_structure_rows_returns_the_deleted_y_runs():
     b = _canvas()
     b[500:520, :] = 255           # a stripe
     b[100:250, 300:500] = 255     # a page
-    removed, runs = remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    removed, runs, _ = remove_structure_rows(b, min_page_h=40, top_boundary=0)
     assert removed == 1
     assert runs == [(500, 520)], runs
 
@@ -3018,3 +3018,177 @@ def test_witness_inside_the_raster_still_claims_its_page():
                                                 image_w=29071)
     assert len(snapped) == 16, len(snapped)
     assert (25860, 10170, 2040, 2760) in snapped, snapped
+
+
+
+# --- Steg 4A (2026-09-08): only real stripes are row boundaries -------------
+# Root cause, found in the real A/B (16 cards, both modes): a row of 12
+# inverted pages covers 12*2050/29071 = 84.6 % of the width and
+# STRIPE_COVERAGE is 0.85 - the knife edge. Where coverage dips inside a row
+# (light band, washed text) the row breaks into runs each shorter than a
+# page, and remove_structure_rows DELETED them as structure. Card 111
+# standard deleted 7470-9450: exactly the missing bottom of row 2. Same on
+# 036 (3310-4400 inside row 1), 050 (6440-6870), 098 (6670-9240,
+# 10580-12660), 104 (3280-3540, 5700-5980) and 029 background (10 px runs
+# at 4820 and 5520, which also dragged the card onto a per-card page size).
+#
+# The jacket is constant: every one of the 32 card runs holds the SAME
+# seven structure runs - a top band, five stripes and a bottom band - on a
+# per-card raster with pitch 3360-3470. Real stripes are 100-420 px thick
+# and measure coverage 0.99-1.00 on the committed fasit; a page row reaches
+# only 0.846. Thickness alone is not enough (104's 260 and 280 px false
+# runs, 050's 340 px): POSITION on the card's raster is what convicts them.
+
+from segment_microfiche import classify_structure_runs, coalesce_runs
+
+STRIPE_FASIT = REPO / "testdata" / "stripe_fasit_2026-09-08.txt"
+CARD_H, CARD_MIN_PAGE_H, CARD_HEADER = 21505, 430, 1720
+
+
+def _stripe_fasit():
+    """[(mode, card, runs)] from the committed field fasit (numbers only)."""
+    out = []
+    for line in STRIPE_FASIT.read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        head, runs = line.split("] ", 1)
+        mode, card = head.split()[0], head.split()[1]
+        out.append((mode, card,
+                    [tuple(int(v) for v in r.split("-"))
+                     for r in runs.split(", ")]))
+    return out
+
+
+def _classify_card(runs):
+    runs = coalesce_runs(runs, 60)          # 60 px full-res (074's cut stripe)
+    return classify_structure_runs(runs, [1.0] * len(runs), CARD_H,
+                                   CARD_MIN_PAGE_H, CARD_HEADER)
+
+
+def test_the_fasit_covers_all_32_field_runs():
+    fasit = _stripe_fasit()
+    assert len(fasit) == 32, len(fasit)
+    assert all(len(runs) >= 7 for _, _, runs in fasit)
+
+
+def test_every_field_card_classifies_to_exactly_seven_structure_runs():
+    """The jacket is constant: top band, five stripes, bottom band - no
+    matter how many pages the card holds or which mode produced it."""
+    for mode, card, runs in _stripe_fasit():
+        stripes, rejected = _classify_card(runs)
+        assert len(stripes) == 7, (mode, card, stripes, rejected)
+        gaps = [b[0] - a[0] for a, b in zip(stripes[1:-1], stripes[2:-1])]
+        assert all(3300 <= g <= 3600 for g in gaps), (mode, card, gaps)
+        assert all(why for _, why in rejected), (mode, card, rejected)
+
+
+def test_the_field_runs_that_ate_pages_are_all_rejected():
+    """The named casualties, card by card - each was page content."""
+    casualties = {
+        ("6-standard", "111"): (7570, 7780),
+        ("6-standard", "036"): (3310, 3730),
+        ("6-standard", "050"): (6440, 6780),
+        ("6-standard", "104"): (3280, 3540),
+        ("6-standard", "104b"): (5700, 5980),
+        ("6-standard", "098"): (7500, 7880),
+        ("7-bakgrunn", "029"): (4820, 4830),
+        ("7-bakgrunn", "050"): (2880, 2890),
+    }
+    by_card = {(m.split("-")[0] + "-" + m.split("-")[1], c): r
+               for m, c, r in _stripe_fasit()}
+    for (mode, card), run in casualties.items():
+        runs = by_card[(mode, card.rstrip("b"))]
+        stripes, rejected = _classify_card(runs)
+        assert run not in stripes, (mode, card, run, stripes)
+        assert any(r[0] <= run[0] and r[1] >= run[1] for r, _ in rejected), \
+            (mode, card, run, rejected)
+
+
+def test_a_cut_stripe_is_coalesced_into_one(nothing=None):
+    """Card 074, both modes: 6100-6110 and 6150-6400 are ONE stripe with a
+    40 px cut. Real stripes sit 3400 px apart, so a 60 px bridge is safe."""
+    assert coalesce_runs([(6100, 6110), (6150, 6400)], 60) == [(6100, 6400)]
+    assert coalesce_runs([(2460, 2730), (2880, 2890)], 60) == \
+        [(2460, 2730), (2880, 2890)], "150 px apart is two runs"
+
+
+def test_classify_rejects_a_run_that_is_not_solid_enough():
+    """A page row creeping over the run threshold is not a stripe: the fasit
+    measures real stripes at 0.99-1.00, a 12-page row at 0.846."""
+    runs = [(2810, 3050), (4000, 4300), (6250, 6510), (9680, 9960),
+            (13140, 13400), (16600, 16860), (20040, 20370), (20690, 21510)]
+    cov = [1.0, 0.88] + [1.0] * 6
+    stripes, rejected = classify_structure_runs(runs, cov, CARD_H,
+                                                CARD_MIN_PAGE_H, CARD_HEADER)
+    assert (4000, 4300) not in stripes, stripes
+    assert any("coverage" in why for r, why in rejected if r == (4000, 4300))
+
+
+def test_a_dip_inside_a_page_row_survives_detection():
+    """The 111 profile as a real binary: 12 pages of 2050 at pitch 2180
+    (84.6 %) with dark noise in every gap, cut by a light band - both halves
+    were deleted before 4A. Only the real stripes may go."""
+    h, w = 2151, 2907
+    b = np.zeros((h, w), np.uint8)
+    for k in range(6):
+        b[222 + k * 344:222 + k * 344 + 30, :] = 255        # real stripes
+    for row in range(2):
+        top = 262 + row * 344
+        for c in range(12):
+            x = 5 + c * 218
+            b[top:top + 278, x:x + 205] = 255                # pages
+            b[top:top + 278, x + 205:x + 218] = 255          # dirt in the gap
+    b[749:757, :] = 0                                        # the light cut
+    row2 = b[604:882, :].copy()
+
+    removed, runs, notes = remove_structure_rows(b, min_page_h=43,
+                                                 top_boundary=172)
+
+    assert removed == 6, (removed, runs)
+    assert (b[604:882, :] == row2).all(), "row 2 deleted as structure"
+    halves = [r for r, text in notes
+              if "kept run" in text and r[0] < r[1] <= 749 or
+              ("kept run" in text and 757 <= r[0] < r[1])]
+    assert len(halves) >= 2, ("both halves of the cut row must be reported "
+                              "as kept, not deleted", notes)
+    assert sum(1 for _r, text in notes if text.startswith("stripe")) == 6, notes
+
+
+def test_report_logs_rejected_runs_with_a_reason(tmp_path):
+    """Every run the classifier refuses is named in the log with why, so the
+    next A/B can calibrate against it."""
+    src = tmp_path / "612130000012_00016.jpg"
+    a = np.full((2151, 2907), 200, 'uint8')
+    for k in range(6):
+        a[222 + k * 344:222 + k * 344 + 30, :] = 40
+    for row in range(2):
+        top = 262 + row * 344
+        for c in range(12):
+            x = 5 + c * 218
+            a[top:top + 278, x:x + 205] = 60
+            a[top:top + 278, x + 205:x + 218] = 60
+    a[749:757, :] = 200
+    pyvips.Image.new_from_memory(a.tobytes(), 2907, 2151, 1,
+                                 'uchar').write_to_file(str(src))
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+
+    assert re.search(r"kept run \d+-\d+: .*(thin|coverage|off-raster|page)",
+                     proc.stdout), proc.stdout
+
+
+def test_the_healthy_standard_cards_keep_exactly_the_slots_they_had():
+    """Leader's check (e): the 11 cards that passed in standard mode have
+    seven runs and all of them are structure - their row slots are
+    unchanged by 4A, so no card can pick up a new refusal from it."""
+    checked = 0
+    for mode, card, runs in _stripe_fasit():
+        if mode != "6-standard" or card in ("036", "050", "098", "104", "111"):
+            continue
+        structure, rejected = _classify_card(runs)
+        assert structure == coalesce_runs(runs, 60), (card, structure, rejected)
+        assert not [r for r, why in rejected if "MISSING" not in why], \
+            (card, rejected)
+        checked += 1
+    assert checked == 11, checked
