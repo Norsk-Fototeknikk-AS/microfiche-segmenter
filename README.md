@@ -252,15 +252,36 @@ Known wart: failed scans go to `error/` *inside* the input folder, while the
 archive sits *beside* it. Those two should probably agree. Nobody has decided
 which way.
 
-### C14. Split pages fail the card, they are not merged
+### C14. Fragment chains: geometric completion first, exit 3 for the rest
 
-Production 2026-09-07: a light horizontal stitching seam in the panorama cuts
-pages in two detections — top ~1/3 and bottom ~2/3, same x-span, small gap.
-Extracting would archive half-pages as success with shifted page numbering,
-and content may be **missing** in the seam gap, so auto-merging the halves is
-wrong: the card fails loudly instead (exit 3, no `_done`, source to `error/`
-for re-stitching — merging could become phase 2 once real seamed cards have
-been inspected via `--anon-viz`).
+History: 2026-09-07 the guard BLOCKED every fragmented card (stitching seams,
+content possibly missing in the gap — merging would have been fabrication).
+2026-09-08 Trond flipped it: stitching is fixed and content is intact; the
+remaining defects are material (washed-out patches at jacket brightness,
+short documents, half-dark pages). The sheet size is known, so **geometry
+overrides the binary** (`complete_geometry`):
+
+- Grid-matching fragment chains are **merged** into their union box. Crops
+  are cut from the original graytone, so a washed-out patch keeps whatever
+  readable traces it has for OCR. A merge that would invent more than
+  `GEOMETRY_MAX_INVENTED_SHARE` (30 %) of the page area is refused — that is
+  fabrication, not repair. (Field calibration, 28 production groups: every
+  one tiled its union exactly, ~0 % invented.)
+- A lone **short detection** in a row with ≥2 full-height anchors is
+  extended to the row's top edge and median height (pages share their top
+  edge within a row; verified on the fasit). Worst case is empty film in
+  the crop, so extensions are exempt from the invented-cap.
+- Repaired pages are marked **blue** in both visualizations, counted in the
+  banner, and logged per page (`N pages geometry-completed`, with invented
+  share). Never silent repair.
+- The guard is NOT weakened: it re-runs on the repaired geometry, so
+  whatever still matches the fragment signature (refused merges included)
+  exits 3 as before. And if geometry had to repair more than
+  `GEOMETRY_MAX_REPAIR_SHARE` (50 %; field worst case 28 %) of the card's
+  pages, the card is genuinely sick — exit 3.
+
+Thresholds are calibrated against RAPPORT-2026-09-08-3 (13 production cards)
+and marked preliminary.
 
 The signature (`find_fragment_groups`): detections sharing an x-span
 (interval IoU ≥ 0.8) with vertical gaps ≤ 15 % of the expected page height

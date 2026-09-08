@@ -79,6 +79,26 @@ FRAGMENT_UNION_MIN = 0.8
 FRAGMENT_UNION_MAX = 1.8
 FRAGMENT_MARK_COLOR = (0, 165, 255)  # orange boxes in both visualizations
 
+# Phase 2, geometric completion (Trond, 2026-09-08): stitching is fixed and
+# content is INTACT, so grid-matching fragment chains are MERGED into one
+# page (crops are cut from the original graytone; a washed-out patch may
+# still hold readable traces for OCR) and lone short detections are extended
+# to their row's height. What does not reconcile with the grid still exits 3.
+# Field calibration (28 production groups, 13 cards): every group tiled its
+# union exactly (invented ~0); the worst card needed 28% of its pages
+# repaired - thresholds sit well above both with margin.
+GEOMETRY_MAX_INVENTED_SHARE = 0.3   # per MERGED page; extensions are exempt
+                                    # (empty film is harmless, fabricated
+                                    # content between fragments is not).
+                                    # The group criteria already bound
+                                    # invention near this - the cap is the
+                                    # backstop if they are ever loosened.
+GEOMETRY_MAX_REPAIR_SHARE = 0.5     # of the card's pages, else the card is
+                                    # genuinely sick
+GEOMETRY_SHORT_RATIO = 0.7          # below this share of row height = short
+GEOMETRY_FULL_RATIO = 0.8           # at least this share = a full anchor
+GEOMETRY_MARK_COLOR = (255, 80, 0)  # blue boxes for geometry-completed pages
+
 # A card is pages on visible card background, so foreground can never be
 # ~everything. Above this share the threshold split is meaningless (blank or
 # washed-out scan) and the run fails loudly instead of emitting one giant
@@ -644,6 +664,89 @@ def find_fragment_groups(boxes):
     return sorted(groups)
 
 
+def complete_geometry(boxes):
+    """Phase 2: let the known sheet size override a defective binary.
+
+    Fragment chains from find_fragment_groups (they already reconcile with
+    the expected page height) are merged into their union box; a merge is
+    refused when it would INVENT more than GEOMETRY_MAX_INVENTED_SHARE of
+    the page area - that is fabrication, not repair. Then lone short
+    detections in a row with at least two full-height anchors are extended
+    to the row's top edge and height (pages share their top edge within a
+    row; verified on the fasit card).
+
+    Returns (new_boxes, repaired_flags, notes, refused_groups). The caller
+    fails the card for refused groups and for over-repair - the guard is
+    not weakened, it just gets a repair step in front of it.
+    """
+    n = len(boxes)
+    if n < 2:
+        return list(boxes), [False] * n, [], []
+    exp_h = expected_page_height(boxes)
+
+    notes = []
+    refused = []
+    consumed = set()
+    merged = []
+    for g in find_fragment_groups(boxes):
+        parts = [boxes[i] for i in g]
+        x0 = min(b[0] for b in parts)
+        y0 = min(b[1] for b in parts)
+        x1 = max(b[0] + b[2] for b in parts)
+        y1 = max(b[1] + b[3] for b in parts)
+        union_area = (x1 - x0) * (y1 - y0)
+        covered = sum(b[2] * b[3] for b in parts)
+        invented = max(0.0, 1.0 - covered / union_area)
+        pages = "+".join(str(i + 1) for i in g)
+        if invented > GEOMETRY_MAX_INVENTED_SHARE:
+            refused.append(g)
+            notes.append(f"REFUSED merge of detections {pages}: "
+                         f"{invented:.0%} of the page would be invented")
+            continue
+        consumed.update(g)
+        merged.append((x0, y0, x1 - x0, y1 - y0))
+        notes.append(f"merged {len(g)} fragments (detections {pages}) into "
+                     f"one page at ({x0}, {y0}), {invented:.0%} invented")
+
+    contested = {i for g in refused for i in g}
+    entries = [[boxes[i], False, i in contested]
+               for i in range(n) if i not in consumed]
+    entries += [[b, True, False] for b in merged]
+
+    # Short-document extension, per row (same y-chaining as
+    # group_boxes_into_rows, kept on indices so the flags follow along).
+    all_boxes = [e[0] for e in entries]
+    order = sorted(range(len(entries)), key=lambda i: all_boxes[i][1])
+    tolerance = float(np.mean([b[3] for b in all_boxes])) * 0.5
+    rows = [[order[0]]]
+    for idx in order[1:]:
+        if abs(all_boxes[idx][1] - all_boxes[rows[-1][-1]][1]) < tolerance:
+            rows[-1].append(idx)
+        else:
+            rows.append([idx])
+    for row in rows:
+        anchors = [i for i in row
+                   if all_boxes[i][3] >= GEOMETRY_FULL_RATIO * exp_h]
+        if len(anchors) < 2:
+            continue
+        row_top = int(np.median([all_boxes[i][1] for i in anchors]))
+        row_h = int(np.median([all_boxes[i][3] for i in anchors]))
+        for i in row:
+            x, y, w, h = entries[i][0]
+            # Never extend a merged page, nor a fragment whose merge was
+            # REFUSED - that would quietly repair contested geometry.
+            if entries[i][1] or entries[i][2] or h >= GEOMETRY_SHORT_RATIO * row_h:
+                continue
+            invented = 1.0 - h / row_h
+            entries[i][0] = (x, row_top, w, row_h)
+            entries[i][1] = True
+            notes.append(f"extended short detection at ({x}, {y}) to row "
+                         f"height {row_h} ({invented:.0%} invented, "
+                         "empty film at worst)")
+
+    return ([e[0] for e in entries], [e[1] for e in entries], notes, refused)
+
+
 def make_anon_mask(shape, contours, dilate_radius):
     """Solid silhouettes of the detected blobs, strictly 0/255.
 
@@ -674,10 +777,11 @@ def _stamp_solid(img, color, draw):
 
 
 def render_anon_viz(mask, boxes_fullres, fullres_to_mask, label, banner_color,
-                    fragment_indices=frozenset()):
+                    fragment_indices=frozenset(), repaired_indices=frozenset()):
     """Annotate the silhouette mask with page boxes and the quality banner.
-    Boxes whose index is in fragment_indices are marked orange - they are one
-    half of a suspected split page.
+    Boxes whose index is in fragment_indices are marked orange (one part of
+    an irreconcilable suspected split page); repaired_indices are marked
+    blue (geometry-completed pages - merged fragments or extended shorts).
 
     Everything here must keep the two-level safety property: INTER_NEAREST for
     the resize and hard-thresholded stamps for all overlay drawing, so the
@@ -693,9 +797,16 @@ def render_anon_viz(mask, boxes_fullres, fullres_to_mask, label, banner_color,
                int(w * fullres_to_viz), int(h * fullres_to_viz))
               for (x, y, w, h) in boxes_fullres]
 
+    def category(i):
+        if i in fragment_indices:
+            return "fragment"
+        if i in repaired_indices:
+            return "repaired"
+        return "page"
+
     def draw_boxes(layer, wanted):
         for i, (sx, sy, sw, sh) in enumerate(scaled):
-            if (i in fragment_indices) == wanted:
+            if category(i) == wanted:
                 cv2.rectangle(layer, (sx, sy), (sx + sw, sy + sh), 255, 2)
 
     def draw_numbers(layer):
@@ -703,8 +814,11 @@ def render_anon_viz(mask, boxes_fullres, fullres_to_mask, label, banner_color,
             cv2.putText(layer, str(i), (sx + 5, sy + 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 2)
 
-    _stamp_solid(viz, (0, 255, 0), lambda layer: draw_boxes(layer, False))
-    _stamp_solid(viz, FRAGMENT_MARK_COLOR, lambda layer: draw_boxes(layer, True))
+    _stamp_solid(viz, (0, 255, 0), lambda layer: draw_boxes(layer, "page"))
+    _stamp_solid(viz, FRAGMENT_MARK_COLOR,
+                 lambda layer: draw_boxes(layer, "fragment"))
+    _stamp_solid(viz, GEOMETRY_MARK_COLOR,
+                 lambda layer: draw_boxes(layer, "repaired"))
     _stamp_solid(viz, (0, 0, 255), draw_numbers)
 
     banner_h = 32
@@ -1417,21 +1531,49 @@ def main():
 
         boxes_fullres = refined
 
-    # Fragment guard: pages cut horizontally in two by a light stitching seam
-    # in the panorama (bad input, seen in production 2026-09-07). Content may
-    # be MISSING in the gap, so merging them back is wrong - the card fails
-    # loudly further down, after the visualizations are written with the
-    # suspect pairs marked.
+    # Phase 2, geometric completion (2026-09-07 the guard BLOCKED these
+    # cards; 2026-09-08 Trond flipped it: stitching is fixed, content is
+    # intact, so grid-matching chains are repaired - merged or extended -
+    # and only irreconcilable geometry still fails).
+    boxes_fullres, geo_flags, geo_notes, refused_groups = \
+        complete_geometry(boxes_fullres)
+    repaired_count = sum(geo_flags)
+    if geo_notes:
+        print(f"\n{repaired_count} pages geometry-completed:")
+        for note in geo_notes:
+            print(f"  {note}")
+        # Repair changed boxes and counts: re-sort with the flags riding
+        # along (row grouping only reads elements 0/1/3, so the flag can sit
+        # at index 4), then rescore - the score must describe what ships.
+        tagged = sort_boxes_by_rows(
+            [b + (f,) for b, f in zip(boxes_fullres, geo_flags)])
+        boxes_fullres = [t[:4] for t in tagged]
+        geo_flags = [t[4] for t in tagged]
+        quality = compute_card_quality(boxes_fullres, None)
+    geo_indices = {i for i, f in enumerate(geo_flags) if f}
+
+    # Fragment guard on the REPAIRED geometry: whatever still matches the
+    # fragment signature could not be reconciled (refused merges re-detect
+    # here). The guard is unchanged - it just runs after the repair step.
     fragment_groups = find_fragment_groups(boxes_fullres)
     fragment_indices = {i for group in fragment_groups for i in group}
     if fragment_groups:
         print(f"\nERROR: {len(fragment_groups)} suspected page fragment "
-              "group(s) - a page cut horizontally into stacked detections:",
-              file=sys.stderr)
+              "group(s) - stacked detections that do not reconcile with "
+              "the page grid:", file=sys.stderr)
         for group in fragment_groups:
             pages = "+".join(str(i + 1) for i in group)
             coords = ", ".join(str(boxes_fullres[i]) for i in group)
             print(f"  pages {pages}: {coords}", file=sys.stderr)
+
+    # Card-level sanity: when geometry has to save more than half the card,
+    # the card is genuinely sick - repair must not become silent success.
+    geo_overload = repaired_count > GEOMETRY_MAX_REPAIR_SHARE * len(boxes_fullres)
+    if geo_overload:
+        print(f"\nERROR: geometry had to repair {repaired_count} of "
+              f"{len(boxes_fullres)} pages "
+              f"(limit {GEOMETRY_MAX_REPAIR_SHARE:.0%}) - card is sick, "
+              "not repairable", file=sys.stderr)
 
     # Output coordinates
     print("\n=== PAGE COORDINATES (full resolution) ===")
@@ -1478,8 +1620,12 @@ def main():
     for i, (x, y, w, h) in enumerate(boxes_fullres, 1):
         sx, sy = int(x * fullres_to_viz), int(y * fullres_to_viz)
         sw, sh = int(w * fullres_to_viz), int(h * fullres_to_viz)
-        box_color = (FRAGMENT_MARK_COLOR if (i - 1) in fragment_indices
-                     else (0, 255, 0))
+        if (i - 1) in fragment_indices:
+            box_color = FRAGMENT_MARK_COLOR
+        elif (i - 1) in geo_indices:
+            box_color = GEOMETRY_MARK_COLOR
+        else:
+            box_color = (0, 255, 0)
         cv2.rectangle(viz, (sx, sy), (sx + sw, sy + sh), box_color, 2)
         cv2.putText(viz, str(i), (sx + 5, sy + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
@@ -1498,7 +1644,9 @@ def main():
         label += "  |  inverted" + ("" if args.invert else " (auto)")
     if illum_note:
         label += f"  |  {illum_note}"
-    if fragment_groups:
+    if repaired_count:
+        label += f"  |  {repaired_count} geometry-completed"
+    if fragment_groups or geo_overload:
         label = f"SUSPECT FRAGMENTS ({len(fragment_groups)} group(s))  |  " + label
         banner_color = (0, 0, 200)
     cv2.putText(banner, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, banner_color, 2)
@@ -1516,16 +1664,17 @@ def main():
                                    detect_radius)
         anon_viz = render_anon_viz(anon_mask, boxes_fullres, detect_scale,
                                    label, banner_color,
-                                   fragment_indices=fragment_indices)
+                                   fragment_indices=fragment_indices,
+                                   repaired_indices=geo_indices)
         anon_path = debug_dir / "anon_viz.jpg"
         cv2.imwrite(str(anon_path), anon_viz)
         print(f"Saved {anon_path} (anonymized)")
 
-    # Fragment guard verdict, after both visualizations exist with the pairs
-    # marked. Extracting would archive half-pages as success with shifted
-    # numbering; the cause is bad input (stitching seam), so the card goes to
-    # error/ for re-stitching, like the no-pages failure.
-    if fragment_groups:
+    # Guard verdict, after both visualizations exist with the suspects
+    # marked: irreconcilable chains, or a card geometry had to repair more
+    # of than the limit. The source goes to error/ for review, like the
+    # no-pages failure.
+    if fragment_groups or geo_overload:
         print(f"\nERROR: suspected split pages in {input_file} - "
               "not extracting.", file=sys.stderr)
         print("  No _done sentinel written — this card will not be offered "

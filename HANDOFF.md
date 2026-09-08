@@ -361,9 +361,27 @@ venv reads the production zstd files - proven by the segmenter reading them
 - even though the LOCAL libvips here lacks zstd write support (why the test
 uses a deflate source).
 
+### Phase 2: geometric completion (2026-09-08, evening)
+
+The guard's exit 3 flipped to a repair step for everything that reconciles
+with the page grid - Trond's call, grounded in field data (28 production
+groups: all x-IoU 1.0, gap 0, union ~2790-2800 = one page height, so every
+one resolves by sheet size). `complete_geometry` merges grid-matching
+chains (union box; refuse over 30% invented area - the group criteria
+already bound invention near that, the cap is a backstop) and extends lone
+short detections to their row's anchors (>=2 full neighbours; top-edge
+anchored - pages share tops within a row). Repaired pages: blue in both
+viz, counted in banner, logged with invented share. Guard re-runs AFTER
+repair - refused merges re-detect and still exit 3, and repairing more
+than 50% of a card exits 3 (field worst: 28%, card 612130000135 with 34
+detections/7 groups - now a unit-test fixture). Refused fragments are also
+excluded from extension: contested geometry must not be quietly repaired
+by the other mechanism. Contract change: seamed-card e2e tests flipped
+from exit-3 to completed-with-blue.
+
 ### Tests
 
-124 tests, ~19 s (was 32 when this was written). Unit tests for box
+132 tests, ~19 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 

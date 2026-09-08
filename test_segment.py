@@ -1444,9 +1444,9 @@ def test_real_card_with_synthetic_seam_flags_a_fragment_pair():
     assert find_fragment_groups(boxes) == [(0, 1)]
 
 
-def make_seamed_card(path, seams=1):
-    """A 4x3 card where light seams cut every page of the middle row - the
-    failed-stitching input seen in production (1 seam = 1/3+2/3 pairs,
+def make_seamed_card(path, seams=1, seam_rows=(1,)):
+    """A 4x3 card where light seams cut every page of the given rows - the
+    defective input seen in production (1 seam = 1/3+2/3 pairs,
     2 seams = stacks of three).
 
     Proportions matter: pages must be tall enough that a 1/3 fragment
@@ -1459,28 +1459,29 @@ def make_seamed_card(path, seams=1):
             y = 350 + r * 900
             x = 60 + c * 480
             a[y:y + 700, x:x + 400] = 255
-    for k in range(1, seams + 1):
-        seam_y = 350 + 900 + (700 * k) // (seams + 1)
-        a[seam_y:seam_y + 30, :] = 0
+    for r in seam_rows:
+        for k in range(1, seams + 1):
+            seam_y = 350 + r * 900 + (700 * k) // (seams + 1)
+            a[seam_y:seam_y + 30, :] = 0
     pyvips.Image.new_from_memory(a.tobytes(), 2000, 3000, 1, 'uchar').write_to_file(str(path))
 
 
-def test_seamed_card_fails_loudly_with_exit_3(tmp_path):
-    """Half-pages must never archive as success: no _done, source to error/,
-    own exit code so the app can tell it from no-pages."""
+def test_seamed_card_is_geometry_completed(tmp_path):
+    """Phase 2 contract flip (Trond, 2026-09-08): content is intact, so
+    grid-matching fragment pairs MERGE into whole pages instead of exit 3.
+    The card completes with the merged pages marked and counted."""
     panoramas = tmp_path / "Panoramas"
     panoramas.mkdir()
     src = panoramas / "612130000012_00016.jpg"
     make_seamed_card(src)
     out = tmp_path / "card"
 
-    proc = run_segmenter("-i", str(src), "-O", str(out))
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--no-archive")
 
-    assert proc.returncode == EXIT_SUSPECT_FRAGMENTS, proc.stdout + proc.stderr
-    assert not (out / DONE_SENTINEL).exists(), "_done written for a seamed card"
-    assert "fragment" in (proc.stdout + proc.stderr).lower()
-    assert (panoramas / "error" / src.name).exists(), "not moved to error/"
-    assert not (tmp_path / ARCHIVE_DIR_NAME).exists(), "seamed card was archived"
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (out / DONE_SENTINEL).exists()
+    assert "4 pages geometry-completed" in proc.stdout, proc.stdout
+    assert len(real_pages(out)) == 12, "4 merged + 8 whole pages"
 
 
 def test_whole_card_still_passes_the_fragment_guard(tmp_path):
@@ -1668,18 +1669,61 @@ def test_fragment_groups_ignores_whole_pages_in_adjacent_rows_too():
     assert find_fragment_groups(boxes) == []
 
 
-def test_triple_seamed_card_fails_loudly_end_to_end(tmp_path):
-    """The exact production miss: two seams per page in one row - exit 3."""
+def test_triple_seamed_card_is_geometry_completed(tmp_path):
+    """Stacks of three merge just like pairs."""
     panoramas = tmp_path / "Panoramas"
     panoramas.mkdir()
     src = panoramas / "612130000111_00012.jpg"
     make_seamed_card(src, seams=2)
     out = tmp_path / "card"
 
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--no-archive")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "4 pages geometry-completed" in proc.stdout, proc.stdout
+    assert len(real_pages(out)) == 12
+
+
+def test_card_needing_too_much_repair_still_fails(tmp_path):
+    """Two of three rows seamed: geometry would have to save 8 of 12 pages.
+    A card THAT sick is not repaired into silent success - exit 3 stands.
+    (Threshold is preliminary; field worst case so far is 28%.)"""
+    panoramas = tmp_path / "Panoramas"
+    panoramas.mkdir()
+    src = panoramas / "612130000012_00016.jpg"
+    make_seamed_card(src, seam_rows=(1, 2))
+    out = tmp_path / "card"
+
     proc = run_segmenter("-i", str(src), "-O", str(out))
 
     assert proc.returncode == EXIT_SUSPECT_FRAGMENTS, proc.stdout + proc.stderr
     assert not (out / DONE_SENTINEL).exists()
+    assert "geometry" in (proc.stdout + proc.stderr).lower()
+    assert (panoramas / "error" / src.name).exists(), "not moved to error/"
+
+
+def test_short_document_is_extended_end_to_end(tmp_path):
+    """A short document in a full row gets the full sheet and the card
+    completes - no guard trip, visible in the log."""
+    src = tmp_path / "612130000012_00016.jpg"
+    a = np.zeros((3000, 2000), 'uint8')
+    for r in range(3):
+        for c in range(4):
+            y = 350 + r * 900
+            x = 60 + c * 480
+            h = 300 if (r, c) == (1, 1) else 700   # one short document
+            a[y:y + h, x:x + 400] = 255
+    pyvips.Image.new_from_memory(a.tobytes(), 2000, 3000, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "1 pages geometry-completed" in proc.stdout, proc.stdout
+    rows_csv = (out / "page_coordinates.csv").read_text().splitlines()[2:]
+    heights = sorted({int(r.split(",")[4]) for r in rows_csv})
+    assert max(heights) - min(heights) <= 130, \
+        f"short page not extended to row height: {heights}"
 
 
 # --- Illumination-robust thresholding --------------------------------------
@@ -1861,3 +1905,127 @@ def test_convert_writes_a_lossless_lzw_copy(tmp_path):
     out = pyvips.Image.new_from_file(str(dst))
     b = np.ndarray(buffer=out.write_to_memory(), dtype=np.uint8, shape=[64, 80])
     assert np.array_equal(a, b), "viewing copy must be lossless"
+
+
+# --- Phase 2: geometric completion ------------------------------------------
+# Decided by Trond 2026-09-08: stitching is fixed, content is INTACT - the
+# remaining defects are material (washed-out patches at jacket brightness,
+# short documents, half-dark pages). The sheet size is known, so geometry
+# overrides the binary: grid-matching fragment chains are MERGED into one
+# page box (crops are cut from the original graytone anyway), lone short
+# detections are extended to their row's height. What does not reconcile
+# with the grid still exits 3 - the guard gets a repair step, not a
+# weakening. Field verdict from 28 production groups: every one resolves
+# by sheet size (x-IoU 1.0, gap 0, union ~page height).
+
+from segment_microfiche import (GEOMETRY_MAX_INVENTED_SHARE,
+                                GEOMETRY_MAX_REPAIR_SHARE, complete_geometry)
+
+
+def test_geometry_merges_a_fragment_chain_into_one_page():
+    boxes = _whole_page_row() + [
+        (2000, 100, 400, 180),
+        (2000, 295, 400, 190),
+        (2000, 500, 400, 180),
+    ]
+    new, flags, notes, refused = complete_geometry(boxes)
+
+    assert refused == []
+    assert len(new) == 5
+    repaired = [b for b, f in zip(new, flags) if f]
+    assert repaired == [(2000, 100, 400, 580)]
+    assert any("merged 3 fragments" in n for n in notes)
+
+
+def test_geometry_refuses_a_merge_that_invents_too_much():
+    """A chain at the very edge of the group criteria - maximal gaps AND
+    maximal x offsets - would invent over a third of the 'page'. That is
+    fabrication, not repair."""
+    boxes = _whole_page_row() + [
+        (2000, 100, 360, 120),
+        (2040, 300, 360, 120),
+        (2000, 500, 360, 140),
+    ]
+    new, flags, notes, refused = complete_geometry(boxes)
+
+    assert refused == [(4, 5, 6)]
+    assert not any(flags), "refused fragments must not be marked repaired"
+    assert len(new) == 7
+    assert any("REFUSED" in n for n in notes)
+
+
+def test_geometry_extends_a_short_document_to_row_height():
+    """A short document in a full row gets the full sheet: worst case is a
+    little empty film in the crop."""
+    boxes = [(0, 100, 400, 600), (500, 100, 400, 600),
+             (1000, 105, 400, 250),   # short document
+             (1500, 100, 400, 600)]
+    new, flags, notes, refused = complete_geometry(boxes)
+
+    assert refused == []
+    extended = [b for b, f in zip(new, flags) if f]
+    assert extended == [(1000, 100, 400, 600)]
+    assert any("extended short detection" in n for n in notes)
+
+
+def test_geometry_leaves_a_short_box_without_full_neighbours_alone():
+    """No row anchor - nothing to extend toward. The guard downstream still
+    sees the true geometry."""
+    boxes = [(0, 100, 400, 250), (500, 105, 400, 260)]
+    new, flags, _, _ = complete_geometry(boxes)
+    assert new == boxes
+    assert not any(flags)
+
+
+def test_geometry_handles_the_worst_field_card():
+    """Card 612130000135 from production 2026-09-08 (34 detections, 7 groups,
+    half-dark pages, strip fragments): all seven in-band chains merge, none
+    refused, and the repair share stays under the card threshold."""
+    boxes = [
+        (1920, 3790, 880, 2210), (4220, 4070, 800, 1900),
+        (10640, 3870, 810, 2020), (17150, 3950, 1240, 1860),
+        (19330, 4210, 1000, 1580), (19510, 3480, 730, 850),
+        (21490, 4260, 1350, 1500), (25860, 4610, 1950, 1100),
+        (2010, 6710, 1870, 435), (2010, 7145, 1870, 1485),
+        (4190, 6680, 1350, 2760), (5540, 6680, 720, 2760),
+        (6370, 6650, 1950, 1875), (8560, 6630, 2040, 1875),
+        (10720, 6590, 1830, 1880), (12900, 6540, 2040, 2790),
+        (15080, 7090, 1280, 1745), (17260, 6950, 2020, 2330),
+        (19420, 6470, 1700, 510), (19420, 6980, 1700, 1345),
+        (23790, 6940, 1300, 1470), (25970, 7100, 1730, 2050),
+        (2010, 8630, 1870, 830), (6370, 8525, 1950, 885),
+        (8560, 8505, 2040, 885), (10720, 8470, 1830, 890),
+        (15080, 8835, 1280, 465), (19420, 8325, 1700, 925),
+        (21990, 8330, 890, 870), (23790, 8410, 1300, 770),
+        (19260, 10170, 1680, 455), (19260, 10625, 1680, 2075),
+        (21440, 11950, 1380, 730), (24110, 11950, 1140, 700),
+    ]
+    new, flags, notes, refused = complete_geometry(boxes)
+
+    assert refused == []
+    repaired = sum(flags)
+    assert repaired >= 7, notes
+    assert repaired <= GEOMETRY_MAX_REPAIR_SHARE * len(new), \
+        "the worst real card must still pass the card threshold"
+    merged_heights = [b[3] for b, f in zip(new, flags) if f]
+    for h in merged_heights:
+        assert h <= 3000, f"a repaired page taller than any real page: {h}"
+
+
+def test_anon_viz_marks_repaired_pages_in_blue_and_stays_clean():
+    from segment_microfiche import GEOMETRY_MARK_COLOR
+    mask = np.zeros((500, 800), np.uint8)
+    mask[100:400, 100:700] = 255
+    boxes = [(1000, 1000, 3000, 3400), (5000, 1000, 3000, 3400)]
+
+    viz = render_anon_viz(mask, boxes, fullres_to_mask=0.1,
+                          label="1 geometry-completed",
+                          banner_color=(0, 180, 0),
+                          repaired_indices={1})
+
+    colors = {tuple(c) for c in np.unique(viz.reshape(-1, 3), axis=0)}
+    allowed = {(0, 0, 0), (255, 255, 255), (0, 255, 0), (0, 0, 255),
+               (30, 30, 30), (0, 180, 0), GEOMETRY_MARK_COLOR}
+    assert colors <= allowed, f"unexpected midtones leaked: {colors - allowed}"
+    assert GEOMETRY_MARK_COLOR in colors, "repaired page not marked in blue"
+    assert (0, 255, 0) in colors
