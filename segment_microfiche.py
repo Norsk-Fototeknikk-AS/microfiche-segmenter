@@ -2806,16 +2806,25 @@ def main(otsu_override=None, step2=False, step1_border=None):
     # Per-cell evidence (steg 8A): measurement only, nothing decides on it.
     # One machine-readable line per cell, empty cells included, so the
     # calibration in 8B can be scripted straight off the report folders.
-    cell_pw, cell_ph, _ = resolve_page_size(boxes_fullres)
-    for cell in card_cells(boxes_fullres, cell_pw, cell_ph, original_width):
-        local = illumination_local_threshold(
-            otsu_thresh, illum_field, illum_norm,
-            (cell["x"], cell["y"], cell_pw, cell_ph),
-            original_width, original_height)
-        fg, edge = cell_evidence(gray_small, cell, cell_pw, cell_ph,
-                                 detect_scale, local, dark_pages=do_invert)
-        print(f"CELL row={cell['row']} x={cell['x']} y={cell['y']} "
-              f"page={cell['page']} fg={fg:.3f} edge={edge:.3f}")
+    # ...and because it decides nothing, it must not be able to decide
+    # anything by crashing either: a measurement that fails takes the card
+    # down with it otherwise.
+    try:
+        cell_pw, cell_ph, _ = resolve_page_size(boxes_fullres)
+        for cell in card_cells(boxes_fullres, cell_pw, cell_ph,
+                               original_width):
+            local = illumination_local_threshold(
+                otsu_thresh, illum_field, illum_norm,
+                (cell["x"], cell["y"], cell_pw, cell_ph),
+                original_width, original_height)
+            fg, edge = cell_evidence(gray_small, cell, cell_pw, cell_ph,
+                                     detect_scale, local,
+                                     dark_pages=do_invert)
+            print(f"CELL row={cell['row']} x={cell['x']} y={cell['y']} "
+                  f"page={cell['page']} fg={fg:.3f} edge={edge:.3f}")
+    except Exception as exc:                       # measurement only - never
+        print(f"CELL measurement failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)                     # ...a reason to fail
 
     # Coverage guard: did the boxes cover what the threshold saw? The one
     # signal that survives any upstream mistake (row-banding collapse put a

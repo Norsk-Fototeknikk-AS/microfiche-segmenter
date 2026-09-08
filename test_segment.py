@@ -4174,3 +4174,33 @@ def test_cell_evidence_follows_the_cards_polarity(tmp_path):
            for l in proc.stdout.splitlines()) if m and m.group(1) == "1"]
     assert fg, proc.stdout
     assert min(fg) > 0.5, (fg, "pages must measure as foreground")
+
+
+def test_a_failing_cell_measurement_cannot_fail_the_card(tmp_path,
+                                                         monkeypatch, capsys):
+    """C22: the per-cell evidence decides nothing, so it must never be able
+    to decide anything by crashing either. Same exit code, same coordinates,
+    one line on stderr."""
+    import segment_microfiche as seg
+    src = tmp_path / "612130000012_00012.jpg"
+    make_card(src)
+    out_a, out_b = tmp_path / "a", tmp_path / "b"
+
+    monkeypatch.setattr(sys, "argv", ["seg", "-i", str(src), "-O",
+                                      str(out_a), "--skip-extraction"])
+    rc_ok = seg.main()
+    coords_ok = (out_a / "page_coordinates.csv").read_text()
+
+    def boom(*a, **k):
+        raise RuntimeError("measurement exploded")
+
+    monkeypatch.setattr(seg, "card_cells", boom)
+    monkeypatch.setattr(sys, "argv", ["seg", "-i", str(src), "-O",
+                                      str(out_b), "--skip-extraction"])
+    rc_broken = seg.main()
+    err = capsys.readouterr().err
+
+    assert rc_broken == rc_ok == 0, (rc_broken, rc_ok)
+    assert (out_b / "page_coordinates.csv").read_text() == coords_ok
+    assert "CELL measurement failed" in err, err
+    assert "RuntimeError" in err, err
