@@ -139,7 +139,7 @@ ILLUM_FIELD_FLOOR = 0.4        # of field max: the dark surround around the
 # fasit vs 2.1 mottled). Measured: clean fasit cards 0.15-0.19%, the fasit
 # with a synthetic blotch over the pages 0.93% - warn between, with margin
 # both ways.
-ILLUM_WARN_SHARE = 0.005
+ILLUM_WARN_SHARE = 0.03
 
 # Background-first binarization (--background-first, 2026-09-09, flagged
 # until A/B-validated in production): the jacket is the only STABLE class -
@@ -1079,6 +1079,26 @@ COVERAGE_WARN_SHARE = 0.15      # of total foreground mass
 WITNESS_MIN_AREA_SHARE = 0.005  # of the page area
 
 
+def can_hold_two_pages(box, page_w, page_h):
+    """Could this detection contain more than one page? Two pages side by
+    side span ~2.1 page widths (field pitch 2180 against a 2050 page), so a
+    box within SNAP_IMPOSSIBLE_RATIO of a single page holds exactly one -
+    and splitting it can only cut that page into pieces. Card 098 split
+    sixteen single pages into 2-4 fragments each, because the split pass
+    judged them against the MEDIAN of a box list its own fragments
+    dominated. The page size is a format constant (C15); use it."""
+    return (box[2] > SNAP_IMPOSSIBLE_RATIO * page_w
+            or box[3] > SNAP_IMPOSSIBLE_RATIO * page_h)
+
+
+def suspected_merged_boxes(boxes, page_w, page_h):
+    """[(box, how many pages it looks like)] for boxes that still look fused
+    after the split pass. Measured against the page size for the same reason
+    as above: card 098 reported 38 normal pages as '~2 fused'."""
+    return [(b, max(round(b[2] / page_w), round(b[3] / page_h)))
+            for b in boxes if can_hold_two_pages(b, page_w, page_h)]
+
+
 def foreground_outside_boxes(binary_img, boxes):
     """Share of the binary's foreground mass not covered by any box
     (detect-scale boxes). The operator-facing 'did the boxes cover what the
@@ -2004,12 +2024,20 @@ def main():
     illum_field, illum_norm, otsu_thresh, reclassified = illumination_plan(thumb)
     print(f"Otsu threshold: {otsu_thresh:.0f} (illumination-flattened; "
           f"flattening re-classified {reclassified:.1%} of thumbnail pixels)")
+    # The measurement goes in the log on EVERY run (steg 5B): it is how the
+    # drift is followed across report folders, and it is what re-calibrated
+    # this threshold in the first place. Only an outlier is a warning -
+    # 0.8-1.9 % is the normal range for these panoramas (16 field cards,
+    # both modes), so warning below that was noise on 100 % of cards.
+    print(f"Illumination re-classified {reclassified:.1%} of the thumbnail "
+          f"(warns above {ILLUM_WARN_SHARE:.0%})")
     illum_note = None
     if reclassified > ILLUM_WARN_SHARE:
         illum_note = f"UNEVEN ILLUMINATION ({reclassified:.0%} re-classified)"
         print(f"WARNING: uneven illumination - flattening re-classified "
-              f"{reclassified:.1%} of pixels (mottled panorama). Detection "
-              "compensates; the source may want re-stitching review.")
+              f"{reclassified:.1%} of pixels, above the {ILLUM_WARN_SHARE:.0%} "
+              "outlier threshold (mottled panorama). Detection compensates; "
+              "the source may want re-stitching review.")
 
     # A (nearly) uniform surface gives Otsu threshold 0, which makes the ENTIRE
     # image foreground and the whole card come back as one giant "page" -
@@ -2234,10 +2262,24 @@ def main():
             return split_box_by_projection(
                 input_file, box, local_thresh, do_invert, min_w_full, min_h_full)
 
-        pieces = [None] * len(boxes_fullres)
+        # Only boxes that could actually hold two pages are scanned: the
+        # rest are single pages, and a valley inside one is washed content,
+        # not a gutter (steg 5B). The basis is the FORMAT size, never the
+        # median of a box list the fragments dominate - that median is what
+        # made card 098 split sixteen single pages. resolve_page_size takes
+        # the prior whenever any detection matches it (a whole page always
+        # does), so a fragment-heavy card cannot shrink the gate; only a
+        # card with no format-sized detection at all falls to the per-card
+        # estimate, and then there is no constant to lean on. Say which.
+        split_w, split_h, split_basis = resolve_page_size(boxes_fullres)
+        if split_basis and split_basis.startswith("Page-size prior"):
+            print(f"Split gate on per-card estimate {split_w} x {split_h} "
+                  "(no detection matches the format prior)")
+        pieces = [[b] for b in boxes_fullres]
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(_split_one, b): i
-                       for i, b in enumerate(boxes_fullres)}
+                       for i, b in enumerate(boxes_fullres)
+                       if can_hold_two_pages(b, split_w, split_h)}
             for future in as_completed(futures):
                 pieces[futures[future]] = future.result()
 
@@ -2256,30 +2298,17 @@ def main():
     # dropping loses content - but the operator must see it in the log, not
     # just as a wide box in the viz.
     if len(boxes_fullres) >= 4:
-        med_w = np.median([b[2] for b in boxes_fullres])
-        med_h = np.median([b[3] for b in boxes_fullres])
-        for (x, y, w, h) in boxes_fullres:
-            if w > med_w * 1.5 or h > med_h * 1.5:
-                print(f"WARNING: suspected merged pages "
-                      f"(~{max(round(w / med_w), round(h / med_h))} fused): "
-                      f"at ({x}, {y}) size {w} x {h} full-res")
+        warn_w, warn_h, _ = resolve_page_size(boxes_fullres)   # format, not median
+        for (x, y, w, h), fused in suspected_merged_boxes(boxes_fullres,
+                                                          warn_w, warn_h):
+            print(f"WARNING: suspected merged pages (~{fused} fused): "
+                  f"at ({x}, {y}) size {w} x {h} full-res")
 
     # === Compute card quality score ===
     # After a split the detect-scale contours no longer correspond to the
     # boxes; the shape component then falls back to neutral.
     quality = compute_card_quality(
         boxes_fullres, filtered_contours if split_count == 0 else None)
-
-    # Validate against the physical card: more rows or more pages per row
-    # than any real card holds is a misdetection signal in itself.
-    layout_rows = group_boxes_into_rows(boxes_fullres)
-    if len(layout_rows) > MAX_ROWS:
-        print(f"Warning: {len(layout_rows)} rows detected - real cards hold "
-              f"at most {MAX_ROWS}. Likely misdetection.")
-    for i, row in enumerate(layout_rows, 1):
-        if len(row) > MAX_PAGES_PER_ROW:
-            print(f"Warning: {len(row)} pages in one row (row {i}) - real "
-                  f"cards hold at most {MAX_PAGES_PER_ROW}. Likely misdetection.")
 
     # Sort based on reading order
     if args.order == 'columns':
@@ -2432,6 +2461,21 @@ def main():
             pages = "+".join(str(i + 1) for i in group)
             coords = ", ".join(str(boxes_fullres[i]) for i in group)
             print(f"  pages {pages}: {coords}", file=sys.stderr)
+
+    # Validate against the physical card: more rows or more pages per row
+    # than any real card holds is a misdetection signal in itself. Judged on
+    # the REPAIRED geometry (steg 5B): before the move this counted raw
+    # detections and fired on 10 of 16 field cards, every one of which
+    # shipped 12 pages or fewer per row.
+    layout_rows = group_boxes_into_rows(boxes_fullres)
+    if len(layout_rows) > MAX_ROWS:
+        print(f"Warning: {len(layout_rows)} rows detected - real cards hold "
+              f"at most {MAX_ROWS}. Likely misdetection.")
+    for i, row in enumerate(layout_rows, 1):
+        if len(row) > MAX_PAGES_PER_ROW:
+            print(f"Warning: {len(row)} pages in one row (row {i}) - real "
+                  f"cards hold at most {MAX_PAGES_PER_ROW}. Likely "
+                  "misdetection.")
 
     # Coverage guard: did the boxes cover what the threshold saw? The one
     # signal that survives any upstream mistake (row-banding collapse put a

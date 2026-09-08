@@ -598,9 +598,13 @@ double-click B side (calls `RAPPORT.command` with `--background-first`).
    threshold-then-resize order the detect pass depends on. The split and
    refine passes use the same field via local scalar thresholds. Flattening
    a flat image is ~identity; the share of thumbnail pixels it re-classifies
-   is the mottle detector — above `ILLUM_WARN_SHARE` (0.5 %; clean cards
-   measure ~0.2 %) the run prints a loud warning and both visualization
-   banners say `UNEVEN ILLUMINATION`. Detection compensates either way; the
+   is the mottle detector, **printed on every run**. Above
+   `ILLUM_WARN_SHARE` the run prints a loud warning and both visualization
+   banners say `UNEVEN ILLUMINATION`. That threshold was 0.5 % (from the
+   fasit, where clean cards measure ~0.2 %) and is **3 % since 2026-09-08**:
+   the field range for real production panoramas is 0.8–1.9 %, so 0.5 %
+   warned on 100 % of cards — noise, not signal — while the one genuinely
+   blotched card measured 6.5 %. Detection compensates either way; the
    warning tells the operator the *source* is sick.
 2. Downscale to 10 %. Polarity is **auto-detected** per card (2026-09-04,
    decided cross-repo): the two known card types are opposite (Yamaha-type
@@ -627,7 +631,13 @@ double-click B side (calls `RAPPORT.command` with `--background-first`).
 4. Contours → bounding boxes, filtered by minimum page size.
 5. **Expand boxes by the erosion radius** (C1).
 6. **Reject detections that are not page-shaped** (C12).
-7. Scale back to full resolution and **split merged detections**: touching
+7. Scale back to full resolution and **split merged detections** — only
+   boxes that could actually hold two pages (`can_hold_two_pages`: over 1.5
+   pages in a dimension, since two pages side by side span ~2.1 page
+   widths). The basis is the format page size, never the median of the box
+   list, because after a split that list is dominated by the fragments
+   themselves: card 098 split sixteen *single* pages into 2–4 fragments each
+   and reported 38 normal pages as `~2 fused`. Touching
    pages fuse into one box at detect scale, but the gap between real pages is
    a projection *valley* — columns/rows whose foreground share drops below
    `SPLIT_VALLEY_RATIO` (0.6×) of the box's median. Each box is re-scanned
@@ -640,6 +650,9 @@ double-click B side (calls `RAPPORT.command` with `--background-first`).
    disables. Then sort into reading order.
 8. Optionally refine each box by re-detecting locally at 20 %.
 9. Score the card (size consistency, **row** alignment, spacing, shape).
+   The row and page-count warnings are judged on the **repaired** geometry:
+   they used to count raw detections and fired on 10 of 16 field cards,
+   every one of which shipped 12 pages or fewer per row.
    Rows are the only real axis — real cards hold at most 5 rows of up to 11
    pages, rows are NOT vertically aligned with each other, and there is no
    column structure (Trond, 2026-09-04). Nothing in the score rewards or

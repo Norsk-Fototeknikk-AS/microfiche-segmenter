@@ -1798,15 +1798,23 @@ def test_clean_journal_card_gets_no_illumination_warning(tmp_path):
     assert "uneven illumination" not in proc.stdout.lower()
 
 
-def _mottle_thumb(a):
-    """The synthetic mottle from the coordinator's spec, on the real fasit."""
+def _mottle_thumb(a, amp=1.6):
+    """The synthetic mottle from the coordinator's spec, on the real fasit.
+
+    Amplitude recalibrated 2026-09-08 (steg 5B): at the original 1.0 it
+    re-classifies 0.93 % of the thumbnail, which the field then showed to be
+    MILDER than a healthy production panorama (0.8-1.9 % is the normal range
+    for these). At 1.6 it measures 6.3 %, matching the one field card that
+    is genuinely blotched (612130000135, 6.5 %) - so the fixture again means
+    what its name says."""
     h, w = a.shape
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     f = np.ones((h, w), np.float32)
-    for cx, cy, s, sign in [(0.78, 0.15, 0.22, -0.5), (0.3, 0.7, 0.3, +0.3)]:
+    for cx, cy, s, sign in [(0.78, 0.15, 0.22, -0.5 * amp),
+                            (0.3, 0.7, 0.3, +0.3 * amp)]:
         f += sign * np.exp(-(((xx / w - cx) ** 2 + (yy / h - cy) ** 2)
                              / (2 * s ** 2)))
-    f += 0.15 * (xx / w - 0.5)
+    f += 0.15 * amp * (xx / w - 0.5)
     return np.clip(a.astype(np.float32) * f, 0, 255).astype(np.uint8)
 
 
@@ -3476,3 +3484,115 @@ def test_a_solid_run_off_the_raster_is_still_refused_on_position():
         runs, covs, CARD_H, CARD_MIN_PAGE_H, CARD_HEADER)
     assert (4000, 4300) not in stripes, stripes
     assert any("off-raster" in why for r, why in rejected if r == (4000, 4300))
+
+
+# --- Steg 5B (2026-09-08): three lies in the log ----------------------------
+# All three found in the A/B of e18e143, none of them changing a single page:
+#   1. Card 098 printed 38 "suspected merged pages (~2 fused)" for boxes that
+#      are exactly one page, and split sixteen single pages "into 2-4 pages".
+#      Both compare against the MEDIAN of a box list dominated by the split
+#      fragments themselves, so a normal page looks oversized. The page size
+#      is a format constant (C15) - use it, as the snap already does.
+#   2. The row warning is printed before the repair passes: it fired on 10 of
+#      16 cards in standard mode and every one of them ended at 12 or fewer.
+#   3. The illumination warning fired on 100 % of field cards (0.8-1.9 %,
+#      one outlier at 6.5 %), which makes it noise rather than signal.
+
+from segment_microfiche import (can_hold_two_pages, suspected_merged_boxes,
+                                group_boxes_into_rows, ILLUM_WARN_SHARE)
+
+
+def test_a_single_page_is_never_offered_to_the_splitter():
+    """Card 098's real numbers: two pages side by side span ~2.1 page widths,
+    so a 2050x2800 box cannot hold two - splitting it can only cut one page
+    into pieces (it produced 2 to 4 of them)."""
+    assert not can_hold_two_pages((2150, 10080, 2050, 2820), 2050, 2790)
+    assert not can_hold_two_pages((4320, 13530, 2040, 2800), 2050, 2790)
+
+
+def test_a_genuinely_fused_pair_is_still_offered_to_the_splitter():
+    """The fasit card's tape pair, and the field's real fusions."""
+    assert can_hold_two_pages((2000, 3090, 8610, 3100), 2050, 2790)
+    assert can_hold_two_pages((10630, 2890, 4220, 2840), 2050, 2790)
+
+
+def test_merged_warning_measures_against_the_page_not_the_median():
+    """A row of fragments plus one whole page: the page is normal, however
+    small the median of that population is."""
+    boxes = [(2000 + k * 700, 3000, 600, 900) for k in range(12)]
+    boxes.append((2000, 6000, 2050, 2790))            # one whole page
+    flagged = suspected_merged_boxes(boxes, 2050, 2790)
+    assert flagged == [], flagged
+    boxes.append((2000, 9000, 4220, 2840))            # genuinely fused
+    flagged = suspected_merged_boxes(boxes, 2050, 2790)
+    assert [b for b, _ in flagged] == [(2000, 9000, 4220, 2840)], flagged
+
+
+def _row_probe_card(path):
+    """12 pages in one row, three of them cut by a seam: 15 detections
+    before repair, 12 after - the shape that fired the false warning on 10
+    of 16 field cards."""
+    a = np.full((3000, 6600), 230, 'uint8')
+    a[:200, :] = 20; a[-200:, :] = 20; a[:, :200] = 20; a[:, -200:] = 20
+    a[300:400, :] = 30
+    for c in range(12):
+        x = 300 + c * 500
+        a[500:2300, x:x + 400] = 25
+    for c in (2, 5, 9):
+        x = 300 + c * 500
+        a[1100:1160, x:x + 400] = 230
+    pyvips.Image.new_from_memory(a.tobytes(), 6600, 3000, 1,
+                                 'uchar').write_to_file(str(path))
+
+
+def test_the_row_warning_describes_what_ships(tmp_path):
+    """15 detections become 12 pages: the warning must not fire on the
+    pre-repair count."""
+    src = tmp_path / "612130000012_00012.jpg"
+    _row_probe_card(src)
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "1 row: 12" in proc.stdout, proc.stdout
+    assert "pages in one row" not in proc.stdout, proc.stdout
+
+
+def test_the_row_warning_still_fires_on_a_real_overfull_row():
+    """The warning itself stays: MAX_PAGES_PER_ROW is a fasit from Trond."""
+    row = [(500 + k * 400, 3000, 380, 2790) for k in range(MAX_PAGES_PER_ROW + 2)]
+    rows = group_boxes_into_rows(row)
+    assert len(rows[0]) > MAX_PAGES_PER_ROW
+
+
+def test_illumination_note_is_reported_on_every_run(tmp_path):
+    """The measurement is always in the log - it is how the next round
+    calibrates - but only an outlier is a warning. Field: 0.8-1.9 % is the
+    normal range for these panoramas, one card measured 6.5 %."""
+    src = tmp_path / "612130000012_00012.jpg"
+    make_card(src)
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    assert re.search(r"Illumination re-classified [\d.]+% of the thumbnail",
+                     proc.stdout), proc.stdout
+    assert "warns above" in proc.stdout, proc.stdout
+    assert "WARNING: uneven illumination" not in proc.stdout, proc.stdout
+    assert ILLUM_WARN_SHARE >= 0.03, ("0.8-1.9 % is normal in the field; "
+                                      "warning below that is noise")
+
+
+def test_the_split_gate_never_shrinks_on_a_fragment_heavy_card():
+    """Leader's review point (steg 5B): if the gate took the per-card
+    ESTIMATE, a card whose detections are mostly short fragments would get a
+    small basis - and then every WHOLE page exceeds 1.5x it and gets split
+    into pieces. That is card 098's bug in new clothes. resolve_page_size
+    takes the format prior whenever any detection matches it, and a whole
+    page always does."""
+    boxes = [(2000 + k * 700, 3000, 600, 900) for k in range(20)]
+    boxes.append((2000, 6000, 2050, 2780))            # one whole page
+    pw, ph, note = resolve_page_size(boxes)
+
+    assert (pw, ph) == (2050, 2780), (pw, ph, note)
+    assert not can_hold_two_pages((2000, 6000, 2050, 2780), pw, ph)
+    assert suspected_merged_boxes(boxes, pw, ph) == []
+    # ...and the fragments themselves are not "pages" either way
+    assert not can_hold_two_pages(boxes[0], pw, ph)
