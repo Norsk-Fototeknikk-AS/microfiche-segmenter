@@ -3617,11 +3617,12 @@ def _physical_fasit():
     for line in PHYSICAL_FASIT.read_text().splitlines():
         if line.startswith("#") or not line.strip():
             continue
-        head, coords = line.split(" | ")
+        head, coords = line.split(" |", 1)
         stem, pages, grid = head.split(None, 2)
+        coords = coords.strip()
         out.append((stem, int(pages), grid,
                     [tuple(int(v) for v in b.split(","))
-                     for b in coords.split("; ")]))
+                     for b in coords.split("; ")] if coords else []))
     return out
 
 
@@ -3664,6 +3665,8 @@ def test_the_physically_counted_cards_are_pinned():
     """
     checked = 0
     for stem, pages, grid, boxes in _physical_fasit():
+        if not boxes:
+            continue                     # counted, but no geometry to pin
         assert len(boxes) == pages, (stem, len(boxes), pages)
 
         pw, ph, note = resolve_page_size(boxes)
@@ -3684,7 +3687,12 @@ def test_the_physical_fasit_holds_the_counted_numbers():
     assert counted == {"612130000098_00012": 54,
                        "612130000111_00012": 31,
                        "612130000135_00012": 27,
-                       "612130000432_00024": 60}, counted
+                       "612130000432_00024": 60,
+                       "612130000203_00024": 2,
+                       "612130000609_00036": 17,
+                       "612130000494_00012": 60,
+                       "612130000494_00036": 32,
+                       "612130000623_00024": 23}, counted
     grids = {s: g for s, _, g, _ in _physical_fasit()}
     assert grids["612130000098_00012"] == "5 rows: 12+12+12+12+6", grids
     assert grids["612130000111_00012"] == "3 rows: 12+12+7", grids
@@ -4873,3 +4881,26 @@ def test_margin_cells_are_opt_in_and_counted():
     roomy = card_cells(row, 2030, 2780, image_w=40000, margin_cells=1)
     assert len(roomy) == 14 and sum(1 for c in roomy
                                     if c["page"] == 0) == 2, roomy
+
+
+def test_the_counted_only_cards_are_recorded_without_pretending(tmp_path):
+    """Trond counted five more cards physically 2026-09-08. We have their
+    page COUNT as fasit but no coordinates from code that produces it - the
+    round-2 geometry for several of them is known wrong (623_00024 shipped
+    pages at y = -400, 494_00012 carried a header row). Recording round-2
+    coordinates as fasit would pin geometry we know is bad, so those entries
+    carry the count and nothing else."""
+    counted = {stem: pages for stem, pages, _g, boxes in _physical_fasit()
+               if not boxes}
+    assert counted == {"612130000203_00024": 2,
+                       "612130000609_00036": 17,
+                       "612130000494_00012": 60,
+                       "612130000494_00036": 32,
+                       "612130000623_00024": 23}, counted
+
+
+def test_the_cards_with_coordinates_still_carry_them():
+    with_boxes = {stem for stem, _p, _g, boxes in _physical_fasit() if boxes}
+    assert with_boxes == {"612130000098_00012", "612130000111_00012",
+                          "612130000135_00012", "612130000432_00024"}, \
+        with_boxes
