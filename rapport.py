@@ -54,6 +54,11 @@ QUALITY_WARN_BELOW = 50  # field data 2026-09-07: sick cards < 50, healthy > 74
 QUALITY_POOR_BELOW = 60  # segment_microfiche grades below this as POOR
 
 
+def used_manual_boxes(output):
+    """Did the operator lay this card out by hand? (C24)"""
+    return "MANUAL boxes:" in output
+
+
 def used_step_two(output):
     """Did this card need the staircase's second threshold? (C9, steg 7 -
     a step-two run is never silent.)"""
@@ -66,7 +71,7 @@ def parse_grid(output):
 
 
 def summary_line(stem, exit_code, pages, fragment_groups, anon_missing=False,
-                 quality=None, grid=None, step2=False):
+                 quality=None, grid=None, step2=False, manual=False):
     if anon_missing:
         # Whatever the exit code said: without the anonymized image the card
         # cannot be inspected across the air gap, and a missing expected
@@ -82,6 +87,8 @@ def summary_line(stem, exit_code, pages, fragment_groups, anon_missing=False,
     detail += f"  {grid or '?':<20}"
     if step2:
         detail += "  TRINN2"
+    if manual:
+        detail += "  MANUELL"
     if exit_code == 0:
         # A card the segmenter is not confident about must not read as fine.
         label = ("SVAK    " if quality is not None
@@ -173,7 +180,8 @@ def run_report(source_folder, report_dir, open_finder=True, extra_args=()):
                                      anon_missing=not anon.exists(),
                                      quality=parse_quality(output),
                                      grid=parse_grid(output),
-                                     step2=used_step_two(output)))
+                                     step2=used_step_two(output),
+                                     manual=used_manual_boxes(output)))
 
     ok = sum(1 for r in rows if r.startswith("OK"))
     svak = sum(1 for r in rows if r.startswith("SVAK"))

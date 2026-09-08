@@ -596,6 +596,44 @@ two runs and still finds nothing, the card is told the reason it *had* —
 `threshold found only the frame; re-threshold failed` — never "no pages
 detected", which would blame the card for a threshold's mistake.
 
+### C24. Manual boxes: the operator draws, the segmenter cuts
+
+For cards that **failed** segmentation (exit 2 or 3). The automation has had
+its say; the operator lays the pages out in Station and
+
+```
+segment_microfiche.py -i <panorama> -O <card> --manual-boxes <boxes.csv>
+```
+
+cuts exactly those rectangles. `boxes.csv` is one line per page,
+`x,y,w,h` in full resolution, no header line, **in the order the pages are
+to be numbered**. The **first line is the header** and becomes `page_000`;
+the rest become `page_001`, `page_002`, … in the order given.
+
+With the flag, detection, repair, the snap and **every** guard are skipped,
+and there is no quality score. That is the point: nothing may be layered on
+top of what the operator drew. No crop margin is applied either — the
+operator drew what he wanted cut, and the drawing window is downscaled, so
+he draws a little generously by nature. The automatic header page is not
+written in this mode regardless of `--header-page`; the operator's first box
+*is* the header, cut at full resolution rather than at
+`HEADER_PROXY_SCALE`.
+
+Validation happens **before anything is written**: every box must lie
+inside the image with positive width and height, and there must be at least
+two lines (a header and one page). A violation is `exit 1` naming the page
+and the box, and nothing is written. Overlapping boxes are a **warning**,
+not a refusal — the operator may well have meant them.
+
+Afterwards it is an ordinary card: `page_coordinates.csv` (with no quality
+line, since there is no score), `_done` last as always (C2), the panorama
+archived (C13), the log line `MANUAL boxes: N pages placed by operator, no
+padding`, and `MANUELL` on the card's row in `SAMMENDRAG`.
+
+The tail — cutting, the header, the sentinel, archiving — is `finish_card`,
+shared with the automatic path so the two cannot drift apart on the things
+downstream depends on.
+
 ### C19. A card must be FOUND, not composed
 
 Full production run of `65223c2`, 88 cards, 2026-09-08. A new failure class

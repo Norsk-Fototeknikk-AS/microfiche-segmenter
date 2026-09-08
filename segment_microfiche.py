@@ -2399,7 +2399,8 @@ def run_mode(args):
 
 
 def finish_card(boxes_fullres, input_file, input_path, out_dir,
-                original_width, original_height, args, padding=None):
+                original_width, original_height, args, padding=None,
+                header=True, start_number=1):
     """Cut the pages, write the header band, drop the sentinel,
     archive the panorama.
 
@@ -2408,7 +2409,10 @@ def finish_card(boxes_fullres, input_file, input_path, out_dir,
     downstream: page numbering, the `_done` ordering (C2), the header
     page (C11) and archiving (C13). padding overrides args.padding -
     manual mode passes 0, because the operator drew what he wanted
-    cut.
+    cut. header=False and start_number=0 belong together: in manual mode
+    the operator drew the header too, as the FIRST box, so it is cut like
+    any other page and lands as page_000 by numbering rather than by a
+    separate downscaled pass.
     """
     pages_dir = out_dir / "pages"
 
@@ -2463,7 +2467,7 @@ def finish_card(boxes_fullres, input_file, input_path, out_dir,
         # Prepare tasks
         tasks = [
             (i, x, y, w, h, input_file, pages_dir, original_width, original_height)
-            for i, (x, y, w, h) in enumerate(boxes_fullres, 1)
+            for i, (x, y, w, h) in enumerate(boxes_fullres, start_number)
         ]
 
         # Execute in parallel
@@ -2488,7 +2492,7 @@ def finish_card(boxes_fullres, input_file, input_path, out_dir,
         if boxes_fullres:
             first_page_y = min(b[1] for b in boxes_fullres)
             header_px = max(header_px, min(first_page_y, header_px * 2))
-        if not args.no_header_page and header_px > 0:
+        if header and not args.no_header_page and header_px > 0:
             src = pyvips.Image.new_from_file(input_file, access='random')
             header = src.crop(0, 0, original_width, header_px).resize(HEADER_PROXY_SCALE)
             header_path = pages_dir / f"{HEADER_PAGE_STEM}.tif"
@@ -2560,6 +2564,15 @@ def main(otsu_override=None, step2=False, step1_border=None,
     parser.add_argument('--archive-dir', default=None,
                         help=f'Where to archive the panorama (default: '
                              f'{ARCHIVE_DIR_NAME}/ beside the input folder)')
+    parser.add_argument('--manual-boxes', default=None, metavar='CSV',
+                        help='Cut exactly these boxes instead of detecting '
+                             'anything: one line per page, x,y,w,h in full '
+                             'resolution, no header line. The FIRST line is '
+                             'the header and becomes page_000. Detection, '
+                             'repair, snap and every guard are skipped, and '
+                             'no crop margin is applied - for cards the '
+                             'operator has laid out by hand after the '
+                             'automatic run failed (C24).')
     parser.add_argument('--no-header-page', action='store_true',
                         help='Do not write the masked header band as '
                              'pages/page_000.tif (contract C11).')
@@ -2644,6 +2657,53 @@ def main(otsu_override=None, step2=False, step1_border=None,
         gray = image.colourspace('b-w')
     else:
         gray = image
+
+    if args.manual_boxes:
+        # The operator has drawn the pages; cut exactly those and nothing
+        # else (C24). No detection, no repair, no snap, no guard, no
+        # quality score - that is the whole point of manual mode.
+        try:
+            manual = read_manual_boxes(args.manual_boxes)
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if len(manual) < 2:
+            print(f"ERROR: {args.manual_boxes} holds {len(manual)} box(es). "
+                  "The first is the header (page_000) and at least one page "
+                  "must follow, so two lines are the minimum.",
+                  file=sys.stderr)
+            return 1
+        problems = validate_manual_boxes(manual, original_width,
+                                         original_height)
+        if problems:
+            print(f"ERROR: {len(problems)} box(es) cannot be cut - nothing "
+                  "written:", file=sys.stderr)
+            for p in problems:
+                print(f"  {p}", file=sys.stderr)
+            return 1
+        for warning in validate_manual_boxes(manual, original_width,
+                                             original_height, warn=True):
+            print(f"WARNING: {warning} (cutting them as drawn)",
+                  file=sys.stderr)
+        pages = manual[1:]
+        print(f"MANUAL boxes: {len(pages)} pages placed by operator, "
+              "no padding (first box is the header, cut as page_000)")
+        print("\n=== PAGE COORDINATES (full resolution) ===")
+        print("Page#, X, Y, Width, Height")
+        for i, (x, y, w, h) in enumerate(manual, 0):
+            print(f"{i:3d}, {x}, {y}, {w}, {h}")
+        csv_path = out_dir / "page_coordinates.csv"
+        with open(csv_path, 'w') as f:
+            f.write("# Manual boxes placed by operator - no quality score\n")
+            f.write("Page#,X,Y,Width,Height\n")
+            for i, (x, y, w, h) in enumerate(manual, 0):
+                f.write(f"{i},{x},{y},{w},{h}\n")
+        print(f"Coordinates saved to {csv_path}")
+        finish_card(manual, input_file, input_path, out_dir, original_width,
+                    original_height, args, padding=0, header=False,
+                    start_number=0)
+        print("\nDone!")
+        return 0
 
     # Compute illumination field + Otsu threshold from a thumbnail
     print("Computing illumination field and Otsu threshold from thumbnail...")

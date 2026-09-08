@@ -5076,3 +5076,151 @@ def test_overlap_is_a_warning_not_a_refusal():
                            "have meant it", problems)
     warnings = validate_manual_boxes(boxes, 29071, 21505, warn=True)
     assert warnings and "overlap" in warnings[0].lower(), warnings
+
+
+def _manual_card(path, w=8000, h=6000):
+    a = np.full((h, w), 200, 'uint8')
+    a[200:600, 300:7000] = 60           # header band
+    for r in range(2):
+        for c in range(3):
+            a[1200 + r * 2200:1200 + r * 2200 + 1800,
+              400 + c * 2400:400 + c * 2400 + 2000] = 90
+    pyvips.Image.new_from_memory(a.tobytes(), w, h, 1,
+                                 'uchar').write_to_file(str(path))
+
+
+def _manual_csv(path):
+    """First line is the HEADER (page_000), the rest are pages in order."""
+    lines = ["300,200,6700,400"]
+    for r in range(2):
+        for c in range(3):
+            lines.append(f"{400 + c * 2400},{1200 + r * 2200},2000,1800")
+    Path(path).write_text("\n".join(lines) + "\n")
+    return len(lines) - 1               # pages, header not counted
+
+
+def test_manual_mode_cuts_exactly_what_was_drawn(tmp_path):
+    """No snap, no size normalisation, no guard, and no margin: the crop is
+    the rectangle the operator drew (steg 11)."""
+    src = tmp_path / "612130000012_00012.jpg"
+    _manual_card(src)
+    csv = tmp_path / "bokser.csv"
+    pages = _manual_csv(csv)
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--no-archive",
+                         "--manual-boxes", str(csv))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"MANUAL boxes: {pages} pages placed by operator" in proc.stdout
+    assert "no padding" in proc.stdout, proc.stdout
+    names = sorted(p.name for p in (out / "pages").iterdir())
+    assert names == ["page_000.tif"] + [f"page_{i:03d}.tif"
+                                        for i in range(1, pages + 1)], names
+    header = pyvips.Image.new_from_file(str(out / "pages" / "page_000.tif"))
+    assert (header.width, header.height) == (6700, 400), (header.width,
+                                                          header.height)
+    page1 = pyvips.Image.new_from_file(str(out / "pages" / "page_001.tif"))
+    assert (page1.width, page1.height) == (2000, 1800), (page1.width,
+                                                         page1.height)
+
+
+def test_manual_mode_keeps_the_order_it_was_given(tmp_path):
+    src = tmp_path / "612130000012_00012.jpg"
+    _manual_card(src)
+    csv = tmp_path / "bokser.csv"
+    csv.write_text("300,200,6700,400\n"
+                   "5200,1200,2000,1800\n"      # drawn right-to-left on
+                   "2800,1200,2000,1800\n"      # purpose
+                   "400,1200,2000,1800\n")
+    out = tmp_path / "card"
+
+    assert run_segmenter("-i", str(src), "-O", str(out), "--no-archive",
+                         "--manual-boxes", str(csv)).returncode == 0
+    rows = [l for l in (out / "page_coordinates.csv").read_text().splitlines()
+            if l and l[0].isdigit()]
+    xs = [int(l.split(",")[1]) for l in rows]
+    assert xs == [300, 5200, 2800, 400], ("drawing order IS page order", xs)
+
+
+def test_manual_mode_writes_done_and_archives(tmp_path):
+    src_dir = tmp_path / "Panoramas"
+    src_dir.mkdir()
+    src = src_dir / "612130000012_00012.jpg"
+    _manual_card(src)
+    csv = tmp_path / "bokser.csv"
+    _manual_csv(csv)
+    out = tmp_path / "card"
+
+    assert run_segmenter("-i", str(src), "-O", str(out),
+                         "--manual-boxes", str(csv)).returncode == 0
+    assert (out / "_done").exists()
+    assert not src.exists(), "the panorama must leave the queue (C13)"
+    assert (tmp_path / "PanoramaArchive" /
+            "612130000012_00012.jpg").exists()
+
+
+def test_manual_mode_runs_no_detection_at_all(tmp_path):
+    src = tmp_path / "612130000012_00012.jpg"
+    _manual_card(src)
+    csv = tmp_path / "bokser.csv"
+    _manual_csv(csv)
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--no-archive", "--manual-boxes", str(csv))
+    out = proc.stdout + proc.stderr
+
+    for marker in ("Otsu threshold", "potential pages", "Evidence:",
+                   "Structure rows", "snapped detections", "CELL row=",
+                   "Card Quality"):
+        assert marker not in out, (marker, out)
+
+
+def test_manual_mode_refuses_a_box_outside_the_image(tmp_path):
+    src = tmp_path / "612130000012_00012.jpg"
+    _manual_card(src)
+    csv = tmp_path / "bokser.csv"
+    csv.write_text("300,200,6700,400\n7500,1200,2000,1800\n")
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--no-archive",
+                         "--manual-boxes", str(csv))
+
+    assert proc.returncode == 1, (proc.returncode, proc.stderr)
+    assert "outside the image" in proc.stderr, proc.stderr
+    assert not (out / "pages").exists() or not list((out / "pages").iterdir())
+    assert not (out / "_done").exists(), "nothing may be written on refusal"
+
+
+def test_manual_mode_needs_a_header_and_at_least_one_page(tmp_path):
+    src = tmp_path / "612130000012_00012.jpg"
+    _manual_card(src)
+    csv = tmp_path / "bokser.csv"
+    csv.write_text("300,200,6700,400\n")        # header only
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--no-archive", "--manual-boxes", str(csv))
+    assert proc.returncode == 1, proc.returncode
+    assert "header" in proc.stderr.lower(), proc.stderr
+
+
+def test_manual_mode_warns_about_overlap_but_continues(tmp_path):
+    src = tmp_path / "612130000012_00012.jpg"
+    _manual_card(src)
+    csv = tmp_path / "bokser.csv"
+    csv.write_text("300,200,6700,400\n"
+                   "400,1200,2000,1800\n"
+                   "1400,1200,2000,1800\n")     # overlaps the one before
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--no-archive",
+                         "--manual-boxes", str(csv))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "overlap" in (proc.stdout + proc.stderr).lower()
+    assert (out / "_done").exists()
+
+
+def test_summary_marks_a_manual_card():
+    line = rapport.summary_line("kort_a", 0, 12, 0, manual=True)
+    assert "MANUELL" in line, line
+    assert "MANUELL" not in rapport.summary_line("kort_a", 0, 12, 0)
