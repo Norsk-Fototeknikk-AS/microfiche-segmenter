@@ -1851,6 +1851,57 @@ def header_zone_detections(boxes, page_w, page_h, header_px):
     return dropped, note
 
 
+def read_manual_boxes(path):
+    """[(x, y, w, h)] from the operator's CSV, in the order given.
+
+    One line per page, full-resolution integers, no header line (steg 11).
+    The order IS the page numbering, so nothing here sorts or normalises -
+    the whole point of manual mode is that what the operator drew is what
+    gets cut.
+    """
+    boxes = []
+    for n, line in enumerate(Path(path).read_text().splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 4:
+            raise ValueError(f"{path} line {n}: expected 4 numbers "
+                             f"(x,y,w,h), got {len(parts)}: {line!r}")
+        try:
+            boxes.append(tuple(int(p) for p in parts))
+        except ValueError:
+            raise ValueError(f"{path} line {n}: not whole numbers: {line!r}")
+    return boxes
+
+
+def validate_manual_boxes(boxes, image_w, image_h, warn=False):
+    """Problems that must stop the run (warn=False), or warnings that must
+    not (warn=True). A box outside the image or without area cannot be cut;
+    overlapping boxes can, and the operator may well have meant them."""
+    if warn:
+        out = []
+        for i, a in enumerate(boxes, 1):
+            for j, b in enumerate(boxes[i:], i + 1):
+                ox = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+                oy = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+                if ox > 0 and oy > 0:
+                    out.append(f"pages {i} and {j} overlap by {ox}x{oy} px")
+        return out
+    problems = []
+    for i, (x, y, w, h) in enumerate(boxes, 1):
+        if w <= 0:
+            problems.append(f"page {i}: width {w} is not positive")
+        if h <= 0:
+            problems.append(f"page {i}: height {h} is not positive")
+        if w > 0 and h > 0 and not (0 <= x and 0 <= y
+                                    and x + w <= image_w
+                                    and y + h <= image_h):
+            problems.append(f"page {i}: box ({x}, {y}, {w}, {h}) reaches "
+                            f"outside the image (0-{image_w} x 0-{image_h})")
+    return problems
+
+
 def card_cells(boxes, page_w, page_h, image_w, margin_cells=0,
                omitted_out=None):
     """Every cell of the card's raster: the ones a page occupies AND the
@@ -2345,6 +2396,125 @@ def code_version(repo=None):
 def run_mode(args):
     """The word for the binarization mode, as printed in every report."""
     return "bakgrunn-foerst" if args.background_first else "standard"
+
+
+def finish_card(boxes_fullres, input_file, input_path, out_dir,
+                original_width, original_height, args, padding=None):
+    """Cut the pages, write the header band, drop the sentinel,
+    archive the panorama.
+
+    The tail of a run, shared by the automatic path and manual mode
+    (steg 11) so the two can never drift apart on what matters
+    downstream: page numbering, the `_done` ordering (C2), the header
+    page (C11) and archiving (C13). padding overrides args.padding -
+    manual mode passes 0, because the operator drew what he wanted
+    cut.
+    """
+    pages_dir = out_dir / "pages"
+
+    # === STEP 6: Extract pages (optional) ===
+    if not args.skip_extraction:
+        print("\n=== EXTRACTING PAGES (parallel) ===")
+        pages_dir.mkdir(exist_ok=True)
+
+        # Number of parallel workers
+        num_workers = 5
+        print(f"Using {num_workers} parallel workers")
+
+        # Crop margin: a fraction of the median page unless given in pixels
+        if padding is not None:
+            pad_x = pad_y = int(padding)
+        elif args.padding is None:
+            median_w = int(np.median([b[2] for b in boxes_fullres]))
+            median_h = int(np.median([b[3] for b in boxes_fullres]))
+            pad_x = int(median_w * DEFAULT_PADDING_RATIO)
+            pad_y = int(median_h * DEFAULT_PADDING_RATIO)
+        elif args.padding <= 1.0:
+            median_w = int(np.median([b[2] for b in boxes_fullres]))
+            median_h = int(np.median([b[3] for b in boxes_fullres]))
+            pad_x = int(median_w * args.padding)
+            pad_y = int(median_h * args.padding)
+        else:
+            pad_x = pad_y = int(args.padding)
+        print(f"Crop margin: {pad_x}px x {pad_y}px")
+
+        def extract_page(task):
+            """Extract a single page from the source image."""
+            i, x, y, w, h, src_file, out_dir, orig_w, orig_h = task
+
+            img = pyvips.Image.new_from_file(src_file, access='random')
+
+            # Apply margin
+            px = max(0, x - pad_x)
+            py = max(0, y - pad_y)
+            pw = min(w + 2 * pad_x, orig_w - px)
+            ph = min(h + 2 * pad_y, orig_h - py)
+
+            page = img.crop(px, py, pw, ph)
+
+            if args.format == 'jpg':
+                output_path = out_dir / f"page_{i:03d}.jpg"
+                page.write_to_file(str(output_path), Q=95)
+            else:
+                output_path = out_dir / f"page_{i:03d}.tif"
+                page.write_to_file(str(output_path), compression='lzw')
+            return i, output_path
+
+        # Prepare tasks
+        tasks = [
+            (i, x, y, w, h, input_file, pages_dir, original_width, original_height)
+            for i, (x, y, w, h) in enumerate(boxes_fullres, 1)
+        ]
+
+        # Execute in parallel
+        completed = 0
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(extract_page, task): task[0] for task in tasks}
+            for future in as_completed(futures):
+                i, path = future.result()
+                completed += 1
+                if completed % 20 == 0 or completed == len(tasks):
+                    print(f"  Progress: {completed}/{len(tasks)} pages extracted")
+
+        print(f"\nExtracted {len(boxes_fullres)} pages to {pages_dir}/")
+
+        # Keep the header band as page zero. Everything above the first page
+        # row IS the header - on the real journal cards the typed text sits
+        # below the fixed mask line (2026-09-04: a ratio-only crop cut the
+        # date and card index in half), so the crop extends to the topmost
+        # detected page. Capped at twice the configured band so a sparse card
+        # cannot swallow empty rows into page_000; never less than the band.
+        header_px = int(original_height * args.header_skip)
+        if boxes_fullres:
+            first_page_y = min(b[1] for b in boxes_fullres)
+            header_px = max(header_px, min(first_page_y, header_px * 2))
+        if not args.no_header_page and header_px > 0:
+            src = pyvips.Image.new_from_file(input_file, access='random')
+            header = src.crop(0, 0, original_width, header_px).resize(HEADER_PROXY_SCALE)
+            header_path = pages_dir / f"{HEADER_PAGE_STEM}.tif"
+            header.write_to_file(str(header_path), compression='lzw')
+            print(f"Header kept as {header_path.name} "
+                  f"({header.width} x {header.height}, "
+                  f"{HEADER_PROXY_SCALE:.4g} scale of the masked band)")
+
+        # Sentinel written LAST, after every page is on disk, and atomically:
+        # the OCR app's watch+confirm list treats its presence as "fully
+        # written" and only then offers the card for import (without it the app
+        # falls back to a 120 s quiet-period heuristic).
+        write_done_sentinel(out_dir)
+
+        # Card is complete and published; take the panorama out of the queue.
+        # After the sentinel, never before: if this move fails the card is still
+        # valid and importable, it just needs filing by hand.
+        if not args.no_archive:
+            archive_dir = (Path(args.archive_dir) if args.archive_dir
+                           else input_path.parent.parent / ARCHIVE_DIR_NAME)
+            try:
+                archived = move_without_clobber(input_path, archive_dir)
+                print(f"Panorama archived to {archived}")
+            except OSError as exc:
+                print(f"WARNING: could not archive {input_path}: {exc}",
+                      file=sys.stderr)
 
 
 def main(otsu_override=None, step2=False, step1_border=None,
@@ -3153,107 +3323,8 @@ def main(otsu_override=None, step2=False, step1_border=None,
                   "inspection-only).", file=sys.stderr)
         return EXIT_SUSPECT_FRAGMENTS
 
-    # === STEP 6: Extract pages (optional) ===
-    if not args.skip_extraction:
-        print("\n=== EXTRACTING PAGES (parallel) ===")
-        pages_dir.mkdir(exist_ok=True)
-
-        # Number of parallel workers
-        num_workers = 5
-        print(f"Using {num_workers} parallel workers")
-
-        # Crop margin: a fraction of the median page unless given in pixels
-        if args.padding is None:
-            median_w = int(np.median([b[2] for b in boxes_fullres]))
-            median_h = int(np.median([b[3] for b in boxes_fullres]))
-            pad_x = int(median_w * DEFAULT_PADDING_RATIO)
-            pad_y = int(median_h * DEFAULT_PADDING_RATIO)
-        elif args.padding <= 1.0:
-            median_w = int(np.median([b[2] for b in boxes_fullres]))
-            median_h = int(np.median([b[3] for b in boxes_fullres]))
-            pad_x = int(median_w * args.padding)
-            pad_y = int(median_h * args.padding)
-        else:
-            pad_x = pad_y = int(args.padding)
-        print(f"Crop margin: {pad_x}px x {pad_y}px")
-
-        def extract_page(task):
-            """Extract a single page from the source image."""
-            i, x, y, w, h, src_file, out_dir, orig_w, orig_h = task
-
-            img = pyvips.Image.new_from_file(src_file, access='random')
-
-            # Apply margin
-            px = max(0, x - pad_x)
-            py = max(0, y - pad_y)
-            pw = min(w + 2 * pad_x, orig_w - px)
-            ph = min(h + 2 * pad_y, orig_h - py)
-
-            page = img.crop(px, py, pw, ph)
-
-            if args.format == 'jpg':
-                output_path = out_dir / f"page_{i:03d}.jpg"
-                page.write_to_file(str(output_path), Q=95)
-            else:
-                output_path = out_dir / f"page_{i:03d}.tif"
-                page.write_to_file(str(output_path), compression='lzw')
-            return i, output_path
-
-        # Prepare tasks
-        tasks = [
-            (i, x, y, w, h, input_file, pages_dir, original_width, original_height)
-            for i, (x, y, w, h) in enumerate(boxes_fullres, 1)
-        ]
-
-        # Execute in parallel
-        completed = 0
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(extract_page, task): task[0] for task in tasks}
-            for future in as_completed(futures):
-                i, path = future.result()
-                completed += 1
-                if completed % 20 == 0 or completed == len(tasks):
-                    print(f"  Progress: {completed}/{len(tasks)} pages extracted")
-
-        print(f"\nExtracted {len(boxes_fullres)} pages to {pages_dir}/")
-
-        # Keep the header band as page zero. Everything above the first page
-        # row IS the header - on the real journal cards the typed text sits
-        # below the fixed mask line (2026-09-04: a ratio-only crop cut the
-        # date and card index in half), so the crop extends to the topmost
-        # detected page. Capped at twice the configured band so a sparse card
-        # cannot swallow empty rows into page_000; never less than the band.
-        header_px = int(original_height * args.header_skip)
-        if boxes_fullres:
-            first_page_y = min(b[1] for b in boxes_fullres)
-            header_px = max(header_px, min(first_page_y, header_px * 2))
-        if not args.no_header_page and header_px > 0:
-            src = pyvips.Image.new_from_file(input_file, access='random')
-            header = src.crop(0, 0, original_width, header_px).resize(HEADER_PROXY_SCALE)
-            header_path = pages_dir / f"{HEADER_PAGE_STEM}.tif"
-            header.write_to_file(str(header_path), compression='lzw')
-            print(f"Header kept as {header_path.name} "
-                  f"({header.width} x {header.height}, "
-                  f"{HEADER_PROXY_SCALE:.4g} scale of the masked band)")
-
-        # Sentinel written LAST, after every page is on disk, and atomically:
-        # the OCR app's watch+confirm list treats its presence as "fully
-        # written" and only then offers the card for import (without it the app
-        # falls back to a 120 s quiet-period heuristic).
-        write_done_sentinel(out_dir)
-
-        # Card is complete and published; take the panorama out of the queue.
-        # After the sentinel, never before: if this move fails the card is still
-        # valid and importable, it just needs filing by hand.
-        if not args.no_archive:
-            archive_dir = (Path(args.archive_dir) if args.archive_dir
-                           else input_path.parent.parent / ARCHIVE_DIR_NAME)
-            try:
-                archived = move_without_clobber(input_path, archive_dir)
-                print(f"Panorama archived to {archived}")
-            except OSError as exc:
-                print(f"WARNING: could not archive {input_path}: {exc}",
-                      file=sys.stderr)
+    finish_card(boxes_fullres, input_file, input_path, out_dir,
+                original_width, original_height, args)
 
     print("\nDone!")
     return 0

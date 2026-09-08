@@ -5017,3 +5017,62 @@ def test_a_short_bottom_row_gives_real_empty_cells():
     assert len(row5) == 12, row5
     assert sum(1 for c in row5 if c["page"] == 0) == 6, row5
     assert sum(1 for c in cells if c["page"] == 1) == 54, cells
+
+
+# --- Steg 11 (2026-09-08): manual boxes, drawn by the operator ------------
+# For cards that failed segmentation. The automation has had its say; the
+# operator draws the boxes in Station and the segmenter cuts exactly what
+# was drawn - no snap, no size normalisation, no guard. That is the point.
+
+from segment_microfiche import read_manual_boxes, validate_manual_boxes
+
+
+def test_manual_boxes_are_read_in_the_order_given(tmp_path):
+    f = tmp_path / "bokser.csv"
+    f.write_text("100,200,300,400\n1500,200,300,400\n800,900,300,400\n")
+    assert read_manual_boxes(f) == [(100, 200, 300, 400),
+                                    (1500, 200, 300, 400),
+                                    (800, 900, 300, 400)]
+
+
+def test_manual_boxes_tolerate_spaces_and_blank_lines(tmp_path):
+    f = tmp_path / "bokser.csv"
+    f.write_text("\n 100 , 200 , 300 , 400 \n\n500,600,700,800\n\n")
+    assert read_manual_boxes(f) == [(100, 200, 300, 400),
+                                    (500, 600, 700, 800)]
+
+
+def test_a_malformed_line_is_named_by_its_number(tmp_path):
+    f = tmp_path / "bokser.csv"
+    f.write_text("100,200,300,400\nikke,tall,her,nei\n")
+    with pytest.raises(ValueError) as exc:
+        read_manual_boxes(f)
+    assert "line 2" in str(exc.value), str(exc.value)
+
+
+def test_a_box_outside_the_image_is_refused():
+    boxes = [(100, 200, 300, 400), (28000, 200, 2000, 400)]
+    problems = validate_manual_boxes(boxes, 29071, 21505)
+    assert len(problems) == 1, problems
+    assert "2" in problems[0] and "outside" in problems[0], problems
+
+
+def test_a_box_with_no_area_is_refused():
+    problems = validate_manual_boxes([(100, 200, 0, 400),
+                                      (100, 200, 300, -5)], 29071, 21505)
+    assert len(problems) == 2, problems
+    assert all("width" in p or "height" in p for p in problems), problems
+
+
+def test_a_valid_set_has_no_problems():
+    boxes = [(100 + k * 2180, 200, 2030, 2780) for k in range(12)]
+    assert validate_manual_boxes(boxes, 29071, 21505) == []
+
+
+def test_overlap_is_a_warning_not_a_refusal():
+    boxes = [(100, 200, 2030, 2780), (1000, 200, 2030, 2780)]
+    problems = validate_manual_boxes(boxes, 29071, 21505)
+    assert problems == [], ("overlap must not refuse - the operator may "
+                           "have meant it", problems)
+    warnings = validate_manual_boxes(boxes, 29071, 21505, warn=True)
+    assert warnings and "overlap" in warnings[0].lower(), warnings
