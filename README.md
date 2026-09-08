@@ -300,6 +300,42 @@ overrides the binary** (`complete_geometry`):
 Thresholds are calibrated against RAPPORT-2026-09-08-3 (13 production cards)
 and marked preliminary.
 
+### C15. The page size is a format constant — detections snap to it
+
+Architecture addition (Trond, 2026-09-08, after strips kept slipping
+through as wrong-sized "pages"): the journal format guarantees uniform page
+size, so size is never derived from a blob again. After all repair passes, a
+final snap (`snap_pages`) turns every accepted detection into a full page
+box: the blob gives position, `PAGE_SIZE_PRIOR` (2050×2780, measured across
+13 production cards; pitch ~2180) gives the dimensions.
+
+- **Prior resolution** (`resolve_page_size`): detections matching the prior
+  ±10 % tune it (median); exactly one witness contributes its own clamped
+  dimensions (using the raw prior was measured to shrink an edge-of-band
+  card's pages); zero witnesses → per-card estimate with a LOUD note, so an
+  off-format card is never silently forced into journal size. New format
+  one day? Measure a healthy card's PAGE COORDINATES the same way and
+  update the prior.
+- **Cell assignment**: each detection belongs to the grid cell (row phase +
+  pitch) nearest its center — not gap-chaining, because a right-hand strip
+  of one page can sit closer to the neighbour page than to its own sibling
+  (production card 612130000029). Strips anywhere INSIDE a cell are fine (a
+  washed page may keep only its middle); a detection reaching into the
+  neighbour PAGE's span is refused → exit 3. Phase comes from
+  full-width members only; pitch is card-wide (one physical raster).
+- **Deliberately NOT snapped**: single detections spanning >1.25 pages in
+  either direction (unsplittable merges — snapping would shear content or
+  invent a split; they keep their loud warning), everything on a card that
+  is already failing (raw geometry preserved for diagnosis), and the header
+  band (never part of the page grid).
+- Snap growth is logged per page, marks the page blue, and does NOT count
+  toward the over-repair limit — normalizing to the known size is normal
+  operation; content verification is the planned occupancy check.
+
+Field regression (both 2026-09-08 reports, 29 cards) is a committed test:
+no refusals on passing cards, quality up across the board, worst card
+612130000135 from 20.5 to 73.8.
+
 The signature (`find_fragment_groups`): detections sharing an x-span
 (interval IoU ≥ 0.8) with vertical gaps ≤ 15 % of the expected page height
 are linked into transitive chains; within each chain (sorted by y) every

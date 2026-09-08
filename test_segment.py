@@ -2166,3 +2166,245 @@ def test_short_page_never_links_across_the_row_boundary():
     assert (19260, 10170, 1680, 2500) in new, "row-3 page was consumed"
     merged_tall = [b for b, f in zip(new, flags) if f and b[3] > 3000]
     assert merged_tall == [], f"cross-row merge happened: {merged_tall}"
+
+
+# --- Page-size prior and grid snapping (architecture shift, 2026-09-08) -----
+# Trond: "igjen feiler den med sider som er feil størrelse" - the page size
+# is a KNOWN CONSTANT of the format, not something to derive per blob. Every
+# accepted detection snaps to a full page box: the blob gives position, the
+# prior gives size. The merge/extension passes become special cases of the
+# snap. Pitch (regular within a row) resolves collisions; what cannot be
+# reconciled with the grid still exits 3.
+
+from segment_microfiche import (PAGE_SIZE_PRIOR, PAGE_SIZE_TOLERANCE,
+                                resolve_page_size, snap_pages)
+
+
+def test_page_size_comes_from_the_prior_tuned_by_best_detections():
+    """Detections near the prior tune it (bounded); strips do not vote."""
+    boxes = [(2010, 6710, 2040, 2790), (4190, 6680, 2040, 2760),
+             (6370, 6650, 2050, 2800),
+             (8560, 6630, 880, 2210), (10720, 6590, 800, 1900)]  # strips
+    pw, ph, note = resolve_page_size(boxes)
+    assert abs(pw - 2043) <= 10, pw
+    assert abs(ph - 2790) <= 20, ph
+    # and always inside the bound around the prior
+    assert abs(pw - PAGE_SIZE_PRIOR[0]) <= PAGE_SIZE_TOLERANCE * PAGE_SIZE_PRIOR[0]
+
+
+def test_page_size_falls_back_to_estimate_off_format():
+    """A card whose pages are nowhere near the prior (test fixtures, other
+    formats): per-card estimate, loudly noted - never silent garbage."""
+    boxes = [(i * 500, 100, 400, 600) for i in range(5)]
+    pw, ph, note = resolve_page_size(boxes)
+    assert 380 <= pw <= 420 and 570 <= ph <= 630, (pw, ph)
+    assert note is not None and "prior" in note.lower()
+
+
+def test_snap_gives_field_strips_full_page_boxes():
+    """Card 612130000135 row 1 (real coordinates): narrow washed-out strips,
+    NO full-height anchor in the row - exactly what the extension pass
+    could not fix. Every strip becomes a full page on the row's pitch."""
+    row1 = [
+        (1920, 3790, 880, 2210), (4220, 4070, 800, 1900),
+        (10640, 3870, 810, 2020), (17150, 3950, 1240, 1860),
+        (19330, 4210, 1000, 1580), (19510, 3480, 730, 850),
+        (21490, 4260, 1350, 1500), (25860, 4610, 1950, 1100),
+    ]
+    # context: a healthy row below fixes pitch and page size
+    row2 = [(2010 + i * 2180, 6710, 2040, 2790) for i in range(12)]
+
+    snapped, flags, notes, refused = snap_pages(row1 + row2, 2050, 2780)
+
+    assert refused == [], notes
+    assert len(snapped) == 7 + 12, snapped  # the two overlapping strips fuse
+    for (x, y, w, h) in snapped:
+        assert w == 2050 and h == 2780, (x, y, w, h)
+    grown = [b for b, f in zip(snapped, flags) if f]
+    assert len(grown) >= 7, "every strip page must be marked as snapped-grown"
+
+
+def test_snap_leaves_healthy_pages_nearly_alone_and_unmarked():
+    boxes = [(2010 + i * 2180, 6710, 2040, 2790) for i in range(6)]
+    snapped, flags, notes, refused = snap_pages(boxes, 2050, 2780)
+
+    assert refused == []
+    assert not any(flags), "healthy pages must not be marked repaired"
+    for (x, y, w, h), (sx, sy, sw, sh) in zip(sorted(boxes), sorted(snapped)):
+        assert abs(x - sx) <= 30 and abs(y - sy) <= 30
+
+
+def test_snap_fuses_stacked_fragments_and_vertical_strips_into_slots():
+    """The old merge passes as special cases: anything x-overlapping within
+    the row is one page slot."""
+    boxes = [
+        (2010, 6710, 2040, 2790),                       # whole
+        (4190, 6680, 1350, 2760), (5540, 6680, 720, 2760),   # v-strips
+        (6370, 6650, 1950, 1875), (6370, 8525, 1950, 885),   # h-fragments
+    ]
+    snapped, flags, notes, refused = snap_pages(boxes, 2050, 2780)
+
+    assert refused == []
+    assert len(snapped) == 3, snapped
+
+
+def test_snap_refuses_a_detection_straddling_two_cells():
+    """A detection bridging two pages' grid spans is the one geometry no
+    page explains - exit 3 material, not silent repositioning. (A strip
+    fully INSIDE a cell is fine wherever it sits - a washed page may keep
+    only its middle.)"""
+    boxes = [(2010, 6710, 2040, 2790), (2010 + 3 * 2180, 6710, 2040, 2790),
+             (3400, 6790, 1400, 2100),   # spans the cell-0/cell-1 boundary
+             # a second row pins the pitch
+             (2010, 10500, 2040, 2790), (4190, 10500, 2040, 2790),
+             (6370, 10500, 2040, 2790)]
+
+    snapped, flags, notes, refused = snap_pages(boxes, 2050, 2780)
+    assert refused != [], (notes, snapped)
+    assert any("bridges two pages" in nn for nn in notes), notes
+
+
+def test_snap_reunites_the_field_cards_right_hand_strip():
+    """Card 612130000029 detections 10+11+12 (real coordinates): 11 is the
+    RIGHT strip of page 10's cell - gap-chaining would glue it to page 12.
+    Cell assignment by center puts 10+11 together and leaves 12 whole."""
+    boxes = [(2220 + i * 2180, 3190, 2040, 2780) for i in range(9)]
+    boxes += [(21850, 3140, 760, 2780), (23010, 3130, 880, 2770),
+              (24030, 3120, 2050, 2790)]
+    snapped, flags, notes, refused = snap_pages(boxes, 2050, 2780)
+
+    assert refused == [], notes
+    assert len(snapped) == 11, snapped
+    xs = sorted(b[0] for b in snapped)
+    assert all(abs((b - a) - 2180) <= 40 for a, b in zip(xs, xs[1:])), xs
+
+
+def test_snap_leaves_a_single_unsplittable_merge_alone():
+    """One detection spanning two pages with no valley evidence: snapping
+    would invent a split the binary cannot support - the merged-pages
+    warning already covers it (C-contract from the merged-row e2e)."""
+    boxes = [(2010, 6710, 2040, 2790), (4190, 6710, 4260, 2790)]
+    snapped, flags, notes, refused = snap_pages(boxes, 2050, 2780)
+    assert refused == []
+    assert (4190, 6710, 4260, 2790) in snapped, snapped
+
+
+def test_snap_splits_a_multi_member_fused_slot_on_the_pitch():
+    """Healthy neighbours fused by the seam-gap tolerance re-emit as
+    separate pages on the grid - fusion must never LOSE pages."""
+    boxes = [(2010 + i * 2180, 6710, 2100, 2790) for i in range(4)]
+    # 80px gaps (< the fusion tolerance) - the whole row is one slot
+    snapped, flags, notes, refused = snap_pages(boxes, 2050, 2780)
+    assert refused == []
+    assert len(snapped) == 4, snapped
+    xs = sorted(b[0] for b in snapped)
+    assert all(abs((b - a) - 2180) <= 30 for a, b in zip(xs, xs[1:])), xs
+
+
+def test_snap_single_strip_row_uses_pitch_from_other_rows():
+    """A row holding only ONE narrow strip: phase comes from itself, pitch
+    from the healthy rows, and the strip still becomes a full page."""
+    boxes = [(2010 + i * 2180, 6710, 2040, 2790) for i in range(4)]
+    boxes.append((4190, 10500, 700, 2100))
+    snapped, flags, notes, refused = snap_pages(boxes, 2050, 2780)
+    assert refused == []
+    strip_page = [b for b in snapped if b[1] >= 9000]
+    assert strip_page == [(4190, 10500, 2050, 2780)], snapped
+
+
+def test_snap_first_and_last_strip_of_a_row_get_full_pages():
+    """Edge slots (no neighbour on one side) snap like interior ones."""
+    boxes = [(2010, 6710, 600, 2100),                       # first: strip
+             (4190, 6710, 2040, 2790), (6370, 6710, 2040, 2790),
+             (8550, 6710, 500, 1800)]                       # last: strip
+    snapped, flags, notes, refused = snap_pages(boxes, 2050, 2780)
+    assert refused == []
+    assert len(snapped) == 4
+    for (x, y, w, h) in snapped:
+        assert (w, h) == (2050, 2780)
+    xs = sorted(b[0] for b in snapped)
+    assert abs(xs[0] - 2010) <= 330 and abs(xs[-1] - 8550) <= 330, xs
+
+
+def test_snap_card_where_everything_is_strips():
+    """No trusted slot anywhere: phase falls back to the slots themselves.
+    Positions stay near the detections; sizes are still the prior's."""
+    boxes = [(2010 + i * 2180, 6710, 700, 2100) for i in range(4)]
+    snapped, flags, notes, refused = snap_pages(boxes, 2050, 2780)
+    assert refused == []
+    assert all((b[2], b[3]) == (2050, 2780) for b in snapped)
+    assert all(flags), "every strip page must be marked"
+
+
+def test_page_size_tuning_stays_inside_the_prior_bound():
+    """Detections at the very edge of the +-10% window tune the size to the
+    window edge, never beyond it."""
+    hi_w = int(PAGE_SIZE_PRIOR[0] * (1 + PAGE_SIZE_TOLERANCE)) - 1
+    hi_h = int(PAGE_SIZE_PRIOR[1] * (1 + PAGE_SIZE_TOLERANCE)) - 1
+    boxes = [(i * 2500, 100, hi_w, hi_h) for i in range(3)]
+    pw, ph, note = resolve_page_size(boxes)
+    assert note is None
+    assert pw <= PAGE_SIZE_PRIOR[0] * (1 + PAGE_SIZE_TOLERANCE)
+    assert ph <= PAGE_SIZE_PRIOR[1] * (1 + PAGE_SIZE_TOLERANCE)
+    assert pw == hi_w and ph == hi_h
+
+
+import re
+
+FIELD_DATA = Path.home() / "Desktop" / "Mikrofiche-feltdata"
+
+
+def _field_cards(report):
+    """(stem, boxes, exit0, quality) per card in a field report folder."""
+    folder = FIELD_DATA / report
+    summary = (folder / "SAMMENDRAG.txt").read_text()
+    cards = []
+    for rapport_file in sorted(folder.glob("*_rapport.txt")):
+        stem = rapport_file.name[:-len("_rapport.txt")]
+        text = rapport_file.read_text()
+        boxes = []
+        in_block = False
+        for line in text.splitlines():
+            if "PAGE COORDINATES" in line:
+                in_block = True
+                continue
+            if in_block:
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) == 5 and parts[0].isdigit():
+                    boxes.append(tuple(int(p) for p in parts[1:]))
+                elif boxes:
+                    break
+        m = re.search(r"Card Quality: ([\d.]+)/100", text)
+        status = next((l for l in summary.splitlines() if stem in l), "")
+        if boxes and m:
+            cards.append((stem, boxes, status.startswith("OK"),
+                          float(m.group(1))))
+    return cards
+
+
+@pytest.mark.skipif(not FIELD_DATA.exists(), reason="field data not on disk")
+def test_snap_regression_against_both_field_reports():
+    """Every card from RAPPORT-2026-09-08-3 and -4 through the snap: no
+    card may come out WORSE than today - no refusals on cards that passed,
+    uniform page sizes, and the quality never drops. Card 612130000135
+    (strips, quality 20.5 in -4) must come up measurably."""
+    checked = 0
+    for report in ("RAPPORT-2026-09-08-3", "RAPPORT-2026-09-08-4"):
+        for stem, boxes, was_ok, q_before in _field_cards(report):
+            pw, ph, note = resolve_page_size(boxes)
+            assert note is None, (report, stem, "production card off-prior?")
+            snapped, flags, notes, refused = snap_pages(boxes, pw, ph)
+            if was_ok:
+                assert refused == [], (report, stem, notes)
+            refused_idx = {i for g in refused for i in g}
+            exempt_like = [b for b in snapped
+                           if (b[2], b[3]) != (pw, ph)]
+            for b in exempt_like:
+                assert (b[2] > 1.25 * pw or b[3] > 1.25 * ph
+                        or refused), (report, stem, b)
+            q_after = compute_card_quality(snapped, None)["total"]
+            assert q_after >= q_before - 1, (report, stem, q_before, q_after)
+            if stem == "612130000135_00012" and report.endswith("-4"):
+                assert q_after > 50, (q_before, q_after)
+            checked += 1
+    assert checked >= 26, checked

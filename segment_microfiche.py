@@ -816,6 +816,187 @@ def complete_geometry(boxes):
     return ([e[0] for e in entries], [e[1] for e in entries], notes, refused)
 
 
+# Page-size prior (architecture addition, Trond 2026-09-08): the page size
+# is a KNOWN CONSTANT of the journal format, not a per-blob measurement.
+# Calibrated from RAPPORT-2026-09-08-3/-4: healthy detections cluster at
+# ~2040-2050 x 2760-2800 full-res pixels across 13 production cards (pitch
+# ~2180). If another card format ever appears: measure a healthy card's
+# detections the same way (PAGE COORDINATES in any rapport.txt), update the
+# prior or run with a per-card estimate - resolve_page_size falls back to
+# the estimate LOUDLY whenever no detection lands near the prior, so an
+# off-format card never gets silently forced into journal size.
+PAGE_SIZE_PRIOR = (2050, 2780)
+PAGE_SIZE_TOLERANCE = 0.10      # per-card fine-tune bound around the prior
+SNAP_PITCH_TOLERANCE = 0.15     # of the pitch: max offset from a grid slot
+SNAP_GROWTH_MARK = 0.05         # area growth share that marks a page blue
+
+
+def resolve_page_size(boxes):
+    """Card-level page size: the prior, fine-tuned by the detections that
+    already match it (median of those, so strips and fragments do not vote).
+    Off-format cards (fixtures, unknown formats) fall back to the per-card
+    estimate with a loud note. Size never comes from a single blob."""
+    pw0, ph0 = PAGE_SIZE_PRIOR
+    good = [b for b in boxes
+            if abs(b[2] - pw0) <= PAGE_SIZE_TOLERANCE * pw0
+            and abs(b[3] - ph0) <= PAGE_SIZE_TOLERANCE * ph0]
+    if len(good) >= 2:
+        return (int(np.median([b[2] for b in good])),
+                int(np.median([b[3] for b in good])), None)
+    if len(good) == 1:
+        # One pristine witness: its dimensions ARE this card's page, clamped
+        # into the prior band. Using the raw prior instead was measured to
+        # SHRINK pages on a card whose true size sits at the band's edge
+        # (bottom 200px of content cut) - the sickest cards are exactly
+        # where this matters.
+        lo_w, hi_w = pw0 * (1 - PAGE_SIZE_TOLERANCE), pw0 * (1 + PAGE_SIZE_TOLERANCE)
+        lo_h, hi_h = ph0 * (1 - PAGE_SIZE_TOLERANCE), ph0 * (1 + PAGE_SIZE_TOLERANCE)
+        return (int(min(max(good[0][2], lo_w), hi_w)),
+                int(min(max(good[0][3], lo_h), hi_h)), None)
+    ph = int(expected_page_height(boxes))
+    # Width fallback: median width of the FULL-HEIGHT boxes. The height
+    # estimator can lean on "the tallest box is a whole page" (fragments are
+    # shorter), but the widest box may be a fused ROW - wider than a page -
+    # so a max-anchored width is wrong in this direction.
+    full_h = [b[2] for b in boxes if abs(b[3] - ph) <= 0.2 * ph]
+    pw = int(np.median(full_h if full_h else [b[2] for b in boxes]))
+    return pw, ph, (f"Page-size prior {pw0}x{ph0} not matched by this card - "
+                    f"using per-card estimate {pw}x{ph}")
+
+
+def snap_pages(boxes, page_w, page_h, flags=None):
+    """The final geometry pass: every accepted detection becomes a full page
+    box. The blob gives position, the page size gives the dimensions, and
+    the row's grid (phase + pitch) decides which page a partial detection
+    belongs to - assignment is by CELL (nearest grid slot to the detection
+    center), not by gap-chaining, because a right-hand strip of one page
+    can sit closer to its neighbour page than to its own sibling strip
+    (production card 612130000029, detections 10+11+12).
+
+    Refused = detections that STRADDLE a cell boundary (bridging two pages'
+    spans beyond tolerance) - the one geometry no page explains. Their raw
+    box is kept in the output so the failing card can be inspected.
+
+    Returns (snapped_boxes, flags, notes, refused).
+    """
+    n = len(boxes)
+    flags = list(flags) if flags is not None else [False] * n
+    if n == 0:
+        return [], [], [], []
+
+    # Rows, span-limited on tops: every top in a row - fragment tops
+    # included - lies within one page height of the row's first top, while
+    # the next row's top lies at least a row gap beyond it. (Gap-chaining
+    # cannot do this: bottom-fragment tops sit closer to the next row than
+    # to their own anchors.)
+    order = sorted(range(n), key=lambda i: boxes[i][1])
+    rows = [[order[0]]]
+    row_start = boxes[order[0]][1]
+    for i in order[1:]:
+        if boxes[i][1] <= row_start + page_h:
+            rows[-1].append(i)
+        else:
+            rows.append([i])
+            row_start = boxes[i][1]
+
+    # A SINGLE detection spanning well over one page in either direction is
+    # merged content the split pass could not separate (bridged gaps, no
+    # valleys). It already carries the loud merged-pages warning; snapping
+    # would either shear real content or invent a split the binary gives no
+    # evidence for. Passed through untouched.
+    exempt = {i for i in range(n)
+              if boxes[i][2] > 1.25 * page_w or boxes[i][3] > 1.25 * page_h}
+
+    # Pitch is a property of the physical jacket, shared by all rows (rows
+    # start where they start, but the frame raster is one grid).
+    diffs = []
+    for row in rows:
+        xs = sorted(boxes[i][0] for i in row)
+        diffs += [b - a for a, b in zip(xs, xs[1:])
+                  if page_w * 0.8 <= b - a <= page_w * 1.6]
+    pitch = float(np.median(diffs)) if diffs else page_w * 1.05
+    tol = SNAP_PITCH_TOLERANCE * pitch
+
+    snapped, out_flags, notes, refused = [], [], [], []
+    for i in sorted(exempt):
+        snapped.append(boxes[i])
+        out_flags.append(bool(flags[i]))
+
+    for row in rows:
+        members = [i for i in row if i not in exempt]
+        if not members:
+            continue
+        row_boxes = [boxes[i] for i in members]
+
+        fulls = [b for b in row_boxes if b[3] >= 0.85 * page_h]
+        anchors = fulls or row_boxes
+        row_top = float(np.median([b[1] for b in anchors]))
+        row_bottom = float(np.median([b[1] + b[3] for b in anchors]))
+        y_lo = min(row_top, row_bottom - page_h)
+        y_hi = max(row_top, row_bottom - page_h)
+
+        # Grid phase from the members whose width already matches a page -
+        # strips must not vote, their x0 is not a page edge. A row with no
+        # such witness anchors on the strips' left edges instead (logged
+        # implicitly by their growth notes).
+        trusted = [b for b in row_boxes
+                   if abs(b[2] - page_w) <= 0.15 * page_w]
+        phase_src = trusted or row_boxes
+        ref = phase_src[0][0]
+        offsets = []
+        for b in phase_src:
+            d = (b[0] - ref) % pitch
+            if d > pitch / 2:
+                d -= pitch
+            offsets.append(d)
+        phase = ref + float(np.median(offsets))
+
+        # Cell assignment by detection center. A member may reach into the
+        # INTER-PAGE GAP (a dirty seam puts the split cut mid-gap rather
+        # than on the page edge) but never into the neighbour PAGE - that
+        # is the straddle no single page explains.
+        gap = max(0.0, pitch - page_w)
+        cells = {}
+        for i in members:
+            x0, y0, w, h = boxes[i]
+            k = round((x0 + w / 2 - phase - page_w / 2) / pitch)
+            cell_x = phase + k * pitch
+            if (x0 < cell_x - gap - tol
+                    or x0 + w > cell_x + page_w + gap + tol):
+                refused.append((i,))
+                notes.append(f"REFUSED snap of detection {i + 1}: spans "
+                             "beyond one grid cell (bridges two pages)")
+                snapped.append(boxes[i])
+                out_flags.append(bool(flags[i]))
+                continue
+            cells.setdefault(k, []).append(i)
+
+        for k in sorted(cells):
+            group = cells[k]
+            x = int(round(phase + k * pitch))
+            g_top = min(boxes[i][1] for i in group)
+            g_bottom = max(boxes[i][1] + boxes[i][3] for i in group)
+            # The credible edge: whichever of the group's top/bottom agrees
+            # better with the row consensus (washed-out tops leave the
+            # BOTTOM as the surviving edge; tilted cards need the group's
+            # own edge rather than one row-wide y).
+            top_err = abs(g_top - row_top)
+            bottom_err = abs(g_bottom - row_bottom)
+            y = g_top if top_err <= bottom_err else g_bottom - page_h
+            y = int(min(max(y, y_lo), y_hi))
+            covered = sum(boxes[i][2] * boxes[i][3] for i in group)
+            grown = 1.0 - min(1.0, covered / (page_w * page_h))
+            is_grown = grown > SNAP_GROWTH_MARK
+            snapped.append((x, y, page_w, page_h))
+            out_flags.append(bool(any(flags[i] for i in group) or is_grown))
+            if is_grown:
+                dets = "+".join(str(i + 1) for i in sorted(group))
+                notes.append(f"snapped detections {dets} to full page at "
+                             f"({x}, {y}) - {grown:.0%} of the page area "
+                             "grown to the known size")
+    return snapped, out_flags, notes, refused
+
+
 def make_anon_mask(shape, contours, dilate_radius):
     """Solid silhouettes of the detected blobs, strictly 0/255.
 
@@ -1621,9 +1802,59 @@ def main():
         quality = compute_card_quality(boxes_fullres, None)
     geo_indices = {i for i, f in enumerate(geo_flags) if f}
 
-    # Fragment guard on the REPAIRED geometry: whatever still matches the
-    # fragment signature could not be reconciled (refused merges re-detect
-    # here). The guard is unchanged - it just runs after the repair step.
+    # Card-level sanity: when geometry has to save more than half the card,
+    # the card is genuinely sick - repair must not become silent success.
+    geo_overload = repaired_count > GEOMETRY_MAX_REPAIR_SHARE * len(boxes_fullres)
+    if geo_overload:
+        print(f"\nERROR: geometry had to repair {repaired_count} of "
+              f"{len(boxes_fullres)} pages "
+              f"(limit {GEOMETRY_MAX_REPAIR_SHARE:.0%}) - card is sick, "
+              "not repairable", file=sys.stderr)
+
+    # Snap to the known page size (architecture addition, 2026-09-08 - the
+    # format's page size is a constant; blobs give position, the prior
+    # gives size). Runs BEFORE the guard's re-check: cell assignment
+    # reunites fragments the chain criteria cannot (a wash wider than the
+    # gap allowance splits a page into pieces the chains refuse to link,
+    # and the extension pass alone would leave the sibling as a ghost).
+    # Skipped on an already-failing card - it keeps raw geometry for
+    # diagnosis. Snap growth does NOT count toward the over-repair limit:
+    # normalizing to the known size is normal operation, and the coming
+    # occupancy check is the content verification, not this threshold.
+    snap_refused = []
+    if not (refused_groups or geo_overload):
+        geo_flags_list = [i in geo_indices for i in range(len(boxes_fullres))]
+        page_w, page_h, size_note = resolve_page_size(boxes_fullres)
+        if size_note:
+            print(f"\n{size_note}")
+        boxes_fullres, snap_flags, snap_notes, snap_refused = snap_pages(
+            boxes_fullres, page_w, page_h, flags=geo_flags_list)
+        snapped_count = sum(1 for note in snap_notes
+                            if note.startswith("snapped"))
+        if snap_notes:
+            print(f"\n{snapped_count} pages snapped to page size "
+                  f"{page_w} x {page_h}:")
+            for note in snap_notes:
+                print(f"  {note}")
+        tagged = sort_boxes_by_rows(
+            [b + (fl,) for b, fl in zip(boxes_fullres, snap_flags)])
+        boxes_fullres = [t[:4] for t in tagged]
+        geo_indices = {i for i, t in enumerate(tagged) if t[4]}
+        repaired_count = len(geo_indices)
+        if snap_notes:
+            quality = compute_card_quality(boxes_fullres, None)
+        if snap_refused:
+            print(f"\nERROR: {len(snap_refused)} suspected page fragment "
+                  "group(s) - detections irreconcilable with the page grid:",
+                  file=sys.stderr)
+            for group in snap_refused:
+                print("  detections "
+                      + "+".join(str(i + 1) for i in group), file=sys.stderr)
+
+    # Fragment guard re-check, now on the SNAPPED geometry: uniform pages
+    # normally leave it nothing, so what it finds is a genuine leftover
+    # (e.g. stacks involving the snap-exempt merged boxes). Refused merges
+    # fail the card via refused_groups regardless.
     fragment_groups = find_fragment_groups(boxes_fullres)
     fragment_indices = {i for group in fragment_groups for i in group}
     if fragment_groups:
@@ -1634,15 +1865,6 @@ def main():
             pages = "+".join(str(i + 1) for i in group)
             coords = ", ".join(str(boxes_fullres[i]) for i in group)
             print(f"  pages {pages}: {coords}", file=sys.stderr)
-
-    # Card-level sanity: when geometry has to save more than half the card,
-    # the card is genuinely sick - repair must not become silent success.
-    geo_overload = repaired_count > GEOMETRY_MAX_REPAIR_SHARE * len(boxes_fullres)
-    if geo_overload:
-        print(f"\nERROR: geometry had to repair {repaired_count} of "
-              f"{len(boxes_fullres)} pages "
-              f"(limit {GEOMETRY_MAX_REPAIR_SHARE:.0%}) - card is sick, "
-              "not repairable", file=sys.stderr)
 
     # Output coordinates
     print("\n=== PAGE COORDINATES (full resolution) ===")
@@ -1715,8 +1937,9 @@ def main():
         label += f"  |  {illum_note}"
     if repaired_count:
         label += f"  |  {repaired_count} geometry-completed"
-    if fragment_groups or refused_groups or geo_overload:
-        label = f"SUSPECT FRAGMENTS ({len(fragment_groups) + len(refused_groups)} group(s))  |  " + label
+    if fragment_groups or refused_groups or geo_overload or snap_refused:
+        n_suspect = len(fragment_groups) + len(refused_groups) + len(snap_refused)
+        label = f"SUSPECT FRAGMENTS ({n_suspect} group(s))  |  " + label
         banner_color = (0, 0, 200)
     cv2.putText(banner, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, banner_color, 2)
     viz = np.vstack([banner, viz])
@@ -1744,7 +1967,7 @@ def main():
     # invisible to the re-run guard, whose lower bound is 0.8), or a card
     # geometry had to repair more of than the limit. The source goes to
     # error/ for review, like the no-pages failure.
-    if fragment_groups or refused_groups or geo_overload:
+    if fragment_groups or refused_groups or geo_overload or snap_refused:
         print(f"\nERROR: suspected split pages in {input_file} - "
               "not extracting.", file=sys.stderr)
         print("  No _done sentinel written — this card will not be offered "

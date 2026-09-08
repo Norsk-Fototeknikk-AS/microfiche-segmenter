@@ -404,9 +404,25 @@ does not re-detect under the guard's 0.8 bound. Upper bound 1.8x stays
 (cross-row); field row gaps (840-920px) are ~2x the gap criterion, pinned
 by a row-boundary test with real coordinates.
 
+### Page-size prior + grid snap (2026-09-08, architecture addition)
+
+C15 in the README carries the model; what the file history adds: the snap
+was ordered as an ADDITION (existing passes untouched, Trond: "mye av det
+vi har gjort er riktig"), and it runs BEFORE the guard's re-check because
+cell assignment reunites what the chain criteria cannot (a wash wider than
+the 15% gap allowance splits a page into pieces the chains refuse to link,
+and the extension pass alone leaves the sibling as a ghost page - found by
+the washed-panorama e2e, exit 3 before the reorder). Cell assignment is by
+detection CENTER, phase from full-width members only - gap-chaining
+misassigns right-hand strips (card 612130000029: strip 11 glued to page 12
+instead of its own page 10), and one off-grid slot used to poison the
+phase median. A member may reach into the inter-page GAP (dirty seams put
+split cuts mid-gap) but never into the neighbour page. Field regression
+over both reports is a skipif-guarded committed test.
+
 ### Tests
 
-140 tests, ~19 s (was 32 when this was written). Unit tests for box
+154 tests, ~19 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 
