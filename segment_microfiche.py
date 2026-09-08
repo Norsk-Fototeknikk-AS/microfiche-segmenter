@@ -32,11 +32,12 @@ HEADER_SKIP_RATIO = 0.08  # Skip top 8% for yellow header
 MIN_PAGE_WIDTH_RATIO = 0.02
 MIN_PAGE_HEIGHT_RATIO = 0.02
 
-# Physical card limits (Trond, 2026-09-04): at most 5 rows of up to 11 pages,
+# Physical card limits (Trond, 2026-09-04; per-row raised 2026-09-08 after
+# rows of 12 were measured in production - 13 gives margin): at most 5 rows,
 # and no column structure at all - rows start where they start. Exceeding
 # either axis is itself a misdetection signal.
 MAX_ROWS = 5
-MAX_PAGES_PER_ROW = 11
+MAX_PAGES_PER_ROW = 13
 
 # Erosion used to separate touching pages. Both passes shrink every blob by a
 # known amount, which is added back to the boxes so they land on the true page
@@ -327,7 +328,8 @@ def detect_page_boxes(binary_img, header_skip_px, min_w, min_h):
 
 
 # No single microfiche page spans close to the whole card in either dimension
-# (real cards run up to 11 pages per row, up to 5 rows). A detection wider or taller than
+# (real cards run up to MAX_PAGES_PER_ROW pages per row, up to MAX_ROWS rows).
+# A detection wider or taller than
 # this share of the image is a polarity artifact - a full row or column read
 # as foreground - not a page.
 PAGE_MAX_SPAN = 0.6

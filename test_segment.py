@@ -226,22 +226,27 @@ from segment_microfiche import MAX_PAGES_PER_ROW, MAX_ROWS
 
 
 def test_card_limits_match_the_physical_cards():
+    """Trond 2026-09-08: rows of 12 pages measured in production, wants
+    margin - hence 13 (was 11)."""
     assert MAX_ROWS == 5
-    assert MAX_PAGES_PER_ROW == 11
+    assert MAX_PAGES_PER_ROW == 13
 
 
 def test_too_many_pages_in_a_row_warns(tmp_path):
-    """make_card's fixed pitch cannot hold 12 columns, so build a wide card."""
+    """One page beyond the limit must warn; derived from the constant so a
+    raised limit keeps this test honest."""
+    n = MAX_PAGES_PER_ROW + 1
     src = tmp_path / "612130000012_00012.jpg"
-    a = np.zeros((800, 6400), 'uint8')
-    for c in range(12):
+    width = 120 + n * 520
+    a = np.zeros((800, width), 'uint8')
+    for c in range(n):
         a[200:540, 60 + c * 520:460 + c * 520] = 255
-    pyvips.Image.new_from_memory(a.tobytes(), 6400, 800, 1, 'uchar').write_to_file(str(src))
+    pyvips.Image.new_from_memory(a.tobytes(), width, 800, 1, 'uchar').write_to_file(str(src))
     out = tmp_path / "card"
     proc = run_segmenter("-i", str(src), "-O", str(out),
                          "--skip-extraction", "--no-invert")
     assert proc.returncode == 0, proc.stderr
-    assert "12 pages in one row" in proc.stdout, proc.stdout
+    assert f"{n} pages in one row" in proc.stdout, proc.stdout
 
 
 def test_too_many_rows_warns(tmp_path):

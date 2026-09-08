@@ -373,7 +373,8 @@ Do not assume any of this works. None of it has been exercised.
   overlap stripes. Still unproven: real page texture (tape is uniform; fiche
   negatives are not), full cards, and page-to-page contrast.
 - ~~**`--order rows`.**~~ Confirmed correct 2026-09-04, from the domain:
-  real cards are rows-only — at most 5 rows of up to 11 pages, no column
+  real cards are rows-only — at most 5 rows of up to 13 pages (12 measured
+  in production 2026-09-08, +1 margin), no column
   structure, rows not vertically aligned. `--order columns` matches no real
   card and is kept only so existing callers do not break.
 - ~~**`--invert`.**~~ Exercised on the first real journal card 2026-09-04 —

@@ -388,7 +388,7 @@ appear loudly as `FEIL` lines in the summary.
    pages, rows are NOT vertically aligned with each other, and there is no
    column structure (Trond, 2026-09-04). Nothing in the score rewards or
    punishes column geometry, and the reported layout is honest: `3 rows:
-   4+4+4`, not an invented `NxM` grid. More than 5 rows or more than 11 pages
+   4+4+4`, not an invented `NxM` grid. More than 5 rows or more than 13 pages
    in a row is warned about as likely misdetection.
 10. Crop each page with the margin and write TIFFs in parallel (5 workers).
 11. Write the header band as `page_000.tif` (C11).
