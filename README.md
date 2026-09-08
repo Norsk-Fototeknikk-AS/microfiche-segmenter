@@ -126,8 +126,39 @@ A degenerate threshold takes the same path (2026-09-03). A (nearly) uniform
 image gives Otsu threshold 0, and a blank bright scan gives a real threshold
 with ~everything above it (`FOREGROUND_SANE_MAX`, 97 %); both would otherwise
 emit the whole card as one giant "page" — something wrong that looks normal.
-No re-thresholding heuristics: no real panorama has failed this way yet, so
-the failure is reported, not guessed around.
+
+**Re-thresholding, amended 2026-09-08 (Trond's decision).** This contract
+used to end "No re-thresholding heuristics: no real panorama has failed this
+way yet, so the failure is reported, not guessed around." That was written
+when no card had failed that way. In the 88-card production run **six did**,
+identically: 494_00012, 494_00036, 609_00012, 609_00024, 609_00036 and
+623_00024 all detected **zero** pages with the bottom band as their only
+structure run and 99–100 % of their foreground touching the image border.
+
+The mechanism is measured, not guessed. Grey levels on the committed fasit
+cards: **frame 2, page 33, stripe 55, jacket 226**. A page sits next to the
+*frame*, not next to the jacket, so a healthy card has one dark cluster
+{2…55} against the jacket, Otsu lands at ~131 in the wide gap, and
+`clear_border_connected` then removes frame and stripes and leaves the
+pages — border share 12–24 %. On an over-exposed card the page level has
+risen toward the jacket, the only dark mass left is the frame, and Otsu
+splits *frame against everything else* at 85–111. Every page then falls on
+the background side and the foreground that remains **is** the frame.
+
+So re-thresholding is no longer a heuristic guess: it is a second step for a
+diagnosed condition. It is allowed **only** as step two of a staircase, and
+only under these rules:
+
+- It runs **only** after a measured trigger says the first pass did not find
+  the card — never speculatively, never on a card that passed.
+- Step two must **prove itself** on its own result. If it cannot, the card is
+  refused with the reason it actually had (`threshold found only the frame;
+  re-threshold failed`) and both measurements in the message — never
+  "no pages detected", which would blame the card for a threshold's mistake.
+- Every step-two run is **visible**: its own log line with the trigger value,
+  the old and new threshold and what changed, and a mark in `SAMMENDRAG`.
+- Failure is still reported, never guessed around. The staircase adds one
+  diagnosed step; it does not add a search for something that works.
 
 ### C10. Exit codes
 
