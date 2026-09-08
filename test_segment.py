@@ -3681,3 +3681,4 @@ def test_the_physical_fasit_holds_the_counted_numbers():
     assert grids["612130000098_00012"] == "5 rows: 12+12+12+12+6", grids
     assert grids["612130000111_00012"] == "3 rows: 12+12+7", grids
     assert grids["612130000135_00012"] == "3 rows: 12+12+3", grids
+

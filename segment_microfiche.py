@@ -15,6 +15,7 @@ import argparse
 import platform
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import NamedTuple
 import os
 import shutil
 import sys
@@ -1486,6 +1487,126 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=(),
     return snapped, out_flags, notes, refused
 
 
+class ChainResult(NamedTuple):
+    """What the coordinate-only chain decided, and what main must print."""
+    boxes: list
+    repaired: set          # indices of pages a repair or the snap touched
+    fragment_groups: list
+    refused_groups: list
+    snap_refused: list
+    geo_overload: bool
+    substantial: int       # substantial repairs, for the overload message
+    quality: dict          # None when nothing changed the boxes
+    output: list           # (stream, text) in the order they were printed
+
+
+def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
+    """The coordinate-only part of the chain: geometric completion, the
+    over-repair judgement, the snap to the format page size, and the
+    fragment guard's re-check.
+
+    Nothing here reads the image, so a report carrying the PRE-REPAIR
+    detections (steg 5C) can be replayed through exactly this code and
+    reproduce what production shipped. main() prints the result and takes
+    the exit decision; this function decides the geometry. Extracted
+    verbatim from main 2026-09-08 - the printing order is preserved by
+    collecting the lines rather than emitting them here.
+    """
+    out = []
+
+    boxes, geo_flags, geo_notes, refused_groups = complete_geometry(boxes)
+    repaired_count = sum(geo_flags)
+    quality = None
+    if geo_notes:
+        out.append((1, f"\n{repaired_count} pages geometry-completed:"))
+        for note in geo_notes:
+            out.append((1, f"  {note}"))
+        # Repair changed boxes and counts: re-sort with the flags riding
+        # along (row grouping only reads elements 0/1/3, so the flag can sit
+        # at index 4), then rescore - the score must describe what ships.
+        tagged = sort_boxes_by_rows(
+            [b + (f,) for b, f in zip(boxes, geo_flags)])
+        boxes = [t[:4] for t in tagged]
+        geo_flags = [t[4] for t in tagged]
+        quality = compute_card_quality(boxes, None)
+    geo_indices = {i for i, f in enumerate(geo_flags) if f}
+
+    # Card-level sanity: when geometry has to save more than half the card,
+    # the card is genuinely sick - repair must not become silent success.
+    # Only SUBSTANTIAL repairs count toward condemning a card: a merge
+    # that tiles its union perfectly (0% invented - split-pass churn, clean
+    # fragment pairs) is bookkeeping, not fabrication. And at least 3 of
+    # them - on a one- or two-page card any single repair is already "most
+    # of the card".
+    substantial = sum(1 for m in re.findall(r"(\d+)% invented",
+                                            "\n".join(geo_notes))
+                      if int(m) >= 3)
+    geo_overload = (substantial >= 3 and
+                    substantial > GEOMETRY_MAX_REPAIR_SHARE * len(boxes))
+    if geo_overload:
+        out.append((2, f"\nERROR: geometry had to repair {substantial} of "
+                       f"{len(boxes)} pages substantially "
+                       f"(limit {GEOMETRY_MAX_REPAIR_SHARE:.0%}) - card is "
+                       "sick, not repairable"))
+
+    # Snap to the known page size (architecture addition, 2026-09-08 - the
+    # format's page size is a constant; blobs give position, the prior
+    # gives size). Runs BEFORE the guard's re-check: cell assignment
+    # reunites fragments the chain criteria cannot (a wash wider than the
+    # gap allowance splits a page into pieces the chains refuse to link,
+    # and the extension pass alone would leave the sibling as a ghost).
+    # Skipped on an already-failing card - it keeps raw geometry for
+    # diagnosis. Snap growth does NOT count toward the over-repair limit:
+    # normalizing to the known size is normal operation, and the coming
+    # occupancy check is the content verification, not this threshold.
+    snap_refused = []
+    if not (refused_groups or geo_overload):
+        geo_flags_list = [i in geo_indices for i in range(len(boxes))]
+        page_w, page_h, size_note = resolve_page_size(boxes)
+        if size_note:
+            out.append((1, f"\n{size_note}"))
+        boxes, snap_flags, snap_notes, snap_refused = snap_pages(
+            boxes, page_w, page_h, flags=geo_flags_list,
+            witnesses=witnesses, stripes=stripes, image_w=image_w)
+        snapped_count = sum(1 for note in snap_notes
+                            if note.startswith("snapped"))
+        if snap_notes:
+            out.append((1, f"\n{snapped_count} pages snapped to page size "
+                           f"{page_w} x {page_h}:"))
+            for note in snap_notes:
+                out.append((1, f"  {note}"))
+        tagged = sort_boxes_by_rows(
+            [b + (fl,) for b, fl in zip(boxes, snap_flags)])
+        boxes = [t[:4] for t in tagged]
+        geo_indices = {i for i, t in enumerate(tagged) if t[4]}
+        if snap_notes:
+            quality = compute_card_quality(boxes, None)
+        if snap_refused:
+            out.append((2, f"\nERROR: {len(snap_refused)} suspected page "
+                           "fragment group(s) - detections irreconcilable "
+                           "with the page grid:"))
+            for group in snap_refused:
+                out.append((2, "  detections "
+                               + "+".join(str(i + 1) for i in group)))
+
+    # Fragment guard re-check, now on the SNAPPED geometry: uniform pages
+    # normally leave it nothing, so what it finds is a genuine leftover
+    # (e.g. stacks involving the snap-exempt merged boxes). Refused merges
+    # fail the card via refused_groups regardless.
+    fragment_groups = find_fragment_groups(boxes)
+    if fragment_groups:
+        out.append((2, f"\nERROR: {len(fragment_groups)} suspected page "
+                       "fragment group(s) - stacked detections that do not "
+                       "reconcile with the page grid:"))
+        for group in fragment_groups:
+            pages = "+".join(str(i + 1) for i in group)
+            coords = ", ".join(str(boxes[i]) for i in group)
+            out.append((2, f"  pages {pages}: {coords}"))
+
+    return ChainResult(boxes, geo_indices, fragment_groups, refused_groups,
+                       snap_refused, geo_overload, substantial, quality, out)
+
+
 def make_anon_mask(shape, contours, dilate_radius):
     """Solid silhouettes of the detected blobs, strictly 0/255.
 
@@ -2362,105 +2483,27 @@ def main():
 
         boxes_fullres = refined
 
-    # Phase 2, geometric completion (2026-09-07 the guard BLOCKED these
-    # cards; 2026-09-08 Trond flipped it: stitching is fixed, content is
-    # intact, so grid-matching chains are repaired - merged or extended -
-    # and only irreconcilable geometry still fails).
-    boxes_fullres, geo_flags, geo_notes, refused_groups = \
-        complete_geometry(boxes_fullres)
-    repaired_count = sum(geo_flags)
-    if geo_notes:
-        print(f"\n{repaired_count} pages geometry-completed:")
-        for note in geo_notes:
-            print(f"  {note}")
-        # Repair changed boxes and counts: re-sort with the flags riding
-        # along (row grouping only reads elements 0/1/3, so the flag can sit
-        # at index 4), then rescore - the score must describe what ships.
-        tagged = sort_boxes_by_rows(
-            [b + (f,) for b, f in zip(boxes_fullres, geo_flags)])
-        boxes_fullres = [t[:4] for t in tagged]
-        geo_flags = [t[4] for t in tagged]
-        quality = compute_card_quality(boxes_fullres, None)
-    geo_indices = {i for i, f in enumerate(geo_flags) if f}
-
-    # Card-level sanity: when geometry has to save more than half the card,
-    # the card is genuinely sick - repair must not become silent success.
-    # Only SUBSTANTIAL repairs count toward condemning a card: a merge
-    # that tiles its union perfectly (0% invented - split-pass churn, clean
-    # fragment pairs) is bookkeeping, not fabrication. And at least 3 of
-    # them - on a one- or two-page card any single repair is already "most
-    # of the card".
-    substantial = sum(1 for m in re.findall(r"(\d+)% invented",
-                                            "\n".join(geo_notes))
-                      if int(m) >= 3)
-    geo_overload = (substantial >= 3 and
-                    substantial > GEOMETRY_MAX_REPAIR_SHARE * len(boxes_fullres))
-    if geo_overload:
-        print(f"\nERROR: geometry had to repair {substantial} of "
-              f"{len(boxes_fullres)} pages substantially "
-              f"(limit {GEOMETRY_MAX_REPAIR_SHARE:.0%}) - card is sick, "
-              "not repairable", file=sys.stderr)
-
-    # Snap to the known page size (architecture addition, 2026-09-08 - the
-    # format's page size is a constant; blobs give position, the prior
-    # gives size). Runs BEFORE the guard's re-check: cell assignment
-    # reunites fragments the chain criteria cannot (a wash wider than the
-    # gap allowance splits a page into pieces the chains refuse to link,
-    # and the extension pass alone would leave the sibling as a ghost).
-    # Skipped on an already-failing card - it keeps raw geometry for
-    # diagnosis. Snap growth does NOT count toward the over-repair limit:
-    # normalizing to the known size is normal operation, and the coming
-    # occupancy check is the content verification, not this threshold.
-    snap_refused = []
-    if not (refused_groups or geo_overload):
-        geo_flags_list = [i in geo_indices for i in range(len(boxes_fullres))]
-        page_w, page_h, size_note = resolve_page_size(boxes_fullres)
-        if size_note:
-            print(f"\n{size_note}")
-        witnesses_fullres = [
-            (int(x / detect_scale), int(y / detect_scale),
-             int(w / detect_scale), int(h / detect_scale))
-            for (x, y, w, h) in small_witnesses]
-        boxes_fullres, snap_flags, snap_notes, snap_refused = snap_pages(
-            boxes_fullres, page_w, page_h, flags=geo_flags_list,
-            witnesses=witnesses_fullres, stripes=stripes_fullres,
-            image_w=original_width)
-        snapped_count = sum(1 for note in snap_notes
-                            if note.startswith("snapped"))
-        if snap_notes:
-            print(f"\n{snapped_count} pages snapped to page size "
-                  f"{page_w} x {page_h}:")
-            for note in snap_notes:
-                print(f"  {note}")
-        tagged = sort_boxes_by_rows(
-            [b + (fl,) for b, fl in zip(boxes_fullres, snap_flags)])
-        boxes_fullres = [t[:4] for t in tagged]
-        geo_indices = {i for i, t in enumerate(tagged) if t[4]}
-        repaired_count = len(geo_indices)
-        if snap_notes:
-            quality = compute_card_quality(boxes_fullres, None)
-        if snap_refused:
-            print(f"\nERROR: {len(snap_refused)} suspected page fragment "
-                  "group(s) - detections irreconcilable with the page grid:",
-                  file=sys.stderr)
-            for group in snap_refused:
-                print("  detections "
-                      + "+".join(str(i + 1) for i in group), file=sys.stderr)
-
-    # Fragment guard re-check, now on the SNAPPED geometry: uniform pages
-    # normally leave it nothing, so what it finds is a genuine leftover
-    # (e.g. stacks involving the snap-exempt merged boxes). Refused merges
-    # fail the card via refused_groups regardless.
-    fragment_groups = find_fragment_groups(boxes_fullres)
+    # Phase 2 and the snap: one coordinate-only chain, extracted 2026-09-08
+    # so a report's PRE-REPAIR line can be replayed through exactly this
+    # code. main keeps the printing and the exit decision.
+    witnesses_fullres = [
+        (int(x / detect_scale), int(y / detect_scale),
+         int(w / detect_scale), int(h / detect_scale))
+        for (x, y, w, h) in small_witnesses]
+    chain = repair_and_snap(boxes_fullres, witnesses_fullres,
+                            stripes_fullres, original_width)
+    for stream, text in chain.output:
+        print(text, file=sys.stdout if stream == 1 else sys.stderr)
+    boxes_fullres = chain.boxes
+    geo_indices = chain.repaired
+    repaired_count = len(geo_indices)
+    fragment_groups = chain.fragment_groups
     fragment_indices = {i for group in fragment_groups for i in group}
-    if fragment_groups:
-        print(f"\nERROR: {len(fragment_groups)} suspected page fragment "
-              "group(s) - stacked detections that do not reconcile with "
-              "the page grid:", file=sys.stderr)
-        for group in fragment_groups:
-            pages = "+".join(str(i + 1) for i in group)
-            coords = ", ".join(str(boxes_fullres[i]) for i in group)
-            print(f"  pages {pages}: {coords}", file=sys.stderr)
+    refused_groups = chain.refused_groups
+    snap_refused = chain.snap_refused
+    geo_overload = chain.geo_overload
+    if chain.quality is not None:
+        quality = chain.quality
 
     # Validate against the physical card: more rows or more pages per row
     # than any real card holds is a misdetection signal in itself. Judged on
