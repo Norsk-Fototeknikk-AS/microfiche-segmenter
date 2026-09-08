@@ -467,6 +467,32 @@ page. Do not add closing/smoothing to the mask or draw directly on the output.
 
 ---
 
+## Risk log: card 135's row 1 sits on five different y values
+
+Found 2026-09-08 while pinning the physical page count. In the shipped
+production output of `65223c2` (RAPPORT-2026-09-08-8, standard mode), card
+612130000135's first row holds pages at **y = 3040, 3050, 3130, 3210 and
+3240** — a 200 px spread — and its third row at **9940 and 10170**. The
+fasit says pages share their top edge within a row.
+
+The page COUNT is verified correct: Trond counted 27 on the physical card
+and the run produced 27. So this is not about how many pages, but about
+where their crops sit. Two hypotheses, not yet separated:
+
+1. **Real per-cell skew.** 135 is the faded card; each cell kept its own
+   surviving edge, and that is the best evidence available per page.
+2. **The anchor giving way to noise.** The row consensus lost to per-cell
+   evidence that was itself unreliable.
+
+**How to tell them apart, no code needed:** open the crops from 135's first
+row in Finder after the batch run. If the tops of the pages are cut, the
+anchor is wrong (hypothesis 2). If there is jacket above the text, the crops
+are merely generous and the skew is real (hypothesis 1). That answer is the
+intended basis for the still-unordered occupancy check. Nothing is built for
+this yet, deliberately.
+
+---
+
 ## What is UNPROVEN
 
 Do not assume any of this works. None of it has been exercised.

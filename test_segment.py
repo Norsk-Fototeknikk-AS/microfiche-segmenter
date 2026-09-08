@@ -3596,3 +3596,88 @@ def test_the_split_gate_never_shrinks_on_a_fragment_heavy_card():
     assert suspected_merged_boxes(boxes, pw, ph) == []
     # ...and the fragments themselves are not "pages" either way
     assert not can_hold_two_pages(boxes[0], pw, ph)
+
+
+# --- Fysisk fasit (2026-09-08): sidetall talt paa de ekte kortene -----------
+
+PHYSICAL_FASIT = REPO / "testdata" / "fysisk_telling_2026-09-08.txt"
+
+
+def _physical_fasit():
+    """[(stem, pages, grid, boxes)] - the production output of code 65223c2
+    for the three cards Trond counted by hand."""
+    out = []
+    for line in PHYSICAL_FASIT.read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        head, coords = line.split(" | ")
+        stem, pages, grid = head.split(None, 2)
+        out.append((stem, int(pages), grid,
+                    [tuple(int(v) for v in b.split(","))
+                     for b in coords.split("; ")]))
+    return out
+
+
+def test_the_physically_counted_cards_are_pinned():
+    """Ground truth: Trond counted the pages on the PHYSICAL cards
+    2026-09-08 against the production run of code 65223c2 (standard mode,
+    RAPPORT-2026-09-08-8). All three matched exactly - 612130000098 = 54
+    pages, 612130000111 = 31, 612130000135 = 27 - and those coordinates are
+    what this pins.
+
+    HOW STRONG THIS IS, measured rather than assumed (2026-09-08). Eight
+    plausible parameter changes were applied one at a time to see which turn
+    it red. It caught ONE: a gross page-size change (prior height 2780 ->
+    2200). It did NOT catch a 2780 -> 2700 prior change, PAGE_SIZE_TOLERANCE
+    0.10 -> 0.02, SNAP_PITCH_TOLERANCE 0.15 -> 0.02, the row-clustering
+    overlap 0.4 -> 0.9 or -> 0.05, SNAP_IMPOSSIBLE_RATIO 1.5 -> 1.0, or the
+    full-anchor threshold 0.85 -> 0.99.
+
+    The reason is inherent: the input here is the SHIPPED output - uniform,
+    page-sized, already on the grid - and almost any parameterisation
+    handles that input correctly. So treat this as a RECORD of ground truth
+    with a light guard against gross drift, NOT as a safety net. The
+    coordinates are here to be diffed against the next production report,
+    which is the comparison that would actually catch a regression.
+
+    It deliberately does not require the snap to reproduce its own output.
+    Measured: re-snapping shipped geometry moves boxes in y (098 up to 13
+    px, 111 up to 5, 135 up to 230), because the snap anchors each cell on
+    that cell's own surviving edge and clamps to the row consensus - feed it
+    uniform boxes and the row median wins instead. That is the design.
+
+    The caveat, so nobody reads this as stronger than it is: the physical
+    count confirms 65223c2 on THESE three cards at the time of counting. A
+    future change in DETECTION can still move a page count without turning
+    any test here red - that shows up first in the next report.
+
+    The data lives in testdata/ on purpose: the other field regression reads
+    ~/Desktop/Mikrofiche-feltdata and is skipif-guarded, so it never runs on
+    m4-studio - which is exactly where OPPDATER.command runs the suite.
+    """
+    checked = 0
+    for stem, pages, grid, boxes in _physical_fasit():
+        assert len(boxes) == pages, (stem, len(boxes), pages)
+
+        pw, ph, note = resolve_page_size(boxes)
+        assert note is None, (stem, note)
+        snapped, flags, notes, refused = snap_pages(boxes, pw, ph)
+
+        assert refused == [], (stem, notes)
+        assert len(snapped) == pages, (stem, len(snapped), pages)
+        assert all(b[2:] == (pw, ph) for b in snapped), (stem, "page size")
+        assert compute_card_quality(boxes, None)["grid"] == grid, (
+            stem, compute_card_quality(boxes, None)["grid"], grid)
+        checked += 1
+    assert checked == 3, checked
+
+
+def test_the_physical_fasit_holds_the_counted_numbers():
+    counted = {s: p for s, p, _, _ in _physical_fasit()}
+    assert counted == {"612130000098_00012": 54,
+                       "612130000111_00012": 31,
+                       "612130000135_00012": 27}, counted
+    grids = {s: g for s, _, g, _ in _physical_fasit()}
+    assert grids["612130000098_00012"] == "5 rows: 12+12+12+12+6", grids
+    assert grids["612130000111_00012"] == "3 rows: 12+12+7", grids
+    assert grids["612130000135_00012"] == "3 rows: 12+12+3", grids
