@@ -198,6 +198,61 @@ def illumination_plan(thumb):
     return field, norm, float(thresh), share
 
 
+def otsu_excluding(thumb, mask):
+    """Otsu over the pixels where mask == 0, or None if nothing is left.
+
+    Step two of the staircase (C9, steg 7). A page sits next to the FRAME in
+    grey level, not next to the jacket - fasit levels frame 2, page 33,
+    stripe 55, jacket 226 - so a healthy card has one dark cluster and Otsu
+    lands in the wide gap below the jacket. When over-exposure lifts the
+    pages toward the jacket, the frame is the only dark mass left and Otsu
+    splits FRAME against everything else (measured 85-111 on six field
+    cards), putting every page on the background side. Take the frame and
+    the known structure out of the histogram and the false valley goes with
+    it. Masking is by POSITION, never by level, so the frame's colour -
+    which varies from jacket to jacket - does not matter.
+    """
+    keep = thumb[mask == 0]
+    if keep.size < 2 or keep.min() == keep.max():
+        return None
+    thresh, _ = cv2.threshold(keep.reshape(-1, 1), 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return float(thresh)
+
+
+# The staircase's trigger and its proof (C9, steg 7). Validated on all 88
+# production cards: border share is a FRACTION of total foreground, so a
+# card with few pages reads high even when thresholding is perfect (card
+# 418: 5 pages, 85.5 %, quality 100). It therefore cannot trigger on its
+# own - the trigger is that the first pass demonstrably did not find the
+# card, AND that what foreground it did find is essentially all frame.
+STEP2_BORDER_TRIGGER = 0.40      # lowest triggering field card: 62.4 %
+STEP2_BORDER_MUST_HALVE = 0.5    # proof: the share must at least halve
+
+
+def frame_mask(thumb, thresh, header_px):
+    """Pixels step two keeps OUT of its histogram: the header band and the
+    dark structure connected to the image border - frame, edge bands and the
+    stripes that reach the edge. Selected by POSITION, never by level, so
+    the frame's colour (which varies from jacket to jacket) does not matter.
+    """
+    dark = ((thumb <= thresh) * 255).astype(np.uint8)
+    h, w = dark.shape
+    ff = np.zeros((h + 2, w + 2), np.uint8)
+    for x in range(w):
+        for y in (0, h - 1):
+            if dark[y, x]:
+                cv2.floodFill(dark, ff, (x, y), 0)
+    for y in range(h):
+        for x in (0, w - 1):
+            if dark[y, x]:
+                cv2.floodFill(dark, ff, (x, y), 0)
+    mask = ((thumb <= thresh) & (dark == 0)).astype(np.uint8)
+    if header_px > 0:
+        mask[:header_px, :] = 1
+    return mask
+
+
 def illumination_local_threshold(otsu_thresh, field, norm, box,
                                  full_w, full_h):
     """Scalar threshold for a full-res crop: otsu scaled by the mean field
@@ -607,7 +662,7 @@ def clear_border_connected(binary_img):
 
 def detect_page_boxes(binary_img, header_skip_px, min_w, min_h,
                       collect_witnesses=False, structure_rows_out=None,
-                      report_scale=1.0):
+                      report_scale=1.0, border_share_out=None):
     """The detect-scale pipeline: mask header, remove card structure, erode,
     drop border-connected foreground, find and size-filter contours.
 
@@ -641,6 +696,8 @@ def detect_page_boxes(binary_img, header_skip_px, min_w, min_h,
     binary_img = cv2.erode(binary_img, kernel, iterations=DETECT_ERODE_ITERATIONS)
 
     removed = clear_border_connected(binary_img)
+    if border_share_out is not None:
+        border_share_out.append(removed)
     if removed > 0:
         log_lines.append(f"Removed border-connected structure: "
                          f"{removed:.1%} of foreground")
@@ -1515,6 +1572,11 @@ class ChainResult(NamedTuple):
     quality: dict          # None when nothing changed the boxes
     output: list           # (stream, text) in the order they were printed
     card_refusals: list    # reasons this card must not ship (steg 6A/6B)
+    evidence_refused: bool # ...and whether the EVIDENCE guard was one of
+                           # them. An explicit flag, not a search for words
+                           # in a human sentence: the staircase's trigger
+                           # depends on it, and re-wording a layout message
+                           # must never be able to change control flow.
 
 
 def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
@@ -1531,6 +1593,7 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
     """
     out = []
     refusals = []
+    evidence_refusals = []
     detections_in = len(boxes)
 
     boxes, geo_flags, geo_notes, refused_groups = complete_geometry(boxes)
@@ -1628,16 +1691,18 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
                    f"detections (ratio {ratio:.2f}, refused above "
                    f"{EVIDENCE_MAX_PAGES_PER_DETECTION:g})"))
     if ratio > EVIDENCE_MAX_PAGES_PER_DETECTION:
-        refusals.append(
+        evidence_refusals.append(
             f"{len(boxes)} pages laid out from only {detections_in} "
             f"detections (ratio {ratio:.2f}, limit "
             f"{EVIDENCE_MAX_PAGES_PER_DETECTION:g}) - the card was composed "
             "from rests, not read")
     if detections_in < EVIDENCE_MIN_DETECTIONS and len(boxes) > detections_in:
-        refusals.append(
+        evidence_refusals.append(
             f"too little evidence to lay out a card: {detections_in} "
             f"detection(s) (minimum {EVIDENCE_MIN_DETECTIONS}) AND "
             f"{len(boxes) - detections_in} page(s) invented on top of them")
+
+    refusals.extend(evidence_refusals)
 
     # Layout invariants (steg 6B): a physical card holds at most MAX_ROWS
     # rows of at most MAX_PAGES_PER_ROW pages. These were warnings until
@@ -1655,7 +1720,7 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
 
     return ChainResult(boxes, geo_indices, fragment_groups, refused_groups,
                        snap_refused, geo_overload, substantial, quality, out,
-                       refusals)
+                       refusals, bool(evidence_refusals))
 
 
 def make_anon_mask(shape, contours, dilate_radius):
@@ -2061,7 +2126,7 @@ def run_mode(args):
     return "bakgrunn-foerst" if args.background_first else "standard"
 
 
-def main():
+def main(otsu_override=None, step2=False, step1_border=None):
     parser = argparse.ArgumentParser(description='Segment microfiche pages')
     # Not argparse-required: a missing input must exit 1 (generic failure),
     # while argparse errors exit 2 and would collide with EXIT_NO_PAGES.
@@ -2194,6 +2259,11 @@ def main():
     thumb = np.ndarray(buffer=thumb_vips.write_to_memory(), dtype=np.uint8,
                        shape=[thumb_vips.height, thumb_vips.width])
     illum_field, illum_norm, otsu_thresh, reclassified = illumination_plan(thumb)
+    first_pass_thresh = otsu_thresh
+    if otsu_override is not None:
+        otsu_thresh = otsu_override
+        print(f"Step 2 threshold in use: {otsu_thresh:.0f} "
+              f"(first pass had {first_pass_thresh:.0f})")
     print(f"Otsu threshold: {otsu_thresh:.0f} (illumination-flattened; "
           f"flattening re-classified {reclassified:.1%} of thumbnail pixels)")
     # The measurement goes in the log on EVERY run (steg 5B): it is how the
@@ -2315,11 +2385,14 @@ def main():
     print(f"Skipping top {header_skip_px_small} pixels in downsampled image (header region)")
     print(f"Detecting pages (erosion kernel={DETECT_ERODE_KERNEL})...")
     structure_rows = []   # detect-scale y-runs of the deleted stripes
+    border_share_out = []
     boxes, filtered_contours, binary_img, det_log, small_witnesses = \
         detect_page_boxes(binary_img, header_skip_px_small, min_w, min_h,
                           collect_witnesses=True,
                           structure_rows_out=structure_rows,
-                          report_scale=1 / detect_scale)
+                          report_scale=1 / detect_scale,
+                          border_share_out=border_share_out)
+    border_share = border_share_out[0] if border_share_out else 0.0
     for line in det_log:
         print(line)
     # The stripes are the row boundaries (steg 2): full-res in the report so
@@ -2332,11 +2405,55 @@ def main():
 
     print(f"Found {len(boxes)} potential pages")
 
+    # The staircase (C9, steg 7): when the first threshold demonstrably did
+    # not find the card and what it did find is essentially all frame, try
+    # ONE second threshold with the frame and the known structure taken out
+    # of the histogram - then run the whole pass again on its result. Step
+    # two earns nothing: the card must pass every guard on its own.
+    def try_step_two(why):
+        if step2 or otsu_override is not None or args.background_first:
+            return None
+        if border_share <= STEP2_BORDER_TRIGGER:
+            return None
+        header_px_thumb = int(thumb.shape[0] * args.header_skip)
+        mask = frame_mask(thumb, first_pass_thresh, header_px_thumb)
+        flat = np.clip(thumb.astype(np.float32)
+                       * (illum_norm / cv2.resize(illum_field,
+                                                  (thumb.shape[1],
+                                                   thumb.shape[0]),
+                                                  interpolation=cv2.INTER_LINEAR)),
+                       0, 255).astype(np.uint8)
+        new_thresh = otsu_excluding(flat, mask)
+        print(f"\nStep 2 threshold: trigger {why}, border "
+              f"{border_share:.0%} (over {STEP2_BORDER_TRIGGER:.0%}), "
+              f"otsu {first_pass_thresh:.0f} -> "
+              f"{'none' if new_thresh is None else format(new_thresh, '.0f')}")
+        if new_thresh is None or abs(new_thresh - first_pass_thresh) < 1:
+            print("  Step 2 found no different threshold - not retrying",
+                  file=sys.stderr)
+            return None
+        return new_thresh
+
+    if not boxes and not degenerate:
+        retry = try_step_two("0 detections")
+        if retry is not None:
+            return main(otsu_override=retry, step2=True,
+                        step1_border=border_share)
+
     # Fail loudly on a total detection failure. Writing an empty card folder
     # would be worse than useless: the OCR app skips empty folders silently, so
     # the card would vanish from the queue with no error anywhere.
     if degenerate or not boxes:
-        reason = degenerate or "no pages detected"
+        # C9: after a step-two attempt the card must be told the reason it
+        # actually had. "no pages detected" would blame the card for a
+        # threshold's mistake - the staircase ran and did not recover it.
+        if not boxes and step2:
+            reason = (f"threshold found only the frame; re-threshold failed "
+                      f"(border {step1_border:.0%} -> {border_share:.0%}, "
+                      f"second threshold {otsu_thresh:.0f} found no pages "
+                      "either)")
+        else:
+            reason = degenerate or "no pages detected"
         print(f"\nERROR: {reason} in {input_file}", file=sys.stderr)
         print("  No _done sentinel written — this card will not be offered for import.",
               file=sys.stderr)
@@ -2573,8 +2690,37 @@ def main():
     snap_refused = chain.snap_refused
     geo_overload = chain.geo_overload
     card_refusals = chain.card_refusals
+    if chain.evidence_refused:
+        retry = try_step_two("evidence guard refused the card")
+        if retry is not None:
+            return main(otsu_override=retry, step2=True,
+                        step1_border=border_share)
     if chain.quality is not None:
         quality = chain.quality
+
+    # Step two must prove itself (C9): the border share has to at least
+    # halve against the first pass, and the page size must come from the
+    # format prior rather than a per-card estimate. Otherwise the card is
+    # refused with the reason it actually had.
+    if step2:
+        first_border = step1_border if step1_border is not None else 1.0
+        proved = border_share <= STEP2_BORDER_MUST_HALVE * first_border
+        _pw, _ph, size_note = resolve_page_size(boxes_fullres)
+        # Only a fall to the per-card ESTIMATE counts against step two: a
+        # single-witness note means the prior DID match, just thinly.
+        off_prior = bool(size_note and size_note.startswith("Page-size prior"))
+        if not proved or off_prior:
+            card_refusals = card_refusals + [
+                f"threshold found only the frame; re-threshold failed "
+                f"(border {first_border:.0%} -> {border_share:.0%}, needed "
+                f"{STEP2_BORDER_MUST_HALVE * first_border:.0%} or less"
+                + ("" if not off_prior else "; page size still off-prior")
+                + ")"]
+            print(f"\nERROR: {card_refusals[-1]}", file=sys.stderr)
+        else:
+            print(f"\nStep 2 proved itself: border {first_border:.0%} -> "
+                  f"{border_share:.0%}, {len(boxes_fullres)} pages on the "
+                  "format prior")
 
     # Coverage guard: did the boxes cover what the threshold saw? The one
     # signal that survives any upstream mistake (row-banding collapse put a

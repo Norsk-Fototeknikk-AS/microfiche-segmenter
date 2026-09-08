@@ -3909,3 +3909,162 @@ def test_a_full_row_at_the_limit_still_passes():
     boxes = _row_of(MAX_PAGES_PER_ROW)
     chain = repair_and_snap(boxes, (), (), 29071 + 2180)
     assert chain.card_refusals == [], chain.card_refusals
+
+
+# --- Steg 7 (2026-09-08): the staircase's second threshold -----------------
+# Six cards detected ZERO pages with the bottom band as their only structure
+# run and 99-100 % of their foreground touching the image border. Grey
+# levels on the fasit: frame 2, page 33, stripe 55, jacket 226 - a page sits
+# next to the FRAME, not next to the jacket. On an over-exposed card the
+# page level rises toward the jacket, the only dark mass left is the frame,
+# and Otsu splits frame against everything else at 85-111. Masking the frame
+# and the known structure out of the histogram removes that false valley.
+
+from segment_microfiche import otsu_excluding, PAGE_SIZE_PRIOR
+
+
+def _tri_modal_thumb():
+    """A card as the faded ones measure: black frame, pages just under the
+    jacket level, jacket. Global Otsu splits frame vs rest and loses every
+    page; with the frame masked out the pages separate."""
+    h, w = 200, 300
+    a = np.full((h, w), 226, np.uint8)          # jacket
+    a[:12, :] = 2; a[-12:, :] = 2               # frame
+    a[:, :12] = 2; a[:, -12:] = 2
+    for c in range(4):                          # pages, faintly darker
+        a[40:160, 30 + c * 65:30 + c * 65 + 50] = 195
+    mask = np.zeros((h, w), np.uint8)           # what step two masks away
+    mask[:12, :] = 1; mask[-12:, :] = 1
+    mask[:, :12] = 1; mask[:, -12:] = 1
+    return a, mask
+
+
+def test_the_frame_drags_global_otsu_below_every_page():
+    """The measured failure: with the frame in the histogram the split lands
+    between frame and card, so no page is foreground."""
+    a, _mask = _tri_modal_thumb()
+    thresh, _ = cv2.threshold(a, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    assert thresh < 195, thresh          # pages are ABOVE it: background
+    # measured: the split lands at 2 - frame against everything else, and
+    # every page is on the background side
+    assert int((a <= thresh).sum()) == int((a == 2).sum()), "only the frame"
+
+
+def test_masking_the_frame_separates_the_pages():
+    a, mask = _tri_modal_thumb()
+    thresh = otsu_excluding(a, mask)
+    assert 195 <= thresh < 226, thresh
+    found = (a <= thresh) & (mask == 0)
+    assert int(found.sum()) == 4 * 120 * 50, int(found.sum())
+
+
+def test_otsu_excluding_falls_back_when_everything_is_masked():
+    a, _ = _tri_modal_thumb()
+    assert otsu_excluding(a, np.ones_like(a)) is None
+
+
+def test_otsu_excluding_leaves_a_healthy_histogram_alone():
+    """A healthy card has pages in the dark cluster, so removing the frame
+    barely moves the threshold - step two must be safe if it ever runs."""
+    h, w = 200, 300
+    a = np.full((h, w), 226, np.uint8)
+    a[:12, :] = 2; a[-12:, :] = 2; a[:, :12] = 2; a[:, -12:] = 2
+    for c in range(4):
+        a[40:160, 30 + c * 65:30 + c * 65 + 50] = 33      # real pages
+    mask = np.zeros((h, w), np.uint8)
+    mask[:12, :] = 1; mask[-12:, :] = 1; mask[:, :12] = 1; mask[:, -12:] = 1
+    plain, _ = cv2.threshold(a, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    masked = otsu_excluding(a, mask)
+    assert masked == plain == 33, (masked, plain)
+    for t in (plain, masked):
+        assert int(((a <= t) & (mask == 0)).sum()) == 4 * 120 * 50, t
+
+
+def _tri_modal_card(path, page_level=195):
+    """A card as the six zero-detection field cards measure: black frame all
+    round, a dark stripe, and pages only faintly below the jacket - at the
+    FORMAT page size, because step two must prove itself against the prior
+    and a toy-sized card could never satisfy that."""
+    pw, ph, pitch = PAGE_SIZE_PRIOR[0], PAGE_SIZE_PRIOR[1], 2180
+    h, w = 5200, 400 + 3 * pitch
+    a = np.full((h, w), 226, np.uint8)
+    a[:150, :] = 2; a[-150:, :] = 2; a[:, :150] = 2; a[:, -150:] = 2
+    a[600:820, :] = 55                                   # stripe above row 1
+    for c in range(3):
+        a[900:900 + ph, 300 + c * pitch:300 + c * pitch + pw] = page_level
+    pyvips.Image.new_from_memory(a.tobytes(), w, h, 1,
+                                 'uchar').write_to_file(str(path))
+
+
+def test_the_staircase_recovers_a_card_the_first_threshold_lost(tmp_path):
+    """The whole point: 12 pages the first Otsu cannot see, because the
+    frame owns the histogram. Step two must find them and say so."""
+    src = tmp_path / "612130000012_00012.jpg"
+    _tri_modal_card(src)
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    out = proc.stdout + proc.stderr
+
+    assert "Step 2 threshold:" in out, out
+    assert "Step 2 proved itself" in out, out
+    assert proc.returncode == 0, out
+    rows = [l for l in (tmp_path / "card" / "page_coordinates.csv"
+                        ).read_text().splitlines()[2:] if l]
+    assert len(rows) == 3, (len(rows), out)
+
+
+def test_the_staircase_leaves_a_healthy_card_alone(tmp_path):
+    """Same geometry, pages at a normal density: the first pass finds them
+    and step two must never run."""
+    src = tmp_path / "612130000012_00012.jpg"
+    _tri_modal_card(src, page_level=33)
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    out = proc.stdout + proc.stderr
+
+    assert "Step 2" not in out, out
+    assert proc.returncode == 0, out
+    rows = [l for l in (tmp_path / "card" / "page_coordinates.csv"
+                        ).read_text().splitlines()[2:] if l]
+    assert len(rows) == 3, (len(rows), out)
+
+
+def test_step_two_reports_its_own_failure_honestly(tmp_path):
+    """C9: after the staircase has run, the card must be told the reason it
+    actually had. "no pages detected" blames the card for a threshold's
+    mistake - and that is exactly what this printed until the synthetic
+    empty card exposed it."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.full((5200, 6940), 226, np.uint8)
+    a[:150, :] = 2; a[-150:, :] = 2; a[:, :150] = 2; a[:, -150:] = 2
+    pyvips.Image.new_from_memory(a.tobytes(), 6940, 5200, 1,
+                                 'uchar').write_to_file(str(src))
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 2, (proc.returncode, out)
+    assert "Step 2 threshold:" in out, "the staircase must have run"
+    assert "re-threshold failed" in out, out
+    assert "no pages detected" not in out, out
+
+
+def test_summary_marks_a_card_that_went_through_step_two():
+    """C9's visibility rule: never silent. A card that needed the second
+    threshold must be visible as such in SAMMENDRAG, not just in its own
+    log."""
+    line = rapport.summary_line("kort_a", 0, 12, 0, quality=94.0,
+                                grid="1 row: 12", step2=True)
+    assert "TRINN2" in line, line
+    plain = rapport.summary_line("kort_a", 0, 12, 0, quality=94.0,
+                                 grid="1 row: 12")
+    assert "TRINN2" not in plain, plain
+
+
+def test_parse_step_two_reads_the_log():
+    out = "...\nStep 2 threshold: trigger 0 detections, border 100%...\n"
+    assert rapport.used_step_two(out) is True
+    assert rapport.used_step_two("nothing here") is False

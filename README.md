@@ -469,6 +469,48 @@ kind has no whole page left to anchor the expected height. The generous union
 band covers the measured fasit case (1.6×), but proportions beyond that
 escape the guard.
 
+### C21. The staircase: one diagnosed second threshold
+
+C9 allows re-thresholding only as step two, after a measured trigger. This
+is that step.
+
+**Trigger** — validated on all 88 production cards:
+`(0 detections OR the evidence guard refused the card) AND border share >
+STEP2_BORDER_TRIGGER (40 %)`. Border share alone does **not** work and the
+first proposal to use it would have refused correct cards: it is a fraction
+of *total* foreground, so a card with few pages reads high even when
+thresholding is perfect — card 418 has 5 pages, 85.5 % border and quality
+100.0, and card 630 (which must pass) reads 76.4 %. Measured over the batch,
+the composite trigger fires on exactly the 11 threshold failures and on no
+card that passes today.
+
+**Step two** (`otsu_excluding`) recomputes Otsu with the frame, the header
+band and the border-connected structure taken out of the histogram — by
+**position, never by level**, because the frame's colour varies from jacket
+to jacket. On the synthetic replica of the field failure the global
+threshold lands at 2 (frame against everything) and finds no page; masked,
+it lands at 195 and finds every one. On a healthy card both give 33 — step
+two is a no-op if it ever runs.
+
+**It proves itself or the card is refused.** The border share must at least
+halve (`STEP2_BORDER_MUST_HALVE`) and the page size must come from the
+format prior rather than a per-card estimate. Then the *whole* pass runs
+again from the new threshold — same code, no exemptions — and the card must
+satisfy every guard on its own.
+
+**Consequence worth knowing:** step two can only prove itself on a card in
+the journal format, since the proof requires the page-size prior. A faded
+card in a *different* format is refused even if step two recovered its pages
+perfectly. That is deliberate — we cannot tell a recovered off-format card
+from a mis-thresholded one — but it is the first thing to look at if a
+genuinely different format appears in the batch.
+
+**Never silent:** a `Step 2 threshold: trigger …, border … → …, otsu … → …`
+line in the log, and `TRINN2` on the card's row in `SAMMENDRAG`. When step
+two runs and still finds nothing, the card is told the reason it *had* —
+`threshold found only the frame; re-threshold failed` — never "no pages
+detected", which would blame the card for a threshold's mistake.
+
 ### C19. A card must be FOUND, not composed
 
 Full production run of `65223c2`, 88 cards, 2026-09-08. A new failure class

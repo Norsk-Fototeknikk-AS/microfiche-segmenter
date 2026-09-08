@@ -54,13 +54,19 @@ QUALITY_WARN_BELOW = 50  # field data 2026-09-07: sick cards < 50, healthy > 74
 QUALITY_POOR_BELOW = 60  # segment_microfiche grades below this as POOR
 
 
+def used_step_two(output):
+    """Did this card need the staircase's second threshold? (C9, steg 7 -
+    a step-two run is never silent.)"""
+    return "Step 2 threshold:" in output
+
+
 def parse_grid(output):
     m = re.search(r"Detected grid: (.+)", output)
     return m.group(1).strip() if m else None
 
 
 def summary_line(stem, exit_code, pages, fragment_groups, anon_missing=False,
-                 quality=None, grid=None):
+                 quality=None, grid=None, step2=False):
     if anon_missing:
         # Whatever the exit code said: without the anonymized image the card
         # cannot be inspected across the air gap, and a missing expected
@@ -74,6 +80,8 @@ def summary_line(stem, exit_code, pages, fragment_groups, anon_missing=False,
     # at quality 52.5 and the summary just said OK (2026-09-08).
     detail = f"  kv {quality if quality is not None else '?':>5}"
     detail += f"  {grid or '?':<20}"
+    if step2:
+        detail += "  TRINN2"
     if exit_code == 0:
         # A card the segmenter is not confident about must not read as fine.
         label = ("SVAK    " if quality is not None
@@ -164,7 +172,8 @@ def run_report(source_folder, report_dir, open_finder=True, extra_args=()):
                                      count_fragment_groups(output),
                                      anon_missing=not anon.exists(),
                                      quality=parse_quality(output),
-                                     grid=parse_grid(output)))
+                                     grid=parse_grid(output),
+                                     step2=used_step_two(output)))
 
     ok = sum(1 for r in rows if r.startswith("OK"))
     svak = sum(1 for r in rows if r.startswith("SVAK"))
