@@ -2944,3 +2944,77 @@ def test_report_lists_the_structure_rows_it_removed(tmp_path):
                   proc.stdout, re.M)
     assert m, proc.stdout
     assert "Removed" in proc.stdout and "structure row-run" in proc.stdout
+
+
+# --- Steg 3 (2026-09-08): position witnesses take the row's anchor ---------
+# Field card 612130000098: row 2's eight members were bottom fragments and
+# snapped bottom-anchored to y=7790; the four witness pages in the same row
+# landed at y=8872 - the MIDPOINT of the y_lo/y_hi band, not the row's
+# anchor - dropping the card from 93.7 to 76.0 with four correct pages
+# found. Field card 612130000135: a 50x1990 sliver (sleeve edge) at
+# x=27980 claimed page 28 in a 13th column, box reaching to 30020 on a
+# 29071 px image. Witnesses take the row's anchor, must be page-like in
+# BOTH dimensions, and must claim a cell inside the image and inside the
+# card's observed column raster.
+
+def _card_098_row2():
+    members = [(10870 + k * 2180, 9960, 2050, 620) for k in range(8)]  # bottoms
+    rests = [(2150 + k * 2180, 10200, 1930, 380) for k in range(4)]
+    return members, rests
+
+
+def test_witness_page_takes_the_row_anchor_not_the_band_midpoint():
+    members, rests = _card_098_row2()
+    snapped, flags, notes, refused = snap_pages(members, 2050, 2790,
+                                                witnesses=rests)
+    assert refused == [], notes
+    ys = {b[1] for b in snapped}
+    assert ys == {7790}, sorted(ys)
+    assert len(snapped) == 12, len(snapped)
+
+
+def test_witness_sliver_is_refused_as_not_page_like():
+    """50 px wide is a sleeve edge, not a page rest: real field witnesses
+    measure 520-1930 wide and 220-420 tall."""
+    row = [(19260 + k * 2180, 10170, 2040, 2760) for k in range(3)]
+    sliver = [(25800, 10055, 50, 1990)]           # inside the next cell
+    snapped, flags, notes, refused = snap_pages(row, 2040, 2760,
+                                                witnesses=sliver,
+                                                image_w=29071)
+    assert len(snapped) == 3, snapped
+    assert any("witness" in n and "ignored" in n for n in notes), notes
+
+
+def test_witness_cell_outside_the_image_is_refused():
+    """135 page 28: cell at x=27980 reaches 30020 > 29071."""
+    row = [(19260 + k * 2180, 10170, 2040, 2760) for k in range(4)]
+    rest = [(28000, 10400, 600, 400)]              # page-like, but off-card
+    snapped, flags, notes, refused = snap_pages(row, 2040, 2760,
+                                                witnesses=rest,
+                                                image_w=29071)
+    assert len(snapped) == 4, snapped
+    assert any("witness" in n and "ignored" in n for n in notes), notes
+
+
+def test_witness_cell_outside_the_observed_column_raster_is_refused():
+    """Row 1 spans columns x=1880..25860; a rest in a 13th column at 28040
+    (inside the image) is still outside the card's raster."""
+    row1 = [(1880 + k * 2180, 3040, 2040, 2760) for k in range(12)]
+    row3 = [(19320 + k * 2180, 10170, 2040, 2760) for k in range(3)]
+    rest = [(28100, 10400, 600, 400)]
+    snapped, flags, notes, refused = snap_pages(row1 + row3, 2040, 2760,
+                                                witnesses=rest,
+                                                image_w=40000)
+    assert len(snapped) == 15, len(snapped)
+    assert any("witness" in n and "ignored" in n for n in notes), notes
+
+
+def test_witness_inside_the_raster_still_claims_its_page():
+    row1 = [(1880 + k * 2180, 3040, 2040, 2760) for k in range(12)]
+    row3 = [(19320 + k * 2180, 10170, 2040, 2760) for k in range(3)]
+    rest = [(26100, 10400, 600, 400)]              # column 12, empty in row 3
+    snapped, flags, notes, refused = snap_pages(row1 + row3, 2040, 2760,
+                                                witnesses=rest,
+                                                image_w=29071)
+    assert len(snapped) == 16, len(snapped)
+    assert (25860, 10170, 2040, 2760) in snapped, snapped

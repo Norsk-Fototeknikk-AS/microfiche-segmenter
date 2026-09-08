@@ -935,7 +935,12 @@ def resolve_page_size(boxes):
                     f"using per-card estimate {pw}x{ph}")
 
 
-def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=()):
+WITNESS_MIN_DIM_SHARE = 0.05    # of page width AND height: a 50 px sleeve
+                                # edge (field card 135) is not a page rest
+
+
+def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=(),
+               image_w=None):
     """The final geometry pass: every accepted detection becomes a full page
     box. The blob gives position, the page size gives the dimensions, and
     the row's grid (phase + pitch) decides which page a partial detection
@@ -951,7 +956,12 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=()):
     Witnesses are sub-min-size blobs: they never build rows and never vote
     on phase, pitch or row edges - but a witness inside an otherwise EMPTY
     cell of an existing row claims a full page there (field card
-    612130000098 lost half a row to the min-size filter).
+    612130000098 lost half a row to the min-size filter). A witness page
+    takes its ROW's anchor y (steg 3: the band midpoint put 098's four
+    witness pages 1082 px below their row), must be page-like in both
+    dimensions, and its cell must lie inside the image (image_w) and inside
+    the card's observed column raster (135: a 50x1990 sleeve edge claimed a
+    13th column reaching past the image edge).
 
     Stripes (steg 2, 2026-09-08, Trond's architecture) are the dark
     edge-to-edge bands between page rows that remove_structure_rows deleted,
@@ -1034,6 +1044,7 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=()):
 
     snapped, out_flags, notes, refused = [], [], [], []
     origins = []   # detection indices behind each snapped PAGE (not exempt)
+    row_ctx = []   # per-row grid/anchor, for the witness pass
     for i in sorted(exempt):
         snapped.append(boxes[i])
         out_flags.append(bool(flags[i]))
@@ -1145,29 +1156,63 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=()):
                              f"({x}, {y}) - {grown:.0%} of the page area "
                              "grown to the known size")
 
-        # Position witnesses: a sub-min blob whose center falls inside this
-        # row's y-envelope and inside an otherwise EMPTY cell proves the
-        # cell holds a page.
+        # Row context for the witness pass below: the row's y-envelope, its
+        # grid, and the anchor its cells actually got.
         row_y0 = min(boxes[i][1] for i in members)
         row_y1 = max(boxes[i][1] + boxes[i][3] for i in members)
-        witness_ks = set()
-        for (wx, wy, ww, wh) in witnesses:
-            if ww * wh < WITNESS_MIN_AREA_SHARE * page_w * page_h:
-                continue
-            cy = wy + wh / 2
-            if not (row_y0 <= cy <= row_y1):
-                continue
-            k = round((wx + ww / 2 - phase - page_w / 2) / pitch)
-            if k in cells or k in witness_ks:
-                continue
-            witness_ks.add(k)
-            x = int(round(phase + k * pitch))
-            y = int(round((y_lo + y_hi) / 2))
-            snapped.append((x, y, page_w, page_h))
-            out_flags.append(True)
-            origins.append(())
-            notes.append(f"page from position witness at ({x}, {y}) - a "
-                         f"{ww}x{wh} rest proves the cell holds a page")
+        row_ys = [snapped[k][1] for k, o in enumerate(origins)
+                  if o and set(o) <= set(members)]
+        row_ctx.append(dict(y0=row_y0, y1=row_y1, phase=phase, cells=set(cells),
+                            anchor=(int(np.median(row_ys)) if row_ys
+                                    else int(round((y_lo + y_hi) / 2))),
+                            slot=slot))
+
+    # Position witnesses: a sub-min blob whose center falls inside a row's
+    # y-envelope and inside an otherwise EMPTY cell proves the cell holds a
+    # page. Runs after every row is placed so the card's column raster is
+    # known: a cell must lie inside the image and inside [min x, max x] of
+    # the pages the card actually has.
+    # The raster is cross-row evidence: with a single row there is nothing
+    # to compare against (098's own case is half a row of rests LEFT of
+    # every detected page), so it only binds on cards with >= 2 rows.
+    page_xs = [snapped[k][0] for k, o in enumerate(origins) if o]
+    raster = ((min(page_xs), max(page_xs))
+              if page_xs and len(row_ctx) >= 2 else None)
+    for (wx, wy, ww, wh) in witnesses:
+        if ww * wh < WITNESS_MIN_AREA_SHARE * page_w * page_h:
+            continue
+        cy = wy + wh / 2
+        ctx = next((r for r in row_ctx if r["y0"] <= cy <= r["y1"]), None)
+        if ctx is None:
+            continue
+        k = round((wx + ww / 2 - ctx["phase"] - page_w / 2) / pitch)
+        if k in ctx["cells"]:
+            continue
+        x = int(round(ctx["phase"] + k * pitch))
+        why = None
+        if ww < WITNESS_MIN_DIM_SHARE * page_w or wh < WITNESS_MIN_DIM_SHARE * page_h:
+            why = (f"a {ww}x{wh} rest is not page-like (needs >= "
+                   f"{WITNESS_MIN_DIM_SHARE:.0%} of the page in both directions)")
+        elif x < 0 or (image_w is not None and x + page_w > image_w):
+            why = f"cell {x}-{x + page_w} reaches outside the image"
+        elif raster and not (raster[0] - tol <= x <= raster[1] + tol):
+            why = (f"cell at x={x} lies outside the card's column raster "
+                   f"{raster[0]}-{raster[1]}")
+        if why:
+            notes.append(f"position witness at ({wx}, {wy}) ignored: {why}")
+            continue
+        ctx["cells"].add(k)
+        y = ctx["anchor"]
+        if not fits(y, ctx["slot"]):
+            if ctx["slot"][0] is not None:
+                y = max(y, ctx["slot"][0])
+            if ctx["slot"][1] is not None:
+                y = min(y, ctx["slot"][1] - page_h)
+        snapped.append((x, y, page_w, page_h))
+        out_flags.append(True)
+        origins.append(())
+        notes.append(f"page from position witness at ({x}, {y}) - a "
+                     f"{ww}x{wh} rest proves the cell holds a page")
 
     # Invariants (Trond, 2026-09-08): no two page boxes overlap, no page box
     # crosses a stripe. A violation is a wrong guess somewhere above, and
@@ -2123,7 +2168,8 @@ def main():
             for (x, y, w, h) in small_witnesses]
         boxes_fullres, snap_flags, snap_notes, snap_refused = snap_pages(
             boxes_fullres, page_w, page_h, flags=geo_flags_list,
-            witnesses=witnesses_fullres, stripes=stripes_fullres)
+            witnesses=witnesses_fullres, stripes=stripes_fullres,
+            image_w=original_width)
         snapped_count = sum(1 for note in snap_notes
                             if note.startswith("snapped"))
         if snap_notes:

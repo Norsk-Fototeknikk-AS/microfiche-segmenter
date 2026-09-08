@@ -389,6 +389,16 @@ never vote on phase/pitch/edges, but one with real mass (≥ 0.5 % of a page —
 a 20×10 speck of dirt once claimed a phantom cell on the real fasit) inside
 an otherwise empty cell of an existing row claims a full page there (field
 card 612130000098 lost half a row to the min-size filter).
+Steg 3 (2026-09-08) tightened the witness rules on field evidence: the
+witness page takes its **row's anchor y** (the band midpoint put 098's four
+witness pages 1082 px below the rest of their row — quality 93.7 → 76.0
+with four *correct* pages found); a witness must be page-like in **both**
+dimensions (`WITNESS_MIN_DIM_SHARE`, 5 % of page width and height — real
+field rests measure 520–1930 × 220–420, the 50×1990 sleeve edge that
+claimed page 28 on card 135 does not); and the claimed cell must lie inside
+the image and, on cards with ≥ 2 rows, inside the card's observed column
+raster (135's phantom sat in a 13th column reaching past the image edge).
+Ignored witnesses are logged (`position witness … ignored: <why>`).
 
 The signature (`find_fragment_groups`): detections sharing an x-span
 (interval IoU ≥ 0.8) with vertical gaps ≤ 15 % of the expected page height
