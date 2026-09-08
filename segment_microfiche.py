@@ -355,6 +355,7 @@ STRIPE_COVERAGE = 0.85
 # coverage dip inside a row used to be deleted as "structure" (card 111
 # lost the bottom of row 2 that way; 036, 050, 098, 104 and 029 the same).
 STRIPE_REF_HEIGHT = 21505.0
+PAGE_SIZE_PRIOR_H = 2780        # page height of the journal format (C15)
 STRIPE_MIN_H = 80 / STRIPE_REF_HEIGHT        # real stripes 100-420 px; the
                                              # false slivers 10-20 px
 STRIPE_MERGE_GAP = 60 / STRIPE_REF_HEIGHT    # card 074's stripe is cut in
@@ -363,6 +364,13 @@ STRIPE_MERGE_GAP = 60 / STRIPE_REF_HEIGHT    # card 074's stripe is cut in
 STRIPE_RASTER_TOL = 150 / STRIPE_REF_HEIGHT  # false runs sit 400-600 px off
 STRIPE_SOLID_COVERAGE = 0.95                 # fasit stripes measure
                                              # 0.99-1.00; a 12-page row 0.846
+# A stripe raster is one page row plus a stripe: the field pitch is
+# 3360-3470 against a 2780 px page, i.e. 1.21-1.25 page heights. Capping at
+# 1.6 makes DOUBLE pitch (2.5x) impossible - without the cap, a card with
+# one missing stripe hands the fit to a raster of every other stripe, which
+# fills perfectly (3 of 3) and beats the real one (4 of 5), leaving the
+# stripes between it in the binary and dissolving a row slot.
+STRIPE_MAX_PITCH = 1.6 * PAGE_SIZE_PRIOR_H / STRIPE_REF_HEIGHT
 
 
 def coalesce_runs(runs, max_gap):
@@ -377,10 +385,14 @@ def coalesce_runs(runs, max_gap):
     return [(a, b) for a, b in merged]
 
 
-def fit_stripe_raster(centers, min_pitch, tol):
+def fit_stripe_raster(centers, min_pitch, tol, max_pitch=None):
     """(anchor, pitch) of the jacket's stripe raster, or None when there is
     too little evidence to fit one. Fitted per card, not assumed: the first
     stripe measures 5820-6370 across the field cards.
+
+    Pitch is bounded above (max_pitch): a raster of every OTHER stripe fills
+    perfectly on a card with one stripe missing, and would win on
+    completeness alone.
 
     Scored on how COMPLETELY the raster is filled, then on how many
     candidates it explains. Support alone is not enough - a dense cluster of
@@ -394,7 +406,7 @@ def fit_stripe_raster(centers, min_pitch, tol):
         for anchor in centers:
             for other in centers:
                 pitch = other - anchor
-                if pitch < min_pitch:
+                if pitch < min_pitch or (max_pitch and pitch > max_pitch):
                     continue
                 hits = [c for c in centers
                         if min((c - anchor) % pitch,
@@ -458,7 +470,11 @@ def classify_structure_runs(runs, coverages, height, min_page_h,
             candidates.append((run, cov))
 
     centers = [(a + b) / 2 for (a, b), _ in candidates]
-    raster = fit_stripe_raster(centers, 2 * min_page_h, tol)
+    raster = fit_stripe_raster(centers, 2 * min_page_h, tol,
+                               STRIPE_MAX_PITCH * height)
+    if raster is None and candidates:
+        rejected.append(((0, 0), f"raster not fitted: {len(candidates)} "
+                                 "candidate(s) - all kept as structure"))
     for (run, cov), c in zip(candidates, centers):
         a, b = run
         if raster is None:
@@ -528,9 +544,16 @@ def remove_structure_rows(binary_img, min_page_h, top_boundary,
     # threshold row by row, shredding it into 1-row "stripes"; and a real
     # stripe can be cut in two (card 074, 40 px apart). Real stripes sit
     # thousands of rows apart, so bridging STRIPE_MERGE_GAP is safe.
-    merged = coalesce_runs([tuple(r) for r in runs],
-                           max(1, int(round(STRIPE_MERGE_GAP * h))))
-    covs = [float(coverage[a:b].mean()) for a, b in merged]
+    raw = [tuple(r) for r in runs]
+    merged = coalesce_runs(raw, max(1, int(round(STRIPE_MERGE_GAP * h))))
+    # Coverage over the rows that were actually full-width, NOT over the
+    # bridged gaps - those sit below the bar by definition, and averaging
+    # them in drags a cut stripe (card 074) toward the solidity floor.
+    covs = []
+    for a, b in merged:
+        rows = [coverage[ra:rb] for ra, rb in raw if ra >= a and rb <= b]
+        covs.append(float(np.concatenate(rows).mean()) if rows
+                    else float(coverage[a:b].mean()))
 
     structure, rejected = classify_structure_runs(
         merged, covs, h, min_page_h, top_boundary, report_scale)
@@ -1022,7 +1045,7 @@ def complete_geometry(boxes):
 # prior or run with a per-card estimate - resolve_page_size falls back to
 # the estimate LOUDLY whenever no detection lands near the prior, so an
 # off-format card never gets silently forced into journal size.
-PAGE_SIZE_PRIOR = (2050, 2780)
+PAGE_SIZE_PRIOR = (2050, PAGE_SIZE_PRIOR_H)
 PAGE_SIZE_TOLERANCE = 0.10      # per-card fine-tune bound around the prior
 SNAP_PITCH_TOLERANCE = 0.15     # of the pitch: max offset from a grid slot
 SNAP_GROWTH_MARK = 0.05         # area growth share that marks a page blue

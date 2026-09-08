@@ -469,10 +469,21 @@ explains — a dense cluster of false runs inside one row (098 had eight)
 otherwise supports a finer pitch that hits more candidates while leaving most
 of its own positions empty.
 
+The pitch is bounded above by `STRIPE_MAX_PITCH` (1.6 × the page-height
+prior): a stripe raster is one page row plus a stripe, measured at 1.21–1.25
+page heights. Without the bound, a card with **one missing stripe** hands the
+fit to a raster of every *other* stripe — it fills perfectly (3 of 3) and
+beats the real one (4 of 5), leaving the stripes between it in the binary and
+dissolving a row slot. With fewer than three candidates no raster is fitted;
+all of them are then kept as structure and the log says so.
+
 Runs are coalesced across `STRIPE_MERGE_GAP` (60 px full-res) first: card 074
 carries one stripe cut in two 40 px apart, while real stripes sit ~3400 px
-apart. A raster position with no candidate is logged as a MISSING stripe —
-its slot then spans two rows, and the C15 invariants still hold.
+apart. **Coverage is measured over the full-width rows only, never over the
+bridged gap** — averaging the cut in reads 0.91 on 074's stripe and refuses
+a real stripe as "not solid enough". A raster position with no candidate is
+logged as a MISSING stripe — its slot then spans two rows, and the C15
+invariants still hold.
 
 Every run is logged either way, thickness and coverage included, so the next
 A/B calibrates against real numbers rather than against these first ones.

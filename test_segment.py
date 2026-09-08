@@ -3046,7 +3046,9 @@ def test_witness_inside_the_raster_still_claims_its_page():
 # only 0.846. Thickness alone is not enough (104's 260 and 280 px false
 # runs, 050's 340 px): POSITION on the card's raster is what convicts them.
 
-from segment_microfiche import classify_structure_runs, coalesce_runs
+from segment_microfiche import (classify_structure_runs, coalesce_runs,
+                                fit_stripe_raster, STRIPE_RASTER_TOL,
+                                STRIPE_MAX_PITCH)
 
 STRIPE_FASIT = REPO / "testdata" / "stripe_fasit_2026-09-08.txt"
 CARD_H, CARD_MIN_PAGE_H, CARD_HEADER = 21505, 430, 1720
@@ -3272,3 +3274,77 @@ def test_summary_counts_svak_cards_separately(tmp_path):
                                     open_finder=False)
     head = (report_dir / "SAMMENDRAG.txt").read_text().split("\n\n")[0]
     assert "SVAK:" in head, head
+
+
+# --- Steg 4A2 (2026-09-08): two holes in the raster fit ---------------------
+# Review findings from the leader, neither visible in the fasit (no field
+# card is missing a stripe, and no field coverage is recorded):
+#   1. With a stripe missing, DOUBLE pitch fills perfectly (3 of 3) and beats
+#      the real raster (4 of 5) - the stripes between then read as
+#      "off-raster", stay in the binary, and a row slot disappears.
+#   2. The coverage of a coalesced run averaged over the bridged gap too,
+#      which by definition sits below the run threshold: card 074's cut
+#      stripe lands near 0.95 and can be refused as "not solid enough".
+
+def _raster_runs(missing=()):
+    """Six stripes on the field raster (pitch 3455), minus the given ones."""
+    return [(2630 + k * 3455, 2880 + k * 3455) for k in range(6)
+            if k not in missing]
+
+
+def test_a_missing_stripe_does_not_hand_the_raster_to_double_pitch():
+    runs = _raster_runs(missing=(3,)) + [(20690, 21510)]
+    stripes, rejected = classify_structure_runs(
+        runs, [1.0] * len(runs), CARD_H, CARD_MIN_PAGE_H, CARD_HEADER)
+
+    assert len(stripes) == 6, (stripes, rejected)   # 5 stripes + bottom band
+    assert all(r in stripes for r in _raster_runs(missing=(3,))), stripes
+    assert any("MISSING" in why for _, why in rejected), rejected
+
+
+def test_double_pitch_is_refused_even_when_it_fills_perfectly():
+    """Only every other stripe survives: the raster that 'fits' is twice the
+    real pitch, which is physically impossible - a stripe pitch is ~1.24
+    page heights, never 2.5."""
+    centers = [2755 + k * 6910 for k in range(3)]
+    assert fit_stripe_raster(centers, 2 * CARD_MIN_PAGE_H,
+                             STRIPE_RASTER_TOL * CARD_H,
+                             STRIPE_MAX_PITCH * CARD_H) is None
+
+
+def test_the_real_pitch_is_still_accepted():
+    centers = [2755 + k * 3455 for k in range(6)]
+    fit = fit_stripe_raster(centers, 2 * CARD_MIN_PAGE_H,
+                            STRIPE_RASTER_TOL * CARD_H,
+                            STRIPE_MAX_PITCH * CARD_H)
+    assert fit is not None and abs(fit[1] - 3455) < 1, fit
+
+
+def test_coalesced_stripe_coverage_ignores_the_bridged_gap():
+    """Card 074's stripe is cut in two. Averaging over the cut drags the
+    coverage to ~0.94 and the real stripe gets kept in the binary."""
+    h, w = 2151, 2907
+    b = np.zeros((h, w), np.uint8)
+    for k in range(6):
+        y = 222 + k * 344
+        b[y:y + 30, :] = 255
+    b[578:582, :] = 0                       # the cut, mid-stripe
+    b[578:582, :int(w * 0.30)] = 255        # 30 % coverage inside the cut
+
+    removed, runs, notes = remove_structure_rows(b, min_page_h=43,
+                                                 top_boundary=172)
+
+    assert removed == 6, ("the cut stripe was kept in the binary",
+                          removed, runs, notes)
+    cut = [text for run, text in notes if run[0] <= 570 <= run[1]]
+    assert cut and cut[0].startswith("stripe"), notes
+    # Averaged over the cut this reads 0.91 and falls under the 0.95 floor.
+    assert "coverage 1.00" in cut[0], cut[0]
+
+
+def test_log_says_when_no_raster_could_be_fitted():
+    runs = [(2630, 2880), (20690, 21510)]
+    stripes, rejected = classify_structure_runs(
+        runs, [1.0, 1.0], CARD_H, CARD_MIN_PAGE_H, CARD_HEADER)
+    assert len(stripes) == 2, stripes
+    assert any("raster not fitted" in why for _, why in rejected), rejected
