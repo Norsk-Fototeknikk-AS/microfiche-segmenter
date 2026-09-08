@@ -468,7 +468,15 @@ measured with Digital Color Meter. Viewing copies contain journal data and
 stay on the machine; they are never report artifacts.
 
 Every segmenter run starts with an `Env:` line (python/numpy/opencv/pyvips
-versions) so each captured rapport.txt documents the environment it ran in.
+versions, the code's short git SHA or `ukjent`, and the mode — `standard`
+or `bakgrunn-foerst`) so each captured rapport.txt documents the environment
+AND the code that produced it. `SAMMENDRAG.txt` carries the same `Kode:` /
+`Modus:` header. Added 2026-09-08 after two same-day report sets differed
+with nothing in either saying which code ran — and after the planned A/B
+turned out never to have happened: `RAPPORT.command` forwarded only the
+folder, so a flagged run silently became a standard run. It now forwards
+every extra argument, and **`RAPPORT-BAKGRUNN.command`** is the
+double-click B side (calls `RAPPORT.command` with `--background-first`).
 
 ## How detection works
 

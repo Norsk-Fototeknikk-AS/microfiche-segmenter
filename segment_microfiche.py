@@ -1483,11 +1483,36 @@ def refine_box_local(input_file, box, otsu_thresh, orig_w, orig_h,
     return refined
 
 
+
+def code_version(repo=None):
+    """Short git SHA of the code that is running, read straight from .git
+    (no subprocess: Finder launches with no PATH). 'ukjent' when the repo
+    metadata is missing, so a report never claims a version it cannot
+    prove. Two same-day report sets once differed with nothing in either
+    saying which code ran."""
+    repo = Path(repo) if repo else Path(__file__).resolve().parent
+    try:
+        head = (repo / ".git" / "HEAD").read_text().strip()
+        if head.startswith("ref:"):
+            ref = head.split(None, 1)[1]
+            ref_file = repo / ".git" / ref
+            if ref_file.exists():
+                head = ref_file.read_text().strip()
+            else:
+                packed = (repo / ".git" / "packed-refs").read_text()
+                head = next(line.split()[0] for line in packed.splitlines()
+                            if line.endswith(" " + ref))
+        return head[:7] if re.fullmatch(r"[0-9a-f]{40,64}", head) else "ukjent"
+    except (OSError, StopIteration, IndexError):
+        return "ukjent"
+
+
+def run_mode(args):
+    """The word for the binarization mode, as printed in every report."""
+    return "bakgrunn-foerst" if args.background_first else "standard"
+
+
 def main():
-    # One line per run so every captured log documents the environment it ran
-    # in - environment drift on the offline machine was once a suspect.
-    print(f"Env: python {platform.python_version()}, numpy {np.__version__}, "
-          f"opencv {cv2.__version__}, pyvips {pyvips.__version__}")
     parser = argparse.ArgumentParser(description='Segment microfiche pages')
     # Not argparse-required: a missing input must exit 1 (generic failure),
     # while argparse errors exit 2 and would collide with EXIT_NO_PAGES.
@@ -1554,6 +1579,12 @@ def main():
                              'Off by default: the OCR app reads loose image files in the '
                              'card folder as pages.')
     args = parser.parse_args()
+    # One line per run so every captured log documents the environment it ran
+    # in - environment drift on the offline machine was once a suspect - AND
+    # which code and mode produced it (steg 1, 2026-09-08).
+    print(f"Env: python {platform.python_version()}, numpy {np.__version__}, "
+          f"opencv {cv2.__version__}, pyvips {pyvips.__version__}, "
+          f"code {code_version()}, mode {run_mode(args)}")
 
     if not args.input:
         print("ERROR: --input is required", file=sys.stderr)

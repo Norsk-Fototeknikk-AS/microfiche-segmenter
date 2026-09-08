@@ -2767,3 +2767,77 @@ def test_a_double_height_merger_does_not_glue_two_rows():
     assert (10730, 3300, 2040, 6380) in snapped, "merger must pass through raw"
     ys = sorted({b[1] for b in snapped if b[3] == 2780})
     assert ys == [3300, 6900], f"rows glued or re-anchored: {ys}"
+
+
+# --- Steg 1 (2026-09-08): provenance in every report ------------------------
+import re
+from segment_microfiche import code_version
+# Two report runs on the same day gave different results with nothing in
+# either saying which code or which mode ran; and the A/B for
+# --background-first never happened because RAPPORT.command forwarded only
+# the folder. Every rapport.txt and SAMMENDRAG must name the code version
+# and the mode.
+
+def test_code_version_is_a_short_sha_or_ukjent():
+    v = code_version()
+    assert v == "ukjent" or re.fullmatch(r"[0-9a-f]{7,12}", v), v
+
+
+def test_env_line_names_code_version_and_standard_mode(tmp_path):
+    src = tmp_path / "612130000012_00001.jpg"
+    make_card(src)
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    env = proc.stdout.splitlines()[0]
+    assert env.startswith("Env:"), env
+    assert f"code {code_version()}" in env, env
+    assert "mode standard" in env, env
+
+
+def test_env_line_names_background_first_mode(tmp_path):
+    src = tmp_path / "612130000012_00001.jpg"
+    make_card(src)
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction", "--background-first")
+    env = proc.stdout.splitlines()[0]
+    assert "mode bakgrunn-foerst" in env, env
+
+
+def test_rapport_summary_header_names_code_and_mode(tmp_path):
+    src = tmp_path / "arkiv"
+    src.mkdir()
+    make_card(src / "612130000012_00001.jpg")
+    report_dir = rapport.run_report(src, tmp_path / "RAPPORT-test",
+                                    open_finder=False,
+                                    extra_args=("--background-first",))
+    summary = (report_dir / "SAMMENDRAG.txt").read_text()
+    head = summary.split("\n\n")[0]
+    assert f"Kode: {code_version()}" in head, head
+    assert "Modus: bakgrunn-foerst" in head, head
+
+
+def test_rapport_summary_header_says_standard_without_flags(tmp_path):
+    src = tmp_path / "arkiv"
+    src.mkdir()
+    make_card(src / "612130000012_00001.jpg")
+    report_dir = rapport.run_report(src, tmp_path / "RAPPORT-test",
+                                    open_finder=False)
+    head = (report_dir / "SAMMENDRAG.txt").read_text().split("\n\n")[0]
+    assert "Modus: standard" in head, head
+
+
+def test_rapport_command_forwards_extra_arguments():
+    """Finder passes no arguments, Terminal may: everything after the source
+    folder must reach rapport.py, or a flagged A/B run silently becomes a
+    standard run (measured: both 2026-09-08 report sets were standard mode)."""
+    script = (REPO / "RAPPORT.command").read_text()
+    assert 'rapport.py" "$SRC" "$@"' in script, script
+
+
+def test_rapport_bakgrunn_command_is_the_double_click_ab_path():
+    """The operator gets a FILE to double-click for the B side - no dialogs."""
+    path = REPO / "RAPPORT-BAKGRUNN.command"
+    assert path.exists(), "RAPPORT-BAKGRUNN.command mangler"
+    assert path.stat().st_mode & 0o111, "ikke kjoerbar"
+    text = path.read_text()
+    assert "RAPPORT.command" in text and "--background-first" in text, text

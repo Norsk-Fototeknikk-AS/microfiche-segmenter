@@ -23,6 +23,11 @@ fi
 SRC="${1:-}"
 if [[ -z "$SRC" ]]; then
     SRC="$(osascript -e 'POSIX path of (choose folder with prompt "Velg mappen med panoramabildene (arkiv- eller utdatamappen):")')"
+else
+    shift
 fi
 
-exec "$PY" "$SCRIPT_DIR/rapport.py" "$SRC"
+# Alt etter kildemappen gaar videre til rapport.py (f.eks. --background-first
+# for A/B). Uten dette ble en flagget kjoering stille en standardkjoering -
+# begge rapportsettene 2026-09-08 var standardmodus.
+exec "$PY" "$SCRIPT_DIR/rapport.py" "$SRC" "$@"

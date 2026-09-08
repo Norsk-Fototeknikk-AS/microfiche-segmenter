@@ -19,6 +19,8 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
+from segment_microfiche import code_version
+
 REPO = Path(__file__).resolve().parent
 SEGMENTER = REPO / "segment_microfiche.py"
 PANORAMA_SUFFIXES = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
@@ -150,9 +152,12 @@ def run_report(source_folder, report_dir, open_finder=True, extra_args=()):
     ok = sum(1 for r in rows if r.startswith("OK"))
     frag = sum(1 for r in rows if r.startswith("FRAGMENT"))
     fail = len(rows) - ok - frag
+    mode = ("bakgrunn-foerst" if "--background-first" in extra_args
+            else "standard")
     summary = "\n".join([
         f"RAPPORT generert {date.today().isoformat()}",
         f"Kilde: {source_folder}",
+        f"Kode: {code_version()}  |  Modus: {mode}",
         f"Kort: {len(rows)}  |  OK: {ok}  |  FRAGMENTER: {frag}  |  FEIL: {fail}",
         "",
         *rows, ""])
