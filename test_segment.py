@@ -4068,3 +4068,109 @@ def test_parse_step_two_reads_the_log():
     out = "...\nStep 2 threshold: trigger 0 detections, border 100%...\n"
     assert rapport.used_step_two(out) is True
     assert rapport.used_step_two("nothing here") is False
+
+
+# --- Steg 8A (2026-09-08): measure the evidence in every cell -------------
+# Measured over all witness rests in the field reports, area as a share of a
+# page: correct cards (098, 135, 289, 425, 630) run 0.8-9.3 %, and card 203 -
+# which shipped EMPTY crops - runs 0.5-8.5 %. Blob size, the only per-cell
+# evidence logged until now, cannot tell a real cell from an empty one. So
+# 8A measures and logs; it decides nothing. The calibration comes from the
+# field, where the empty cells of short rows are the control.
+
+from segment_microfiche import card_cells
+
+
+def test_card_cells_covers_the_empty_positions_too():
+    """A row of 3 pages on a card 5 cells wide: the two empty cells are the
+    control the 203 analysis never had."""
+    boxes = [(2010 + k * 2180, 3300, 2040, 2780) for k in range(3)]
+    cells = card_cells(boxes, 2040, 2780, image_w=2010 + 5 * 2180)
+
+    assert len(cells) == 5, cells
+    assert sum(1 for c in cells if c["page"]) == 3, cells
+    xs = [c["x"] for c in cells]
+    assert xs == sorted(xs) and xs[0] == 2010
+    assert all(abs((b - a) - 2180) <= 2 for a, b in zip(xs, xs[1:])), xs
+
+
+def test_card_cells_never_runs_off_the_image():
+    boxes = [(2010, 3300, 2040, 2780)]
+    cells = card_cells(boxes, 2040, 2780, image_w=5000)
+    assert all(c["x"] >= 0 and c["x"] + 2040 <= 5000 for c in cells), cells
+
+
+def test_card_cells_handles_two_rows_with_different_starts():
+    """Rows are not vertically aligned (Trond) - each row's phase is its
+    own."""
+    row1 = [(2010 + k * 2180, 3300, 2040, 2780) for k in range(3)]
+    row2 = [(3100 + k * 2180, 6740, 2040, 2780) for k in range(2)]
+    cells = card_cells(row1 + row2, 2040, 2780, image_w=12000)
+    ys = sorted({c["y"] for c in cells})
+    assert ys == [3300, 6740], ys
+    assert {c["x"] for c in cells if c["y"] == 3300} != \
+           {c["x"] for c in cells if c["y"] == 6740}
+
+
+def test_the_report_measures_every_cell(tmp_path):
+    """Machine-readable, one line per cell, so 8B can be scripted straight
+    off the report folders."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.full((3000, 6400), 180, 'uint8')
+    for c in range(8):                      # 8 pages, room for more cells
+        x = 100 + c * 520
+        a[350:1050, x:x + 400] = 110
+    pyvips.Image.new_from_memory(a.tobytes(), 6400, 3000, 1,
+                                 'uchar').write_to_file(str(src))
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("CELL ")]
+
+    assert len(lines) >= 8, proc.stdout
+    for line in lines:
+        m = re.match(r"^CELL row=(\d+) x=(\d+) y=(-?\d+) page=([01]) "
+                     r"fg=([\d.]+) edge=([\d.]+)$", line)
+        assert m, line
+    occupied = [l for l in lines if " page=1 " in l]
+    empty = [l for l in lines if " page=0 " in l]
+    assert len(occupied) == 8, occupied
+    assert empty, "a card with room to spare must report its empty cells"
+
+
+def test_an_empty_cell_measures_lower_than_a_page(tmp_path):
+    """The whole point of 8A: the measurement must separate what blob size
+    could not."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.full((3000, 6400), 180, 'uint8')
+    for c in range(8):
+        x = 100 + c * 520
+        a[350:1050, x:x + 400] = 110
+    pyvips.Image.new_from_memory(a.tobytes(), 6400, 3000, 1,
+                                 'uchar').write_to_file(str(src))
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    fg = {}
+    for line in proc.stdout.splitlines():
+        m = re.match(r"^CELL .* page=([01]) fg=([\d.]+) ", line)
+        if m:
+            fg.setdefault(m.group(1), []).append(float(m.group(2)))
+
+    assert fg.get("0") and fg.get("1"), proc.stdout
+    assert min(fg["1"]) > max(fg["0"]), (fg, "pages must measure higher")
+
+
+def test_cell_evidence_follows_the_cards_polarity(tmp_path):
+    """A Yamaha-type card is bright pages on a dark card. Measuring dark
+    pixels there reports 0.000 foreground on every real page - which would
+    poison the calibration these numbers exist for."""
+    src = tmp_path / "612130000012_00012.jpg"
+    make_card(src)                       # bright pages, dark card
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction", "--no-invert")
+    fg = [float(m.group(2)) for m in
+          (re.match(r"^CELL .* page=([01]) fg=([\d.]+) ", l)
+           for l in proc.stdout.splitlines()) if m and m.group(1) == "1"]
+    assert fg, proc.stdout
+    assert min(fg) > 0.5, (fg, "pages must measure as foreground")

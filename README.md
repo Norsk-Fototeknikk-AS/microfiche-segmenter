@@ -469,6 +469,36 @@ kind has no whole page left to anchor the expected height. The generous union
 band covers the measured fasit case (1.6×), but proportions beyond that
 escape the guard.
 
+### C22. Per-cell evidence is measured, and decides nothing (yet)
+
+Every run logs one machine-readable line per cell of the card's raster,
+**empty cells included**:
+
+```
+CELL row=1 x=2160 y=240 page=1 fg=0.929 edge=0.329
+CELL row=1 x=2600 y=240 page=0 fg=0.000 edge=0.115
+```
+
+`fg` is the foreground share inside the cell measured on the **original
+graytone**, not on the binary — the binary is exactly what failed on the
+faded cards, so it cannot be its own witness. It follows the run's polarity
+decision; without that it reads 0.000 on every real page of a Yamaha-type
+card. `edge` is the share of pixels whose Sobel magnitude clears
+`CELL_EDGE_LEVEL`.
+
+**Why it exists.** A cell prior — laying out expected cells and looking for
+evidence in each — needs a minimum evidence per cell, and the only per-cell
+evidence logged until now was blob size, which cannot do the job: measured
+over every witness rest in the field reports, correct cards run 0.8–9.3 % of
+a page and card 203, which shipped **empty crops**, runs 0.5–8.5 %. They
+overlap almost completely. So this contract measures and logs; it decides
+nothing. The calibration comes from the field, where the empty cells of
+short rows are the control that analysis never had.
+
+Nothing may act on these numbers until they have been calibrated against a
+production run. Building a prior on an uncalibrated floor would be card
+203's mistake with a better explanation.
+
 ### C21. The staircase: one diagnosed second threshold
 
 C9 allows re-thresholding only as step two, after a measured trigger. This

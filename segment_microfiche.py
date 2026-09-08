@@ -1723,6 +1723,79 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
                        refusals, bool(evidence_refusals))
 
 
+def card_cells(boxes, page_w, page_h, image_w):
+    """Every cell of the card's raster: the ones a page occupies AND the
+    empty ones beside them (steg 8A).
+
+    The empty cells are the point. Measured over the field reports, the SIZE
+    of a witness blob cannot tell a real cell from an empty one (correct
+    cards 0.8-9.3 % of a page, card 203 - which shipped empty crops -
+    0.5-8.5 %), so the evidence has to be measured per cell instead, and
+    that needs known-empty cells as the control. A short row on a card with
+    room to spare supplies them by the dozen.
+
+    Phase is per ROW: real cards are rows-only and rows are not vertically
+    aligned (Trond, 2026-09-04). Pitch is card-wide - one physical raster.
+    """
+    if not boxes:
+        return []
+    rows = group_boxes_into_rows(boxes)
+    diffs = []
+    for row in rows:
+        xs = sorted(b[0] for b in row)
+        diffs += [b - a for a, b in zip(xs, xs[1:])
+                  if page_w <= b - a <= page_w * 1.45]
+    pitch = float(np.median(diffs)) if diffs else page_w * 1.05
+
+    cells = []
+    for row in rows:
+        xs = sorted(b[0] for b in row)
+        y = int(np.median([b[1] for b in row]))
+        taken = set(xs)
+        k0 = -int(xs[0] // pitch)
+        k = k0
+        while True:
+            x = int(round(xs[0] + k * pitch))
+            if x + page_w > image_w:
+                break
+            if x >= 0:
+                on_page = any(abs(x - px) <= pitch * 0.25 for px in taken)
+                cells.append({"row": rows.index(row) + 1, "x": x, "y": y,
+                              "page": 1 if on_page else 0})
+            k += 1
+    return cells
+
+
+def cell_evidence(gray_small, cell, page_w, page_h, scale, threshold,
+                  dark_pages=True):
+    """(foreground share, edge share) inside one cell, measured on the
+    ORIGINAL graytone rather than on the binary - the binary is exactly what
+    failed on the faded cards, so it cannot be its own witness.
+
+    dark_pages follows the run's polarity decision. Without it the measure
+    reads 0.000 foreground on every real page of a Yamaha-type card (bright
+    pages on a dark card) - which would quietly poison the calibration 8B is
+    supposed to draw from these numbers."""
+    x0 = int(cell["x"] * scale)
+    y0 = int(cell["y"] * scale)
+    x1 = min(gray_small.shape[1], int((cell["x"] + page_w) * scale))
+    y1 = min(gray_small.shape[0], int((cell["y"] + page_h) * scale))
+    if x1 <= x0 or y1 <= y0:
+        return 0.0, 0.0
+    region = gray_small[y0:y1, x0:x1]
+    fg = float(np.mean(region <= threshold if dark_pages
+                       else region >= threshold))
+    gx = cv2.Sobel(region, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(region, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    edge = float(np.mean(mag > CELL_EDGE_LEVEL))
+    return fg, edge
+
+
+CELL_EDGE_LEVEL = 40.0   # Sobel magnitude counted as an edge (steg 8A,
+                         # measurement only - nothing decides on it yet)
+
+
 def make_anon_mask(shape, contours, dilate_radius):
     """Solid silhouettes of the detected blobs, strictly 0/255.
 
@@ -2340,8 +2413,16 @@ def main(otsu_override=None, step2=False, step1_border=None):
         print(f"Saving 1-bit TIFF to {temp_tiff}...")
         binary.write_to_file(str(temp_tiff), compression='lzw', bigtiff=True)
 
+    # A detect-scale copy of the GRAYTONE for the per-cell measurement
+    # (steg 8A). The binary is what failed on the faded cards, so it cannot
+    # be its own witness - the evidence is measured on the grey.
+    gray_small_vips = gray.resize(detect_scale)
+    gray_small = np.ndarray(
+        buffer=gray_small_vips.write_to_memory(), dtype=np.uint8,
+        shape=[gray_small_vips.height, gray_small_vips.width]).copy()
+
     # Free memory
-    del image, gray, binary, binary_small
+    del image, gray, binary, binary_small, gray_small_vips
 
     # === STEP 2: Find contours in the binary image ===
     print("Finding contours on downsampled image...")
@@ -2721,6 +2802,20 @@ def main(otsu_override=None, step2=False, step1_border=None):
             print(f"\nStep 2 proved itself: border {first_border:.0%} -> "
                   f"{border_share:.0%}, {len(boxes_fullres)} pages on the "
                   "format prior")
+
+    # Per-cell evidence (steg 8A): measurement only, nothing decides on it.
+    # One machine-readable line per cell, empty cells included, so the
+    # calibration in 8B can be scripted straight off the report folders.
+    cell_pw, cell_ph, _ = resolve_page_size(boxes_fullres)
+    for cell in card_cells(boxes_fullres, cell_pw, cell_ph, original_width):
+        local = illumination_local_threshold(
+            otsu_thresh, illum_field, illum_norm,
+            (cell["x"], cell["y"], cell_pw, cell_ph),
+            original_width, original_height)
+        fg, edge = cell_evidence(gray_small, cell, cell_pw, cell_ph,
+                                 detect_scale, local, dark_pages=do_invert)
+        print(f"CELL row={cell['row']} x={cell['x']} y={cell['y']} "
+              f"page={cell['page']} fg={fg:.3f} edge={edge:.3f}")
 
     # Coverage guard: did the boxes cover what the threshold saw? The one
     # signal that survives any upstream mistake (row-banding collapse put a
