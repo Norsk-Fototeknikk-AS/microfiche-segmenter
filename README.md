@@ -331,6 +331,21 @@ box: the blob gives position, `PAGE_SIZE_PRIOR` (2050×2780, measured across
 - Snap growth is logged per page, marks the page blue, and does NOT count
   toward the over-repair limit — normalizing to the known size is normal
   operation; content verification is the planned occupancy check.
+- **Row slots from the stripes** (steg 2, 2026-09-08, Trond's
+  architecture): the dark edge-to-edge stripes between page rows that
+  `remove_structure_rows` deletes are the row boundaries, and they are now
+  returned and handed to `snap_pages` (full-res, also printed as
+  `Structure rows (full-res y): …` in every report). A row's pages must lie
+  in the slot between the stripe above and the stripe below. An anchor-less
+  row (no full-height member) is anchored on whichever surviving edge keeps
+  its box inside the slot — bottoms first (card 036: washed tops), tops when
+  only that fits (card 111: only the top ~700 px of row 2 survived, and
+  unconditional bottom-anchoring stacked the whole row on row 1 with
+  align 100 / quality 90 — exit 3 in every report since RAPPORT-5).
+- **Invariants, refused loudly:** no two page boxes may overlap, and no page
+  box may cross a stripe; a slot shorter than a page is not a page row.
+  Each violation is a `REFUSED …` note and the card exits 3 — a wrong guess
+  upstream must never ship as a quiet page list.
 
 ### C16. Coverage guard — uncovered foreground caps the score
 

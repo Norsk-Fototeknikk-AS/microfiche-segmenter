@@ -975,7 +975,7 @@ def test_removes_a_thin_full_width_stripe():
     b = _canvas()
     b[500:520, :] = 255           # 2% of height, edge to edge
     b[100:250, 300:500] = 255     # a page, for contrast
-    removed = remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    removed, _ = remove_structure_rows(b, min_page_h=40, top_boundary=0)
     assert b[510, 1000] == 0
     assert b[150, 400] == 255
     assert removed > 0
@@ -1012,7 +1012,7 @@ def test_coverage_oscillating_at_the_threshold_is_not_shredded():
     b = _canvas()
     b[300:500, 0:1695] = 255                       # a page band at 84.75%
     b[300:500:2, 1695:1706] = 255                  # alternate rows: 85.3%
-    removed = remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    removed, _ = remove_structure_rows(b, min_page_h=40, top_boundary=0)
     assert removed == 0
     assert (b[300:500, 0:1695] == 255).all()
 
@@ -1022,7 +1022,7 @@ def test_page_rows_are_never_touched():
     b = _canvas()
     for c in range(4):
         b[100:300, 100 + c * 500:400 + c * 500] = 255
-    removed = remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    removed, _ = remove_structure_rows(b, min_page_h=40, top_boundary=0)
     assert removed == 0
     assert b[200, 200] == 255
 
@@ -2398,7 +2398,21 @@ def test_snap_regression_against_both_field_reports():
             pw, ph, note = resolve_page_size(boxes)
             assert note is None, (report, stem, "production card off-prior?")
             snapped, flags, notes, refused = snap_pages(boxes, pw, ph)
-            if was_ok:
+            if stem == "612130000111_00012":
+                # Row 2 survived as tops only; the reports carry no stripe
+                # runs, so the replay has no slot evidence. Either the
+                # overlap invariant refuses the stacked guess (steg 2), or
+                # the output is overlap-free - never a quiet stacked list.
+                # With stripes the slot places the row correctly
+                # (test_snap_anchorless_row_lands_inside_its_stripe_slot).
+                if not refused:
+                    pages = [b for b in snapped if (b[2], b[3]) == (pw, ph)]
+                    for i, a in enumerate(pages):
+                        for b in pages[i + 1:]:
+                            ox = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+                            oy = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+                            assert not (ox > 0 and oy > 0), (report, a, b)
+            elif was_ok:
                 assert refused == [], (report, stem, notes)
             refused_idx = {i for g in refused for i in g}
             exempt_like = [b for b in snapped
@@ -2841,3 +2855,92 @@ def test_rapport_bakgrunn_command_is_the_double_click_ab_path():
     assert path.stat().st_mode & 0o111, "ikke kjoerbar"
     text = path.read_text()
     assert "RAPPORT.command" in text and "--background-first" in text, text
+
+
+# --- Steg 2 (2026-09-08): row slots from the jacket stripes ------------------
+# Field card 612130000111: row 2 survived only as the TOP ~700 px of each
+# page (6770-7470), 650 px below row 1 (3295-6075). The row was anchor-less,
+# so snap_pages bottom-anchored it (036's lesson) - at 4690, on top of row
+# 1 - and the guard exited 3, identically in every report since RAPPORT-5.
+# Trond's architecture: the dark stripes between page rows ARE the row
+# boundaries, so a page box must lie inside its slot between two stripes,
+# and no two page boxes may ever overlap. Both are enforced here.
+
+def _card_111_rows():
+    row1 = [(2020 + k * 2180, 3295, 2040, 2780) for k in range(12)]
+    frags = [(2225 + k * 2180, 6770, 1900, 700) for k in range(12)]  # tops
+    row3 = [(10870 + k * 2180, 10170, 2040, 2780) for k in range(7)]
+    return row1 + frags + row3
+
+
+def test_remove_structure_rows_returns_the_deleted_y_runs():
+    b = _canvas()
+    b[500:520, :] = 255           # a stripe
+    b[100:250, 300:500] = 255     # a page
+    removed, runs = remove_structure_rows(b, min_page_h=40, top_boundary=0)
+    assert removed == 1
+    assert runs == [(500, 520)], runs
+
+
+def test_snap_anchorless_row_lands_inside_its_stripe_slot():
+    """111 geometry with the stripes that bound row 2: the fragments are
+    tops, so the row must come out at 6770-9550 - not 4690 on top of row 1."""
+    stripes = [(6300, 6500), (9750, 9950)]
+    snapped, flags, notes, refused = snap_pages(_card_111_rows(), 2040, 2780,
+                                                stripes=stripes)
+    assert refused == [], notes
+    ys = sorted({b[1] for b in snapped})
+    assert ys == [3295, 6770, 10170], ys
+    assert len(snapped) == 31, len(snapped)
+
+
+def test_snap_bottom_anchoring_still_wins_when_both_fit_the_slot():
+    """036 stays 036: an anchor-less first row whose bottoms survived is
+    bottom-anchored when that box also lies inside its slot."""
+    row1 = [(2340 + k * 2170, 4400, 2050, 1700) for k in range(6)]  # washed
+    row2 = [(2340 + k * 2170, 6700, 2050, 2780) for k in range(4)]
+    stripes = [(6200, 6400), (9700, 9900)]
+    snapped, flags, notes, refused = snap_pages(row1 + row2, 2050, 2780,
+                                                stripes=stripes)
+    assert refused == [], notes
+    assert sorted({b[1] for b in snapped}) == [3320, 6700]
+
+
+def test_snap_refuses_overlapping_pages_without_stripe_evidence():
+    """The invariant stands on its own: with no stripes to place row 2, the
+    bottom-anchored row lands on row 1 - and that is a refusal with a
+    readable note, never a quiet page list with two rows stacked."""
+    snapped, flags, notes, refused = snap_pages(_card_111_rows(), 2040, 2780)
+    assert refused, notes
+    assert any("overlap" in n.lower() for n in notes), notes
+
+
+def test_snap_refuses_a_page_that_cannot_fit_between_two_stripes():
+    """A slot shorter than a page is not a page row - refuse loudly rather
+    than let the box cross a stripe into the neighbour row."""
+    row = [(2020 + k * 2180, 3295, 2040, 2780) for k in range(4)]
+    stripes = [(3000, 3100), (5500, 5600)]      # slot 2400 < page 2780
+    snapped, flags, notes, refused = snap_pages(row, 2040, 2780,
+                                                stripes=stripes)
+    assert len(refused) == 4, (refused, notes)
+    assert any("stripe" in n.lower() for n in notes), notes
+
+
+def test_snap_witness_free_rows_are_untouched_without_stripes():
+    """Regression pin: a healthy card with no stripe information snaps as
+    before."""
+    row1 = [(2010 + k * 2180, 3300, 2040, 2780) for k in range(4)]
+    row2 = [(2010 + k * 2180, 6900, 2040, 2780) for k in range(4)]
+    snapped, flags, notes, refused = snap_pages(row1 + row2, 2050, 2780)
+    assert refused == [] and sorted({b[1] for b in snapped}) == [3300, 6900]
+
+
+def test_report_lists_the_structure_rows_it_removed(tmp_path):
+    """The stripe runs go into every rapport.txt (full-res y-intervals) so
+    the row slots can be validated against 098/111/135 in the field."""
+    proc = run_segmenter("-i", str(REPO / "testdata" / "real_card_10pct.jpg"),
+                         "-O", str(tmp_path / "card"), "--skip-extraction")
+    m = re.search(r"^Structure rows \(full-res y\): (\d+-\d+(?:, \d+-\d+)*)$",
+                  proc.stdout, re.M)
+    assert m, proc.stdout
+    assert "Removed" in proc.stdout and "structure row-run" in proc.stdout

@@ -355,7 +355,9 @@ def remove_structure_rows(binary_img, min_page_h, top_boundary):
     row of pages is full-width too, but page-HEIGHT and floating mid-card, so
     it survives (and is handled by the merged-pages warning downstream).
 
-    Returns the number of runs deleted, for the log.
+    Returns (number of runs deleted, [(y_start, y_end), ...] of those runs).
+    The runs are the card's row boundaries (steg 2, 2026-09-08): a page
+    never crosses a stripe, so snap_pages uses them as row slots.
     """
     h, w = binary_img.shape
     coverage = (binary_img > 0).sum(axis=1) / w
@@ -384,11 +386,13 @@ def remove_structure_rows(binary_img, min_page_h, top_boundary):
             merged.append(run)
 
     removed = 0
+    runs = []
     for start, end in merged:
         if (end - start) < min_page_h or start <= top_boundary or end >= h:
             binary_img[start:end, :] = 0
             removed += 1
-    return removed
+            runs.append((int(start), int(end)))
+    return removed, runs
 
 
 def clear_border_connected(binary_img):
@@ -417,7 +421,7 @@ def clear_border_connected(binary_img):
 
 
 def detect_page_boxes(binary_img, header_skip_px, min_w, min_h,
-                      collect_witnesses=False):
+                      collect_witnesses=False, structure_rows_out=None):
     """The detect-scale pipeline: mask header, remove card structure, erode,
     drop border-connected foreground, find and size-filter contours.
 
@@ -426,14 +430,19 @@ def detect_page_boxes(binary_img, header_skip_px, min_w, min_h,
     with collect_witnesses=True a fifth element holds the sub-min-size
     boxes - too small to be pages, but survivors of the erosion, so they
     witness that their grid cell holds SOMETHING (field card 612130000098:
-    half a row of small rests was silently discarded here).
+    half a row of small rests was silently discarded here). A list passed
+    as structure_rows_out receives the deleted stripe runs (detect-scale
+    y-intervals) - the row slots for snap_pages.
     """
     log_lines = []
     if header_skip_px > 0:
         binary_img[:header_skip_px, :] = 0
 
     min_page_h = max(1, min_h)
-    removed_rows = remove_structure_rows(binary_img, min_page_h, header_skip_px)
+    removed_rows, structure_runs = remove_structure_rows(
+        binary_img, min_page_h, header_skip_px)
+    if structure_rows_out is not None:
+        structure_rows_out.extend(structure_runs)
     if removed_rows:
         log_lines.append(f"Removed {removed_rows} full-width structure "
                          "row-run(s) (stripes / edge bands)")
@@ -926,7 +935,7 @@ def resolve_page_size(boxes):
                     f"using per-card estimate {pw}x{ph}")
 
 
-def snap_pages(boxes, page_w, page_h, flags=None, witnesses=()):
+def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=()):
     """The final geometry pass: every accepted detection becomes a full page
     box. The blob gives position, the page size gives the dimensions, and
     the row's grid (phase + pitch) decides which page a partial detection
@@ -944,12 +953,35 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=()):
     cell of an existing row claims a full page there (field card
     612130000098 lost half a row to the min-size filter).
 
+    Stripes (steg 2, 2026-09-08, Trond's architecture) are the dark
+    edge-to-edge bands between page rows that remove_structure_rows deleted,
+    as full-res y-intervals. A row's pages must lie in the SLOT between the
+    stripe above and the stripe below - so an anchor-less row is anchored
+    on whichever edge keeps its box inside the slot (field card
+    612130000111: only the TOPS of row 2 survived, and unconditional
+    bottom-anchoring stacked the row on row 1). Two invariants are enforced
+    on the result and refuse the card when broken: no two page boxes
+    overlap, and no page box crosses a stripe.
+
     Returns (snapped_boxes, flags, notes, refused).
     """
     n = len(boxes)
     flags = list(flags) if flags is not None else [False] * n
     if n == 0:
         return [], [], [], []
+    stripes = sorted((int(a), int(b)) for a, b in stripes)
+
+    def slot_around(y_center):
+        """(top, bottom) of the open band between the stripes surrounding
+        y_center; None on a side with no stripe there."""
+        top = max((b for a, b in stripes if b <= y_center), default=None)
+        bottom = min((a for a, b in stripes if a >= y_center), default=None)
+        return top, bottom
+
+    def fits(y, slot):
+        top, bottom = slot
+        return ((top is None or y >= top)
+                and (bottom is None or y + page_h <= bottom))
 
     # Rows by transitive y-OVERLAP clustering (2026-09-09, after field card
     # 612130000036): same-row members overlap each other substantially -
@@ -1001,9 +1033,11 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=()):
     tol = SNAP_PITCH_TOLERANCE * pitch
 
     snapped, out_flags, notes, refused = [], [], [], []
+    origins = []   # detection indices behind each snapped PAGE (not exempt)
     for i in sorted(exempt):
         snapped.append(boxes[i])
         out_flags.append(bool(flags[i]))
+        origins.append(None)
 
     for row in rows:
         members = [i for i in row if i not in exempt]
@@ -1017,6 +1051,9 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=()):
         row_bottom = float(np.median([b[1] + b[3] for b in anchors]))
         y_lo = min(row_top, row_bottom - page_h)
         y_hi = max(row_top, row_bottom - page_h)
+        slot = slot_around(float(np.median([b[1] + b[3] / 2
+                                            for b in row_boxes])))
+        slot_h = ((slot[1] - slot[0]) if None not in slot else None)
 
         # Grid phase from the members whose width already matches a page -
         # strips must not vote, their x0 is not a page edge. A row with no
@@ -1051,6 +1088,7 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=()):
                              "beyond one grid cell (bridges two pages)")
                 snapped.append(boxes[i])
                 out_flags.append(bool(flags[i]))
+                origins.append(None)
                 continue
             cells.setdefault(k, []).append(i)
 
@@ -1065,19 +1103,42 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=()):
             # own edge rather than one row-wide y).
             top_err = abs(g_top - row_top)
             bottom_err = abs(g_bottom - row_bottom)
-            # An anchor-less row (no full-height member) has, by definition,
-            # washed tops - bottoms are the surviving edge (036: every
-            # top-anchored cell landed a full row too low).
+            # An anchor-less row (no full-height member) has lost one edge
+            # - which one, the STRIPES decide: the box must sit inside its
+            # slot. Bottoms first (036: washed tops, bottoms survived),
+            # tops when only that fits (111: washed bottoms, tops survived).
+            # Without stripe evidence the bottom rule stands, and the
+            # overlap invariant below catches the wrong guess.
             if not fulls:
-                y = g_bottom - page_h
+                candidates = [g_bottom - page_h, g_top]
+                y = next((c for c in candidates if fits(c, slot)),
+                         candidates[0])
             else:
                 y = g_top if top_err <= bottom_err else g_bottom - page_h
             y = int(min(max(y, y_lo), y_hi))
+            if slot_h is not None and slot_h < page_h:
+                dets = "+".join(str(i + 1) for i in sorted(group))
+                refused.append(tuple(sorted(group)))
+                notes.append(f"REFUSED snap of detections {dets}: the slot "
+                             f"between stripes {slot[0]}-{slot[1]} is "
+                             f"{slot_h} px, shorter than a page ({page_h})")
+                for i in sorted(group):
+                    snapped.append(boxes[i])
+                    out_flags.append(bool(flags[i]))
+                    origins.append(None)
+                continue
+            if not fits(y, slot):
+                # A full box that would cross a stripe: keep it in the slot.
+                if slot[0] is not None:
+                    y = max(y, slot[0])
+                if slot[1] is not None:
+                    y = min(y, slot[1] - page_h)
             covered = sum(boxes[i][2] * boxes[i][3] for i in group)
             grown = 1.0 - min(1.0, covered / (page_w * page_h))
             is_grown = grown > SNAP_GROWTH_MARK
             snapped.append((x, y, page_w, page_h))
             out_flags.append(bool(any(flags[i] for i in group) or is_grown))
+            origins.append(tuple(sorted(group)))
             if is_grown:
                 dets = "+".join(str(i + 1) for i in sorted(group))
                 notes.append(f"snapped detections {dets} to full page at "
@@ -1104,8 +1165,34 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=()):
             y = int(round((y_lo + y_hi) / 2))
             snapped.append((x, y, page_w, page_h))
             out_flags.append(True)
+            origins.append(())
             notes.append(f"page from position witness at ({x}, {y}) - a "
                          f"{ww}x{wh} rest proves the cell holds a page")
+
+    # Invariants (Trond, 2026-09-08): no two page boxes overlap, no page box
+    # crosses a stripe. A violation is a wrong guess somewhere above, and
+    # it must fail the card - never ship as a quiet page list (card 111
+    # scored align 100 / quality 90 with a whole row stacked on another).
+    pages = [k for k, o in enumerate(origins) if o is not None]
+    for a_i, a in enumerate(pages):
+        ax, ay, aw, ah = snapped[a]
+        for b in pages[a_i + 1:]:
+            bx, by, bw, bh = snapped[b]
+            ox = min(ax + aw, bx + bw) - max(ax, bx)
+            oy = min(ay + ah, by + bh) - max(ay, by)
+            if ox > 0 and oy > 0:
+                refused.append(tuple(sorted(set(origins[a] + origins[b]))))
+                notes.append(f"REFUSED: page boxes at ({ax}, {ay}) and "
+                             f"({bx}, {by}) overlap by {ox}x{oy} px - "
+                             "impossible geometry")
+    for k in pages:
+        x, y, w, h = snapped[k]
+        for a, b in stripes:
+            if y < b and y + h > a:
+                refused.append(tuple(origins[k]))
+                notes.append(f"REFUSED: page box at ({x}, {y}) crosses the "
+                             f"stripe {a}-{b}")
+                break
     return snapped, out_flags, notes, refused
 
 
@@ -1757,11 +1844,20 @@ def main():
     # === STEP 3: Detect, filter and sort bounding boxes ===
     print(f"Skipping top {header_skip_px_small} pixels in downsampled image (header region)")
     print(f"Detecting pages (erosion kernel={DETECT_ERODE_KERNEL})...")
+    structure_rows = []   # detect-scale y-runs of the deleted stripes
     boxes, filtered_contours, binary_img, det_log, small_witnesses = \
         detect_page_boxes(binary_img, header_skip_px_small, min_w, min_h,
-                          collect_witnesses=True)
+                          collect_witnesses=True,
+                          structure_rows_out=structure_rows)
     for line in det_log:
         print(line)
+    # The stripes are the row boundaries (steg 2): full-res in the report so
+    # the row slots can be checked against the field cards.
+    stripes_fullres = [(int(a / detect_scale), int(b / detect_scale))
+                       for (a, b) in structure_rows]
+    if stripes_fullres:
+        print("Structure rows (full-res y): "
+              + ", ".join(f"{a}-{b}" for a, b in stripes_fullres))
 
     print(f"Found {len(boxes)} potential pages")
 
@@ -2027,7 +2123,7 @@ def main():
             for (x, y, w, h) in small_witnesses]
         boxes_fullres, snap_flags, snap_notes, snap_refused = snap_pages(
             boxes_fullres, page_w, page_h, flags=geo_flags_list,
-            witnesses=witnesses_fullres)
+            witnesses=witnesses_fullres, stripes=stripes_fullres)
         snapped_count = sum(1 for note in snap_notes
                             if note.startswith("snapped"))
         if snap_notes:
