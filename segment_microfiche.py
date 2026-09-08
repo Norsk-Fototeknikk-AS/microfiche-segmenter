@@ -1124,6 +1124,9 @@ SNAP_GROWTH_MARK = 0.05         # area growth share that marks a page blue
 # one 4220x2840 box on an otherwise healthy card). Boxes between the snap
 # exemption (1.25) and this stay raw with their loud warning.
 SNAP_IMPOSSIBLE_RATIO = 1.5
+# How far a row anchor may fall outside the image before it stops being a
+# rounding artifact and becomes a misplaced page (steg 9A).
+SNAP_EDGE_TOLERANCE = 0.05
 
 # Evidence guard (steg 6A, 2026-09-08, after the full production run of 88
 # cards). A card must be FOUND, not composed: card 612130000203_00012
@@ -1242,7 +1245,7 @@ WITNESS_MIN_DIM_SHARE = 0.05    # of page width AND height: a 50 px sleeve
 
 
 def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=(),
-               image_w=None):
+               image_w=None, image_h=None):
     """The final geometry pass: every accepted detection becomes a full page
     box. The blob gives position, the page size gives the dimensions, and
     the row's grid (phase + pitch) decides which page a partial detection
@@ -1282,6 +1285,14 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=(),
     if n == 0:
         return [], [], [], []
     stripes = sorted((int(a), int(b)) for a, b in stripes)
+
+    def inside(y):
+        """The image edge is a clamp like any other (steg 9A): card
+        612130000623_00024 shipped three pages at y = -400 because the slot
+        clamp had no image edge to clamp against."""
+        if image_h is None:
+            return y
+        return int(min(max(y, 0), max(0, image_h - page_h)))
 
     def slot_around(y_center):
         """(top, bottom) of the open band between the stripes surrounding
@@ -1431,7 +1442,16 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=(),
                          candidates[0])
             else:
                 y = g_top if top_err <= bottom_err else g_bottom - page_h
-            y = int(min(max(y, y_lo), y_hi))
+            y_before_edge = int(min(max(y, y_lo), y_hi))
+            y = inside(y_before_edge)
+            if abs(y - y_before_edge) > SNAP_EDGE_TOLERANCE * page_h:
+                dets = "+".join(str(i + 1) for i in sorted(group))
+                refused.append(tuple(sorted(group)))
+                notes.append(f"REFUSED: detections {dets} anchor to "
+                             f"y={y_before_edge}, outside the image "
+                             f"(0-{image_h}) - moved to {y} to keep the box "
+                             "on the card, but that is not where the "
+                             "evidence put it")
             if slot_h is not None and slot_h < page_h:
                 dets = "+".join(str(i + 1) for i in sorted(group))
                 refused.append(tuple(sorted(group)))
@@ -1450,6 +1470,7 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=(),
                     y = max(y, slot[0])
                 if slot[1] is not None:
                     y = min(y, slot[1] - page_h)
+                y = inside(y)
             covered = sum(boxes[i][2] * boxes[i][3] for i in group)
             grown = 1.0 - min(1.0, covered / (page_w * page_h))
             is_grown = grown > SNAP_GROWTH_MARK
@@ -1515,7 +1536,7 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=(),
                 y = max(y, ctx["slot"][0])
             if ctx["slot"][1] is not None:
                 y = min(y, ctx["slot"][1] - page_h)
-        snapped.append((x, y, page_w, page_h))
+        snapped.append((x, inside(y), page_w, page_h))
         out_flags.append(True)
         origins.append(())
         src_idx.append(())
@@ -1579,7 +1600,8 @@ class ChainResult(NamedTuple):
                            # must never be able to change control flow.
 
 
-def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
+def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None,
+                    image_h=None):
     """The coordinate-only part of the chain: geometric completion, the
     over-repair judgement, the snap to the format page size, and the
     fragment guard's re-check.
@@ -1649,7 +1671,8 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
             out.append((1, f"\n{size_note}"))
         boxes, snap_flags, snap_notes, snap_refused = snap_pages(
             boxes, page_w, page_h, flags=geo_flags_list,
-            witnesses=witnesses, stripes=stripes, image_w=image_w)
+            witnesses=witnesses, stripes=stripes, image_w=image_w,
+            image_h=image_h)
         snapped_count = sum(1 for note in snap_notes
                             if note.startswith("snapped"))
         if snap_notes:
@@ -1659,10 +1682,15 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
                 out.append((1, f"  {note}"))
         tagged = sort_boxes_by_rows(
             [b + (fl,) for b, fl in zip(boxes, snap_flags)])
-        boxes = [t[:4] for t in tagged]
+        snapped_boxes = [t[:4] for t in tagged]
         geo_indices = {i for i, t in enumerate(tagged) if t[4]}
-        if snap_notes:
-            quality = compute_card_quality(boxes, None)
+        # Recompute whenever the BOXES changed, not when the snap happened
+        # to have something to say (steg 9A): card 432_00024 shipped 5 clean
+        # rows of 12 at a true 99.5 and reported "6 rows ... 71.1" from
+        # before the snap, because the snap tidied it without a note.
+        if snapped_boxes != boxes:
+            quality = compute_card_quality(snapped_boxes, None)
+        boxes = snapped_boxes
         if snap_refused:
             out.append((2, f"\nERROR: {len(snap_refused)} suspected page "
                            "fragment group(s) - detections irreconcilable "
@@ -2759,7 +2787,7 @@ def main(otsu_override=None, step2=False, step1_border=None):
     print("RAW witnesses (full-res x,y,w,h): "
           + "; ".join(f"{x},{y},{w},{h}" for x, y, w, h in witnesses_fullres))
     chain = repair_and_snap(boxes_fullres, witnesses_fullres,
-                            stripes_fullres, original_width)
+                            stripes_fullres, original_width, original_height)
     for stream, text in chain.output:
         print(text, file=sys.stdout if stream == 1 else sys.stderr)
     boxes_fullres = chain.boxes

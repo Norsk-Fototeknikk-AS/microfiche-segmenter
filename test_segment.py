@@ -3676,18 +3676,22 @@ def test_the_physically_counted_cards_are_pinned():
         assert compute_card_quality(boxes, None)["grid"] == grid, (
             stem, compute_card_quality(boxes, None)["grid"], grid)
         checked += 1
-    assert checked == 3, checked
+    assert checked == 4, checked
 
 
 def test_the_physical_fasit_holds_the_counted_numbers():
     counted = {s: p for s, p, _, _ in _physical_fasit()}
     assert counted == {"612130000098_00012": 54,
                        "612130000111_00012": 31,
-                       "612130000135_00012": 27}, counted
+                       "612130000135_00012": 27,
+                       "612130000432_00024": 60}, counted
     grids = {s: g for s, _, g, _ in _physical_fasit()}
     assert grids["612130000098_00012"] == "5 rows: 12+12+12+12+6", grids
     assert grids["612130000111_00012"] == "3 rows: 12+12+7", grids
     assert grids["612130000135_00012"] == "3 rows: 12+12+3", grids
+    # Not physically counted: this one pins that the reported grid describes
+    # the boxes that shipped (steg 9A).
+    assert grids["612130000432_00024"] == "5 rows: 12+12+12+12+12", grids
 
 
 
@@ -4523,3 +4527,66 @@ def test_a_hostile_file_in_the_report_folder_is_refused(tmp_path, monkeypatch):
         test_runde.run_round(cards, parent=tmp_path, open_finder=False)
 
     assert not list(stick.rglob("*.tif")), list(stick.rglob("*.tif"))
+
+
+# --- Steg 9A (2026-09-08): two bugs from test round 2 ----------------------
+
+def test_the_reported_grid_describes_the_boxes_that_shipped():
+    """Card 612130000432_00024 shipped 60 pages in 5 clean rows of 12 and
+    REPORTED '6 rows: 13+12+12+12+1+13' at quality 71.1. Its true quality on
+    the shipped boxes is 99.5. The snap had tidied the rows but emitted no
+    notes - no growth, no witnesses - and quality was only recomputed when
+    the snap had something to say. A clean card read as a bad one, and the
+    layout guard (which does judge the final boxes) was right to let it
+    through."""
+    boxes = ([(2010 + k * 2180, 3300, 2040, 2780) for k in range(6)]
+             + [(2010 + k * 2180, 4700, 2040, 2780) for k in range(6)])
+    # two rows to group_boxes_into_rows (1400 apart > its tolerance), one
+    # row to the snap (they overlap by 1380 > 40 % of a page)
+    assert len(group_boxes_into_rows(boxes)) == 2, "fixture must start split"
+
+    chain = repair_and_snap(boxes, (), (), 29071, 21505)
+
+    shipped = group_boxes_into_rows(chain.boxes)
+    assert chain.quality is not None, "boxes changed - quality must follow"
+    assert chain.quality["grid"] == (
+        f"{len(shipped)} row{'s' if len(shipped) != 1 else ''}: "
+        + "+".join(str(len(r)) for r in shipped)), (
+            chain.quality["grid"], shipped)
+
+
+def test_a_page_box_may_never_sit_outside_the_image():
+    """Card 612130000623_00024 shipped three pages at y = -400 after step
+    two. A box outside the image is not a page, whatever the row anchor
+    says: the slot clamp had no image edge to clamp against."""
+    boxes = [(4290 + k * 2150, 300, 2020, 700) for k in range(4)]
+
+    snapped, flags, notes, refused = snap_pages(boxes, 2020, 2770,
+                                                image_w=29071, image_h=21505)
+
+    assert all(b[1] >= 0 for b in snapped), snapped
+    assert all(b[1] + b[3] <= 21505 for b in snapped), snapped
+
+
+def test_a_row_anchored_outside_the_image_is_refused_loudly():
+    """The box is put back inside - a page box outside the image is never
+    shipped - but a page that had to MOVE that far is not where the evidence
+    said it was, so the card fails rather than quietly relocating it."""
+    row = [(2010 + k * 2180, 20900, 2040, 2780) for k in range(3)]
+
+    snapped, flags, notes, refused = snap_pages(row, 2040, 2780,
+                                                image_w=29071, image_h=21505)
+
+    assert all(0 <= b[1] and b[1] + b[3] <= 21505 for b in snapped), snapped
+    assert refused, notes
+    assert any("outside the image" in n for n in notes), notes
+
+
+def test_a_rounding_sized_overshoot_is_just_clamped():
+    """A few pixels past the edge is an anchor rounding artifact, not a
+    misplaced page."""
+    row = [(2010 + k * 2180, 18740, 2040, 2780) for k in range(3)]
+    snapped, flags, notes, refused = snap_pages(row, 2040, 2780,
+                                                image_w=29071, image_h=21505)
+    assert refused == [], notes
+    assert all(b[1] + b[3] <= 21505 for b in snapped), snapped
