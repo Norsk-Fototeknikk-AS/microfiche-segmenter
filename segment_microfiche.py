@@ -713,7 +713,13 @@ def complete_geometry(boxes):
     refused = []
     consumed = set()
     merged = []
-    for g in find_fragment_groups(boxes):
+    # Lower union bound REMOVED for merging (phase 3, 2026-09-08): a chain
+    # under 0.8x expected height is a page that LOST height to a defect
+    # (field pair 17+27: union 0.79x) - it merges here and the extension
+    # pass completes it to the row's anchors. The upper bound stays: it is
+    # the cross-row guard. Row-boundary safety for the short results is the
+    # gap criterion - field row gaps (~840-920px) are twice the allowed gap.
+    for g in find_fragment_groups(boxes, union_min=0.0):
         parts = [boxes[i] for i in g]
         x0 = min(b[0] for b in parts)
         y0 = min(b[1] for b in parts)
@@ -729,14 +735,17 @@ def complete_geometry(boxes):
                          f"{invented:.0%} of the page would be invented")
             continue
         consumed.update(g)
-        merged.append((x0, y0, x1 - x0, y1 - y0))
+        sub_band = (y1 - y0) < FRAGMENT_UNION_MIN * exp_h
+        merged.append(((x0, y0, x1 - x0, y1 - y0), sub_band))
         notes.append(f"merged {len(g)} fragments (detections {pages}) into "
-                     f"one page at ({x0}, {y0}), {invented:.0%} invented")
+                     f"one page at ({x0}, {y0}), {invented:.0%} invented"
+                     + (" (short union - completing below)" if sub_band
+                        else ""))
 
     contested = {i for g in refused for i in g}
-    entries = [[boxes[i], False, i in contested]
+    entries = [[boxes[i], False, i in contested, False]
                for i in range(n) if i not in consumed]
-    entries += [[b, True, False] for b in merged]
+    entries += [[b, True, False, sub] for b, sub in merged]
 
     # Vertical stripes, on the horizontally-repaired boxes (a page split
     # into quadrants heals fully: the two half-width columns from the merge
@@ -761,7 +770,7 @@ def complete_geometry(boxes):
                          f"{invented:.0%} of the page would be invented")
             continue
         stripe_consumed.update(g)
-        stripe_entries.append([(x0, y0, x1 - x0, y1 - y0), True, False])
+        stripe_entries.append([(x0, y0, x1 - x0, y1 - y0), True, False, False])
         notes.append(f"merged {len(g)} vertical stripes (detections {dets}) "
                      f"into one page at ({x0}, {y0}), {invented:.0%} invented")
     entries = [e for i, e in enumerate(entries)
@@ -787,9 +796,15 @@ def complete_geometry(boxes):
         row_h = int(np.median([all_boxes[i][3] for i in anchors]))
         for i in row:
             x, y, w, h = entries[i][0]
-            # Never extend a merged page, nor a fragment whose merge was
-            # REFUSED - that would quietly repair contested geometry.
-            if entries[i][1] or entries[i][2] or h >= GEOMETRY_SHORT_RATIO * row_h:
+            # Never extend a fragment whose merge was REFUSED - that would
+            # quietly repair contested geometry. Merged pages only continue
+            # here when their union came out SHORT (sub-band chain).
+            if entries[i][2]:
+                continue
+            if entries[i][1] and not entries[i][3]:
+                continue
+            short_limit = row_h if entries[i][3] else GEOMETRY_SHORT_RATIO * row_h
+            if h >= short_limit:
                 continue
             invented = 1.0 - h / row_h
             entries[i][0] = (x, row_top, w, row_h)
@@ -1700,8 +1715,8 @@ def main():
         label += f"  |  {illum_note}"
     if repaired_count:
         label += f"  |  {repaired_count} geometry-completed"
-    if fragment_groups or geo_overload:
-        label = f"SUSPECT FRAGMENTS ({len(fragment_groups)} group(s))  |  " + label
+    if fragment_groups or refused_groups or geo_overload:
+        label = f"SUSPECT FRAGMENTS ({len(fragment_groups) + len(refused_groups)} group(s))  |  " + label
         banner_color = (0, 0, 200)
     cv2.putText(banner, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, banner_color, 2)
     viz = np.vstack([banner, viz])
@@ -1725,10 +1740,11 @@ def main():
         print(f"Saved {anon_path} (anonymized)")
 
     # Guard verdict, after both visualizations exist with the suspects
-    # marked: irreconcilable chains, or a card geometry had to repair more
-    # of than the limit. The source goes to error/ for review, like the
-    # no-pages failure.
-    if fragment_groups or geo_overload:
+    # marked: irreconcilable chains, REFUSED merges (a sub-band refusal is
+    # invisible to the re-run guard, whose lower bound is 0.8), or a card
+    # geometry had to repair more of than the limit. The source goes to
+    # error/ for review, like the no-pages failure.
+    if fragment_groups or refused_groups or geo_overload:
         print(f"\nERROR: suspected split pages in {input_file} - "
               "not extracting.", file=sys.stderr)
         print("  No _done sentinel written — this card will not be offered "

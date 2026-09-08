@@ -261,12 +261,20 @@ remaining defects are material (washed-out patches at jacket brightness,
 short documents, half-dark pages). The sheet size is known, so **geometry
 overrides the binary** (`complete_geometry`):
 
-- Grid-matching fragment chains are **merged** into their union box. Crops
+- Fragment chains meeting the x-IoU/gap criteria are **merged** into their
+  union box — including chains whose union falls BELOW 0.8× the expected
+  height (phase 3, field pair 17+27 at 0.79×): those are pages that lost
+  height to a defect, and after merging, the extension pass completes them
+  to the row's anchors. The upper union bound (1.8×) stays — it is the
+  cross-row guard, and field row gaps (~2× the gap criterion) keep short
+  results from ever linking across a row boundary. Crops
   are cut from the original graytone, so a washed-out patch keeps whatever
   readable traces it has for OCR. A merge that would invent more than
   `GEOMETRY_MAX_INVENTED_SHARE` (30 %) of the page area is refused — that is
-  fabrication, not repair. (Field calibration, 28 production groups: every
-  one tiled its union exactly, ~0 % invented.)
+  fabrication, not repair; refused merges fail the card explicitly — a
+  refused sub-band chain is invisible to the re-run guard. (Field
+  calibration, 28 production groups: every one tiled its union exactly,
+  ~0 % invented.)
 - **Vertical stripes** merge symmetrically (Trond's override, same day):
   a page split into full-height strips has the outline of one page, and the
   format guarantees uniform page sizes. The union band is tighter

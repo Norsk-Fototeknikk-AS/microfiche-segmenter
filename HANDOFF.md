@@ -390,9 +390,23 @@ heals fully. Field fixture: card 135 detections 11+12 (1350+720 wide, gap
 0) merge to one 2070-wide page. Two half-width documents in neighbouring
 frames never link - frame spacing exceeds the 15% gap criterion.
 
+### Phase 3: sub-band chains (2026-09-08, night)
+
+Field-confirmed (pair 17+27, union 0.79x): the lower union bound is gone
+for MERGING (find_fragment_groups grew a union_min parameter; the guard
+still uses 0.8) - a sub-band chain merges and its short union is completed
+to the row's anchors by the extension pass (force flag on the entry; the
+0.7 short-ratio does not apply to it, row height does). The strengthened
+tests exposed why merging must come first: extension alone repaired the
+top piece and left the sibling as an overlapping GHOST page. Refused
+groups now fail the card EXPLICITLY in main - a refused sub-band chain
+does not re-detect under the guard's 0.8 bound. Upper bound 1.8x stays
+(cross-row); field row gaps (840-920px) are ~2x the gap criterion, pinned
+by a row-boundary test with real coordinates.
+
 ### Tests
 
-137 tests, ~19 s (was 32 when this was written). Unit tests for box
+140 tests, ~19 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 

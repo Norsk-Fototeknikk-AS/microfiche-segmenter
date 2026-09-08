@@ -2102,3 +2102,67 @@ def test_vertical_seam_card_is_geometry_completed_end_to_end(tmp_path):
     assert "1 pages geometry-completed" in proc.stdout, proc.stdout
     rows_csv = (out / "page_coordinates.csv").read_text().splitlines()[2:]
     assert len(rows_csv) == 18, rows_csv
+
+
+# --- Phase 3: sub-band chains (Trond, 2026-09-08) ---------------------------
+# Field-confirmed (pair 17+27 in RAPPORT-2026-09-08-3, union 0.79x): chains
+# meeting the x-IoU and gap criteria but with union BELOW 0.8x expected are
+# pages that LOST height to a defect - they must repair too, not slip
+# through unflagged. The lower union bound is removed for MERGING (the upper
+# ~1.8x stays as the cross-row guard), and the merged short result is
+# completed to the row's anchors. Row-boundary safety: field row gaps are
+# ~840-920px vs the 418px gap criterion - a short page can never link
+# across the row boundary.
+
+
+def test_sub_band_chain_completes_to_row_height_field_case():
+    """Pair 17+27 from card 612130000135 (real coordinates): a half-dark
+    page detected as 1745+465 with union 2210 = 0.79x expected. One page,
+    repaired, completed to the row's median height."""
+    boxes = [
+        (15080, 7090, 1280, 1745), (15080, 8835, 1280, 465),   # the pair
+        (12900, 6540, 2040, 2790), (17260, 6950, 2020, 2330),  # row anchors
+        (25970, 7100, 1730, 2050),
+    ]
+    new, flags, notes, refused = complete_geometry(boxes)
+
+    assert refused == []
+    assert len(new) == 4, ("the pair must merge into ONE page - a sibling "
+                           "fragment left behind becomes a ghost page", new)
+    repaired = [b for b, f in zip(new, flags) if f]
+    assert len(repaired) == 1, (new, flags)
+    x, y, w, h = repaired[0]
+    assert (x, w) == (15080, 1280)
+    assert h >= 2500, f"sub-band chain not completed to row height: {h}"
+    assert any("row height" in n for n in notes), notes
+
+
+def test_page_that_lost_a_third_of_its_height_repairs():
+    """Synthetic: two pieces totalling 70% of the page with a small gap -
+    union 0.7x is below the old band and used to slip through silently."""
+    boxes = _whole_page_row() + [
+        (2000, 100, 400, 180),
+        (2000, 335, 400, 185),
+    ]
+    new, flags, notes, refused = complete_geometry(boxes)
+
+    assert refused == []
+    assert len(new) == 5, ("both pieces must be consumed by the repair", new)
+    repaired = [b for b, f in zip(new, flags) if f]
+    assert repaired == [(2000, 100, 400, 600)], (repaired, notes)
+
+
+def test_short_page_never_links_across_the_row_boundary():
+    """Field geometry: the row gap (~920px) is far beyond the gap criterion
+    (15% of 2790 = 418px). A bottom-of-row fragment must not chain onto the
+    next row's page even with the lower union bound removed."""
+    boxes = [
+        (19420, 8325, 1700, 925),     # bottom fragment, row 2
+        (19260, 10170, 1680, 2500),   # whole page, row 3 (gap 920)
+        (12900, 6540, 2040, 2790), (17260, 6950, 2020, 2330),
+    ]
+    assert find_fragment_groups(boxes, union_min=0.0) == []
+    new, flags, _, _ = complete_geometry(boxes)
+    assert (19260, 10170, 1680, 2500) in new, "row-3 page was consumed"
+    merged_tall = [b for b, f in zip(new, flags) if f and b[3] > 3000]
+    assert merged_tall == [], f"cross-row merge happened: {merged_tall}"
