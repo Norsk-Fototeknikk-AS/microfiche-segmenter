@@ -726,9 +726,19 @@ One orchestrated test round, from a list of card IDs to a comparison.
 Double-click in Finder; the card list is `TEST-KORT.txt` beside the script,
 one ID per line (`#` is a comment), or it asks for a file.
 
-It **copies** each named panorama into a fresh `TEST-RUNDE-<date>/` folder
-and never moves anything — a test round must not disturb the production
-queue, so the sources stay exactly where the app and the runner expect them.
+**The rule: only reports and anonymized artifacts leave the machine.** The
+panorama copies are journal data, so they go to a **separate**
+`TEST-PANORAMAER-<date>/` folder outside the report tree, with a
+`LES-MEG-IKKE-KOPIER.txt` inside saying so. `TEST-RUNDE-<date>/` then holds
+nothing but the two report folders and `SAMMENLIGNING.txt` — which makes
+"copy the test round folder to the stick" a safe sentence. That separation
+is for the *human*: the machine was already safe, since every copy goes
+through the whitelist, but in the first version the panoramas sat beside the
+reports and no whitelist helps against dragging the whole folder.
+
+It **copies** each named panorama and never moves anything — a test round
+must not disturb the production queue, so the sources stay exactly where the
+app and the runner expect them.
 Cards are looked for in `Panoramas/`, `Panoramas/error/`,
 `PanoramaArchive/` and `Error/` under `sessionRoot` (read from
 `~/.microfiche-station.json` like the app, default

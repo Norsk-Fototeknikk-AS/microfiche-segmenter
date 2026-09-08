@@ -4453,3 +4453,73 @@ def test_a_second_round_compares_against_the_first(tmp_path, monkeypatch):
     assert any(l.startswith("= 612130000012_00012")
                for l in text.splitlines()), ("same card, same code, must "
                                              "read unchanged", text)
+
+
+def test_no_panorama_ever_lands_in_the_report_tree(tmp_path, monkeypatch):
+    """Trond, 2026-09-08: the panorama copies sat beside the reports. The
+    machine never copied them out - copy_out's whitelist would have refused
+    a .tif - but the structure invited a HUMAN to copy the whole folder to
+    the stick, and against that the machine is no help. Panoramas now live
+    outside the report tree entirely."""
+    root = _station_tree(tmp_path / "NHA")
+    make_card(root / "Panoramas" / "612130000012_00012.jpg")
+    cards = tmp_path / "TEST-KORT.txt"
+    cards.write_text("612130000012_00012\n")
+    monkeypatch.setattr(test_runde, "session_root", lambda: root)
+    monkeypatch.setattr(test_runde, "USB_REPORT_DIR",
+                        tmp_path / "nope" / "Rapport")
+
+    folder = test_runde.run_round(cards, parent=tmp_path, open_finder=False)
+
+    images = [p for p in folder.rglob("*")
+              if p.suffix.lower() in (".tif", ".tiff", ".jpg", ".jpeg", ".png")
+              and not p.name.endswith("anon_viz.jpg")]
+    assert images == [], images
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "SAMMENLIGNING.txt", "rapport-bakgrunn", "rapport-standard"], \
+        sorted(p.name for p in folder.iterdir())
+
+
+def test_the_panorama_folder_says_it_must_stay(tmp_path, monkeypatch):
+    root = _station_tree(tmp_path / "NHA")
+    make_card(root / "Panoramas" / "612130000012_00012.jpg")
+    cards = tmp_path / "TEST-KORT.txt"
+    cards.write_text("612130000012_00012\n")
+    monkeypatch.setattr(test_runde, "session_root", lambda: root)
+    monkeypatch.setattr(test_runde, "USB_REPORT_DIR",
+                        tmp_path / "nope" / "Rapport")
+
+    test_runde.run_round(cards, parent=tmp_path, open_finder=False)
+
+    pano = sorted(tmp_path.glob("TEST-PANORAMAER-*"))
+    assert len(pano) == 1, pano
+    assert (pano[0] / "612130000012_00012.jpg").exists()
+    warning = (pano[0] / "LES-MEG-IKKE-KOPIER.txt").read_text()
+    assert "journaldata" in warning.lower(), warning
+    assert "maskinen" in warning.lower(), warning
+
+
+def test_a_hostile_file_in_the_report_folder_is_refused(tmp_path, monkeypatch):
+    """Defence in depth: even if something image-shaped appears in a report
+    folder, the copy to the stick must refuse it rather than carry it."""
+    root = _station_tree(tmp_path / "NHA")
+    make_card(root / "Panoramas" / "612130000012_00012.jpg")
+    cards = tmp_path / "TEST-KORT.txt"
+    cards.write_text("612130000012_00012\n")
+    stick = tmp_path / "stick" / "Rapport"
+    stick.parent.mkdir(parents=True)
+    monkeypatch.setattr(test_runde, "session_root", lambda: root)
+    monkeypatch.setattr(test_runde, "USB_REPORT_DIR", stick)
+
+    real_run = rapport.run_report
+
+    def plant(*a, **k):
+        out = real_run(*a, **k)
+        (out / "612130000012_00012.tif").write_text("journal content")
+        return out
+
+    monkeypatch.setattr(rapport, "run_report", plant)
+    with pytest.raises(rapport.UnsafeArtifact):
+        test_runde.run_round(cards, parent=tmp_path, open_finder=False)
+
+    assert not list(stick.rglob("*.tif")), list(stick.rglob("*.tif"))

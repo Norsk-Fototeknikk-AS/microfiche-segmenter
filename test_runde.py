@@ -9,8 +9,17 @@ so a test round can never disturb the production queue - the sources stay
 exactly where the app and the runner expect them. Then it inspects the copy
 in both modes and diffs the result against the previous round.
 
-Only anonymized artifacts leave: the whitelist is rapport.py's, composed
-with this tool's single addition, never duplicated.
+THE RULE: only reports and anonymized artifacts leave this machine. The
+panorama copies are journal data and stay here, so they are written to a
+SEPARATE folder outside the report tree (`TEST-PANORAMAER-<date>/`, with a
+`LES-MEG-IKKE-KOPIER.txt` inside saying so). The report folder holds nothing
+but the two report folders and SAMMENLIGNING.txt, so "copy the test round
+folder to the stick" is a safe sentence.
+
+That separation is for the HUMAN. The machine was already safe - every copy
+goes through `copy_out`, which refuses anything outside the whitelist - but
+in the first version the panoramas sat beside the reports, and no whitelist
+helps against someone dragging the whole folder (Trond, 2026-09-08).
 """
 
 import json
@@ -239,11 +248,24 @@ def run_round(card_file, parent=None, open_finder=True):
     if not card_ids:
         raise SystemExit(f"FEIL: ingen kort-ID-er i {card_file}")
     root = session_root()
-    folder = rapport.unique_dir(parent / f"TEST-RUNDE-{date.today().isoformat()}")
+    today = date.today().isoformat()
+    folder = rapport.unique_dir(parent / f"TEST-RUNDE-{today}")
     folder.mkdir(parents=True)
-    print(f"Testrunde i {folder}\nKilde: {root}\n")
+    # Journal data stays on the machine, and stays OUT of the folder anyone
+    # might carry to the stick.
+    panoramas = rapport.unique_dir(parent / f"TEST-PANORAMAER-{today}")
+    panoramas.mkdir(parents=True)
+    (panoramas / "LES-MEG-IKKE-KOPIER.txt").write_text(
+        "Denne mappen inneholder KOPIER AV PANORAMAENE - journaldata.\n"
+        "Den skal BLI PAA MASKINEN og aldri paa minnepinnen.\n\n"
+        "Bare rapporter og anonymiserte artefakter forlater m4-studio.\n"
+        f"Rapportene fra denne runden ligger i {folder.name}/ - den mappen\n"
+        "er trygg aa kopiere i sin helhet.\n\n"
+        "Naar runden er lest kan denne mappen slettes.\n")
+    print(f"Testrunde i {folder}\nPanoramakopier (BLIR PAA MASKINEN): "
+          f"{panoramas}\nKilde: {root}\n")
 
-    copied, missing = stage_cards(card_ids, root, folder / "panoramas")
+    copied, missing = stage_cards(card_ids, root, panoramas)
     if missing:
         print(f"\nFANT IKKE {len(missing)} kort (soekte i "
               f"{', '.join(SOURCE_FOLDERS)}):", file=sys.stderr)
@@ -257,7 +279,7 @@ def run_round(card_file, parent=None, open_finder=True):
     for label, extra in (("standard", ()), ("bakgrunn", ("--background-first",))):
         print(f"=== Kjoerer {label} ===")
         reports[label] = rapport.run_report(
-            folder / "panoramas", folder / f"rapport-{label}",
+            panoramas, folder / f"rapport-{label}",
             open_finder=False, extra_args=extra)
 
     text = comparison(reports["standard"], previous_round(parent, folder))
@@ -272,7 +294,7 @@ def run_round(card_file, parent=None, open_finder=True):
                 copy_out([f], USB_REPORT_DIR / folder.name / f"rapport-{label}")
         print(f"Kopiert til pinnen: {out}")
     else:
-        print(f"Pinnen er ikke montert - alt ligger i {folder}")
+        print(f"Pinnen er ikke montert - rapportene ligger i {folder}")
     if open_finder:
         subprocess.run(["open", str(folder)])
     return folder
