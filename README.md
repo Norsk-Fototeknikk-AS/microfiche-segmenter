@@ -208,6 +208,17 @@ flat. A merged detection is first offered to the split pass (below); what
 still cannot be split is kept and warned about (`suspected merged pages` in
 the log) — dropping loses content.
 
+**Changed 2026-09-08 (steg 4B):** keeping it is no longer the same as
+shipping it. A box over `SNAP_IMPOSSIBLE_RATIO` (1.5) pages in either
+dimension is *impossible geometry* — several pages fused into one — and now
+**fails the card** (exit 3, no `_done`, source to `error/`), while its raw
+box stays in the coordinates and the visualizations so the operator can see
+what happened. Card 111 in background mode shipped page 1 as 8610×3100 —
+four pages in one crop — at exit 0, quality 52.5, and `SAMMENDRAG` said OK;
+card 050 had one 4220×2840 box on an otherwise healthy card. Boxes between
+the snap exemption (1.25) and this bound still pass through raw with their
+warning.
+
 The minimum-size filter only catches specks. The opposite failure is a bright
 band along a card edge — far too wide and flat to be a page, far too big to be
 noise. Left in, it becomes a blank page mid-sequence and shifts every later page
@@ -525,7 +536,10 @@ panorama images, and every one is inspected (`--skip-extraction --anon-viz`,
 touching neither sources nor existing card folders). Only whitelisted,
 anonymized artifacts land in `~/Desktop/RAPPORT-<dato>/` — per-card text
 logs, `<kort>_anon_viz.jpg`, and a `SAMMENDRAG.txt` with page counts, exit
-codes and which cards tripped the fragment guard. `rapport.py` enforces the
+codes, **the quality score and the detected grid per card**, and which cards
+tripped the fragment guard. A card that exits 0 but grades POOR (below 60)
+is listed as **`SVAK`**, never `OK`, and counted on its own line — card 111
+read as plain `OK` at quality 52.5 while holding four pages in one box. `rapport.py` enforces the
 whitelist on every copy and re-scans the finished folder; `visualization.jpg`,
 binaries and page crops can never end up there. Cards that fail inspection
 appear loudly as `FEIL` lines in the summary.

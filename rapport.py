@@ -51,8 +51,16 @@ def copy_safe(src, dst):
 QUALITY_WARN_BELOW = 50  # field data 2026-09-07: sick cards < 50, healthy > 74
 
 
+QUALITY_POOR_BELOW = 60  # segment_microfiche grades below this as POOR
+
+
+def parse_grid(output):
+    m = re.search(r"Detected grid: (.+)", output)
+    return m.group(1).strip() if m else None
+
+
 def summary_line(stem, exit_code, pages, fragment_groups, anon_missing=False,
-                 quality=None):
+                 quality=None, grid=None):
     if anon_missing:
         # Whatever the exit code said: without the anonymized image the card
         # cannot be inspected across the air gap, and a missing expected
@@ -62,12 +70,20 @@ def summary_line(stem, exit_code, pages, fragment_groups, anon_missing=False,
     warn = ""
     if quality is not None and quality < QUALITY_WARN_BELOW:
         warn = f"  ADVARSEL LAV KVALITET: {quality}"
+    # Quality and grid on every row: card 111 shipped four pages in one box
+    # at quality 52.5 and the summary just said OK (2026-09-08).
+    detail = f"  kv {quality if quality is not None else '?':>5}"
+    detail += f"  {grid or '?':<20}"
     if exit_code == 0:
-        return f"OK        exit 0  {pages:3d} sider  {stem}{warn}"
+        # A card the segmenter is not confident about must not read as fine.
+        label = ("SVAK    " if quality is not None
+                 and quality < QUALITY_POOR_BELOW else "OK      ")
+        return f"{label}  exit 0  {pages:3d} sider{detail}  {stem}{warn}"
     if exit_code == 3:
-        return (f"FRAGMENT  exit 3  {pages:3d} sider  {stem}  "
+        return (f"FRAGMENT  exit 3  {pages:3d} sider{detail}  {stem}  "
                 f"({fragment_groups} grupper){warn}")
-    return f"FEIL      exit {exit_code}  {pages:3d} sider  {stem}{warn}"
+    return (f"FEIL      exit {exit_code}  {pages:3d} sider{detail}  "
+            f"{stem}{warn}")
 
 
 def find_panoramas(folder):
@@ -147,18 +163,21 @@ def run_report(source_folder, report_dir, open_finder=True, extra_args=()):
             rows.append(summary_line(stem, exit_code, pages,
                                      count_fragment_groups(output),
                                      anon_missing=not anon.exists(),
-                                     quality=parse_quality(output)))
+                                     quality=parse_quality(output),
+                                     grid=parse_grid(output)))
 
     ok = sum(1 for r in rows if r.startswith("OK"))
+    svak = sum(1 for r in rows if r.startswith("SVAK"))
     frag = sum(1 for r in rows if r.startswith("FRAGMENT"))
-    fail = len(rows) - ok - frag
+    fail = len(rows) - ok - svak - frag
     mode = ("bakgrunn-foerst" if "--background-first" in extra_args
             else "standard")
     summary = "\n".join([
         f"RAPPORT generert {date.today().isoformat()}",
         f"Kilde: {source_folder}",
         f"Kode: {code_version()}  |  Modus: {mode}",
-        f"Kort: {len(rows)}  |  OK: {ok}  |  FRAGMENTER: {frag}  |  FEIL: {fail}",
+        f"Kort: {len(rows)}  |  OK: {ok}  |  SVAK: {svak}  |  "
+        f"FRAGMENTER: {frag}  |  FEIL: {fail}",
         "",
         *rows, ""])
     (report_dir / "SAMMENDRAG.txt").write_text(summary)

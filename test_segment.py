@@ -1027,10 +1027,12 @@ def test_page_rows_are_never_touched():
     assert b[200, 200] == 255
 
 
-def test_a_merged_row_is_kept_and_warned_about_end_to_end(tmp_path):
+def test_a_merged_row_is_kept_and_fails_the_card_end_to_end(tmp_path):
     """Weak edges fuse a row at detect scale. The row must survive as ONE
     detection (content present, inspectable in the viz) and the log must warn
-    loudly, so inspection mode shows the problem without squinting at boxes."""
+    loudly - and since steg 4B the card FAILS (exit 3) instead of shipping
+    four pages as one crop. Nothing is dropped: the coordinates still hold
+    the fused row, the source goes to error/ for a re-run."""
     src = tmp_path / "612130000012_00012.jpg"
     a = np.zeros((1500, 2000), 'uint8')
     for r in range(3):
@@ -1043,10 +1045,11 @@ def test_a_merged_row_is_kept_and_warned_about_end_to_end(tmp_path):
     out = tmp_path / "card"
 
     proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode == 3, (proc.returncode, proc.stderr)
     rows = [line for line in (out / "page_coordinates.csv").read_text().splitlines()
             if line and not line.startswith(("#", "page"))]
     assert len(rows) == 9, rows  # 8 single pages + the fused row, nothing dropped
+    assert "impossible geometry" in proc.stdout + proc.stderr
     # NB: tmp_path contains "merged" (pytest names it after the test) and
     # stdout prints paths, so match the warning phrase, not the bare word.
     assert "suspected merged pages" in proc.stdout.lower()
@@ -2280,13 +2283,14 @@ def test_snap_reunites_the_field_cards_right_hand_strip():
     assert all(abs((b - a) - 2180) <= 40 for a, b in zip(xs, xs[1:])), xs
 
 
-def test_snap_leaves_a_single_unsplittable_merge_alone():
+def test_snap_refuses_a_single_unsplittable_merge():
     """One detection spanning two pages with no valley evidence: snapping
-    would invent a split the binary cannot support - the merged-pages
-    warning already covers it (C-contract from the merged-row e2e)."""
+    would invent a split the binary cannot support, so the box keeps its raw
+    geometry - and since steg 4B it also fails the card rather than shipping
+    two pages in one crop (field card 050 background did exactly that)."""
     boxes = [(2010, 6710, 2040, 2790), (4190, 6710, 4260, 2790)]
     snapped, flags, notes, refused = snap_pages(boxes, 2050, 2780)
-    assert refused == []
+    assert refused, notes
     assert (4190, 6710, 4260, 2790) in snapped, snapped
 
 
@@ -2777,10 +2781,13 @@ def test_a_double_height_merger_does_not_glue_two_rows():
     snapped, flags, notes, refused = snap_pages(row1 + row2 + merger,
                                                 2050, 2780)
 
-    assert refused == [], notes
     assert (10730, 3300, 2040, 6380) in snapped, "merger must pass through raw"
     ys = sorted({b[1] for b in snapped if b[3] == 2780})
     assert ys == [3300, 6900], f"rows glued or re-anchored: {ys}"
+    # Steg 4B: a double-height merger is two pages in one box, so it also
+    # fails the card - the clustering must be right REGARDLESS of that.
+    assert refused == [(8,)], (refused, notes)
+    assert any("impossible geometry" in n for n in notes), notes
 
 
 # --- Steg 1 (2026-09-08): provenance in every report ------------------------
@@ -3192,3 +3199,76 @@ def test_the_healthy_standard_cards_keep_exactly_the_slots_they_had():
             (card, rejected)
         checked += 1
     assert checked == 11, checked
+
+
+# --- Steg 4B (2026-09-08): wrong that looks normal ---------------------------
+# Card 111 in background mode exited 0 with 21 pages at quality 52.5 POOR,
+# and page 1 was 8610x3100 - four pages in one box, delivered as one crop.
+# SAMMENDRAG called it OK. Two holes: nothing refused an impossible box (the
+# snap exempts anything over 1.25 pages and passes it through raw), and the
+# summary showed neither the quality nor the grid the operator needed to see
+# it. Card 050 background has the same defect once: a 4220x2840 box.
+
+def test_snap_refuses_a_box_four_pages_wide():
+    """111 background, real geometry: 8610x3100 is not a page."""
+    row = [(2000, 3090, 8610, 3100), (10750, 3090, 6390, 3100),
+           (17280, 3260, 2050, 2790), (19460, 3260, 2050, 2790)]
+    snapped, flags, notes, refused = snap_pages(row, 2050, 2790)
+    assert refused, notes
+    assert any("impossible" in n and "8610" in n for n in notes), notes
+
+
+def test_snap_refuses_a_box_two_pages_wide():
+    """050 background: a single 4220x2840 box on an otherwise healthy card
+    still hides two pages."""
+    row = [(2050 + k * 2180, 2890, 2050, 2840) for k in range(4)]
+    fused = [(10630, 2890, 4220, 2840)]
+    snapped, flags, notes, refused = snap_pages(row + fused, 2050, 2790)
+    assert refused, notes
+
+
+def test_snap_still_passes_a_slightly_oversized_box_through():
+    """Between 1.25 and 1.5 pages the box keeps its loud warning and its raw
+    geometry - only impossible geometry is refused."""
+    row = [(2050 + k * 2180, 2890, 2050, 2790) for k in range(3)]
+    odd = [(8590, 2890, 2800, 2790)]        # 1.37 pages wide
+    snapped, flags, notes, refused = snap_pages(row + odd, 2050, 2790)
+    assert refused == [], notes
+    assert (8590, 2890, 2800, 2790) in snapped, snapped
+
+
+def test_summary_line_carries_quality_and_grid():
+    line = rapport.summary_line("kort_a", 0, 13, 0, quality=92.6,
+                                grid="2 rows: 12+1")
+    assert "92.6" in line and "2 rows: 12+1" in line and "kort_a" in line
+
+
+def test_a_poor_card_is_reported_as_svak_not_ok():
+    """Card 111 background: exit 0, quality 52.5 POOR - and SAMMENDRAG said
+    OK. A card the segmenter is not confident about must not read as fine."""
+    line = rapport.summary_line("kort_b", 0, 21, 0, quality=52.5,
+                                grid="3 rows: 7+7+7")
+    assert line.startswith("SVAK"), line
+    assert not line.startswith("OK"), line
+
+
+def test_a_good_card_still_reads_ok():
+    line = rapport.summary_line("kort_c", 0, 13, 0, quality=92.6,
+                                grid="2 rows: 12+1")
+    assert line.startswith("OK"), line
+
+
+def test_parse_grid_reads_the_detected_grid():
+    out = "...\n  Detected grid: 3 rows: 12+12+7\n..."
+    assert rapport.parse_grid(out) == "3 rows: 12+12+7"
+    assert rapport.parse_grid("nothing here") is None
+
+
+def test_summary_counts_svak_cards_separately(tmp_path):
+    src = tmp_path / "arkiv"
+    src.mkdir()
+    make_card(src / "612130000012_00001.jpg")
+    report_dir = rapport.run_report(src, tmp_path / "RAPPORT-test",
+                                    open_finder=False)
+    head = (report_dir / "SAMMENDRAG.txt").read_text().split("\n\n")[0]
+    assert "SVAK:" in head, head

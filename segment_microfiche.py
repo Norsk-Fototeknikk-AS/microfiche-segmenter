@@ -1026,6 +1026,12 @@ PAGE_SIZE_PRIOR = (2050, 2780)
 PAGE_SIZE_TOLERANCE = 0.10      # per-card fine-tune bound around the prior
 SNAP_PITCH_TOLERANCE = 0.15     # of the pitch: max offset from a grid slot
 SNAP_GROWTH_MARK = 0.05         # area growth share that marks a page blue
+# Beyond this, a box is not a page at all but several fused into one, and
+# shipping it delivers one crop where the journal has four (card 111 in
+# background mode: page 1 was 8610x3100 at exit 0, quality 52.5; card 050:
+# one 4220x2840 box on an otherwise healthy card). Boxes between the snap
+# exemption (1.25) and this stay raw with their loud warning.
+SNAP_IMPOSSIBLE_RATIO = 1.5
 
 # Coverage guard (mandatory, 2026-09-09): field card 612130000036 scored
 # 100.0 with its whole first page row OUTSIDE every box. Foreground mass
@@ -1199,11 +1205,13 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=(),
 
     snapped, out_flags, notes, refused = [], [], [], []
     origins = []   # detection indices behind each snapped PAGE (not exempt)
+    src_idx = []   # detection indices behind EVERY entry, for reporting
     row_ctx = []   # per-row grid/anchor, for the witness pass
     for i in sorted(exempt):
         snapped.append(boxes[i])
         out_flags.append(bool(flags[i]))
         origins.append(None)
+        src_idx.append((i,))
 
     for row in rows:
         members = [i for i in row if i not in exempt]
@@ -1255,6 +1263,7 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=(),
                 snapped.append(boxes[i])
                 out_flags.append(bool(flags[i]))
                 origins.append(None)
+                src_idx.append((i,))
                 continue
             cells.setdefault(k, []).append(i)
 
@@ -1292,6 +1301,7 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=(),
                     snapped.append(boxes[i])
                     out_flags.append(bool(flags[i]))
                     origins.append(None)
+                    src_idx.append((i,))
                 continue
             if not fits(y, slot):
                 # A full box that would cross a stripe: keep it in the slot.
@@ -1305,6 +1315,7 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=(),
             snapped.append((x, y, page_w, page_h))
             out_flags.append(bool(any(flags[i] for i in group) or is_grown))
             origins.append(tuple(sorted(group)))
+            src_idx.append(tuple(sorted(group)))
             if is_grown:
                 dets = "+".join(str(i + 1) for i in sorted(group))
                 notes.append(f"snapped detections {dets} to full page at "
@@ -1366,8 +1377,20 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=(), stripes=(),
         snapped.append((x, y, page_w, page_h))
         out_flags.append(True)
         origins.append(())
+        src_idx.append(())
         notes.append(f"page from position witness at ({x}, {y}) - a "
                      f"{ww}x{wh} rest proves the cell holds a page")
+
+    # Impossible geometry (steg 4B): several pages fused into one box. The
+    # snap exempts anything over 1.25 pages and passes it through raw, so
+    # without this a four-page box shipped at exit 0 (card 111 background).
+    for k, (x, y, w, h) in enumerate(snapped):
+        if w > SNAP_IMPOSSIBLE_RATIO * page_w or h > SNAP_IMPOSSIBLE_RATIO * page_h:
+            refused.append(tuple(src_idx[k]))
+            notes.append(f"REFUSED: box at ({x}, {y}) is {w}x{h} - "
+                         f"impossible geometry, over "
+                         f"{SNAP_IMPOSSIBLE_RATIO:g} pages "
+                         f"({page_w}x{page_h}); several pages in one box")
 
     # Invariants (Trond, 2026-09-08): no two page boxes overlap, no page box
     # crosses a stripe. A violation is a wrong guess somewhere above, and
