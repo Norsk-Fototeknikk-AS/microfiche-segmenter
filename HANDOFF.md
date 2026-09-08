@@ -467,6 +467,25 @@ page. Do not add closing/smoothing to the mask or draw directly on the output.
 
 ---
 
+## A slot shorter than a page against the bottom band means the card sits low
+
+Decided 2026-09-08 (Trond). Card 612130000562_00012 refuses with
+`REFUSED snap of detections …: the slot between stripes 18260-20920 is
+2660 px, shorter than a page (2780)`. That refusal is **correct and stays**:
+the card physically sits ~1500 px too low in the frame, so its bottom row
+overlaps the bottom band and part of it is outside the imaged area.
+
+**No tolerance is to be built for this class.** A page that is partly
+outside the image cannot be recovered by geometry, and a tolerance would
+turn a card that must be re-photographed into a card that ships with a
+truncated bottom row. The card goes out as a **deviation for
+re-photographing**, and it has been removed from `TEST-KORT.txt`.
+
+The signature to recognise it by: a slot against the *bottom* band that is
+shorter than a page, on a card whose other rows are normal.
+
+---
+
 ## Risk log: card 135's row 1 sits on five different y values
 
 Found 2026-09-08 while pinning the physical page count. In the shipped

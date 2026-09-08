@@ -97,6 +97,7 @@ GEOMETRY_MAX_INVENTED_SHARE = 0.3   # per MERGED page; extensions are exempt
                                     # backstop if they are ever loosened.
 GEOMETRY_MAX_REPAIR_SHARE = 0.5     # of the card's pages, else the card is
                                     # genuinely sick
+EXTEND_MAX_WIDTH_RATIO = 1.25   # steg 10B: wider than this is not one page
 GEOMETRY_SHORT_RATIO = 0.7          # below this share of row height = short
 GEOMETRY_FULL_RATIO = 0.8           # at least this share = a full anchor
 GEOMETRY_MARK_COLOR = (255, 80, 0)  # blue boxes for geometry-completed pages
@@ -1096,6 +1097,19 @@ def complete_geometry(boxes):
             short_limit = row_h if entries[i][3] else GEOMETRY_SHORT_RATIO * row_h
             if h >= short_limit:
                 continue
+            # ...and never widen (steg 10B). The extension is for a page
+            # that lost HEIGHT, and its exemption from the invented cap is
+            # argued on one page's width - "empty film at worst". A box
+            # spanning two pages breaks that argument: card 623_00012's
+            # 4110x450 sliver became a 4110x2780 double page at 84 %
+            # invented. Such a box keeps its raw geometry so the
+            # impossible-geometry guard names it for what it is.
+            row_w = int(np.median([all_boxes[j][2] for j in anchors]))
+            if w > EXTEND_MAX_WIDTH_RATIO * row_w:
+                notes.append(f"NOT extending ({x}, {y}) {w}x{h}: "
+                             f"{w / row_w:.1f} pages wide - several pages "
+                             "in one box, not a page that lost height")
+                continue
             invented = 1.0 - h / row_h
             entries[i][0] = (x, row_top, w, row_h)
             entries[i][1] = True
@@ -1869,14 +1883,22 @@ def card_cells(boxes, page_w, page_h, image_w, margin_cells=0,
                   if page_w <= b - a <= page_w * 1.45]
     pitch = float(np.median(diffs)) if diffs else page_w * 1.05
 
+    # The raster every row is measured against is the CARD's, not its own
+    # (steg 10D): a short bottom row is where the known-empty control cells
+    # live, and they only exist if the row is enumerated across the width
+    # the other rows span. Card 098's row 5 holds 6 pages of 12, and those
+    # six empty cells are real card area with no page in it.
+    card_x0 = min(b[0] for row in rows for b in row)
+    card_x1 = max(b[0] for row in rows for b in row)
     cells = []
     omitted = 0
     for row in rows:
         xs = sorted(b[0] for b in row)
         y = int(np.median([b[1] for b in row]))
         taken = set(xs)
-        span = int(round((xs[-1] - xs[0]) / pitch))
-        for k in range(-margin_cells, span + margin_cells + 1):
+        k_lo = int(round((card_x0 - xs[0]) / pitch))
+        k_hi = int(round((card_x1 - xs[0]) / pitch))
+        for k in range(k_lo - margin_cells, k_hi + margin_cells + 1):
             x = int(round(xs[0] + k * pitch))
             if x < 0 or x + page_w > image_w:
                 omitted += 1
@@ -1884,9 +1906,9 @@ def card_cells(boxes, page_w, page_h, image_w, margin_cells=0,
             on_page = any(abs(x - px) <= pitch * 0.25 for px in taken)
             cells.append({"row": rows.index(row) + 1, "x": x, "y": y,
                           "page": 1 if on_page else 0})
-        # Cells the row does not span are margin, not evidence.
-        omitted += max(0, int((image_w - page_w - xs[0]) // pitch) - span)
-        omitted += int(xs[0] // pitch)
+        # Cells outside the card's own raster are margin, not evidence.
+        omitted += max(0, int((image_w - page_w - xs[0]) // pitch) - k_hi)
+        omitted += max(0, int(xs[0] // pitch) + k_lo)
     if omitted_out is not None:
         omitted_out.append(omitted)
     return cells

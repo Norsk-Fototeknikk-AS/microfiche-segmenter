@@ -4960,3 +4960,60 @@ def test_an_unchanged_card_keeps_the_callers_quality():
     chain = repair_and_snap(boxes, (), (), 29071, 21505)
     assert chain.boxes == boxes, chain.boxes
     assert chain.quality is None, chain.quality
+
+
+# --- Steg 10B (2026-09-08): the extension pass must not widen ------------
+# Card 612130000623_00012 shipped a 4110x2780 box - two pages in one -
+# refused as impossible geometry. The splitter was not at fault: it DID cut
+# the blob, horizontally, leaving (17110, 3490, 4110, 450). The EXTENSION
+# pass then took that 450 px sliver and extended it to row height at "84 %
+# invented, empty film at worst". The extension exists for a page that lost
+# HEIGHT and never checks the WIDTH; its exemption from the invented cap is
+# argued on a single page's width, not on a box spanning two.
+
+def test_a_double_width_sliver_is_never_extended():
+    """623_00012's real geometry: the sliver is two pages wide."""
+    row = [(2230 + k * 2180, 4380, 2030, 2780) for k in range(6)]
+    sliver = [(17110, 3490, 4110, 450)]
+
+    out, flags, notes, refused = complete_geometry(row + sliver)
+
+    assert (17110, 3490, 4110, 450) in out, ("the raw box must survive so "
+                                             "the guard can name it", out)
+    assert not any("extended" in n and "17110" in n for n in notes), notes
+
+
+def test_a_triple_width_sliver_is_never_extended():
+    """623_00024: (7240, 4200) 5800x2770 came the same way."""
+    row = [(2230 + k * 2180, 4200, 2030, 2770) for k in range(4)]
+    sliver = [(7240, 4200, 5800, 400)]
+    out, flags, notes, refused = complete_geometry(row + sliver)
+    assert (7240, 4200, 5800, 400) in out, out
+
+
+def test_a_page_wide_short_detection_is_still_extended():
+    """The mechanism itself stays: a page that lost height is what the
+    extension is for."""
+    row = [(2230 + k * 2180, 4380, 2030, 2780) for k in range(6)]
+    short = [(2230 + 6 * 2180, 4380, 2030, 900)]
+    out, flags, notes, refused = complete_geometry(row + short)
+    assert any("extended" in n for n in notes), notes
+    assert any(b[3] >= 2700 and b[0] == 2230 + 6 * 2180 for b in out), out
+
+
+def test_a_short_bottom_row_gives_real_empty_cells():
+    """Steg 10D: card 098's row 5 holds 6 pages where the rows above hold
+    12. Those six cells are real card area with no page in them - the
+    control 8B needs, and the one place it exists in quantity."""
+    boxes = []
+    for r in range(4):
+        boxes += [(1820 + k * 2180, 3135 + r * 3440, 2050, 2790)
+                  for k in range(12)]
+    boxes += [(12970 + k * 2180, 16865, 2050, 2790) for k in range(6)]
+
+    cells = card_cells(boxes, 2050, 2790, image_w=29071)
+
+    row5 = [c for c in cells if c["y"] > 16000]
+    assert len(row5) == 12, row5
+    assert sum(1 for c in row5 if c["page"] == 0) == 6, row5
+    assert sum(1 for c in cells if c["page"] == 1) == 54, cells

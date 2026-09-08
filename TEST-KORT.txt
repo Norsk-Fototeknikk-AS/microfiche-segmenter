@@ -23,8 +23,10 @@
 612130000425_00012
 # feilet av andre grunner
 612130000555_00012
-612130000562_00012
 612130000647_00012
+# 612130000562_00012 er tatt ut 2026-09-08: kortet ligger for lavt i
+# rammen, nederste rad overlapper bunnbaandet, og Trond har besluttet at
+# det gaar ut som AVVIK til omfotografering. Se risikologgen i HANDOFF.
 # kontroller: friske kort som ikke skal endre seg
 612130000456_00012
 612130000531_00012

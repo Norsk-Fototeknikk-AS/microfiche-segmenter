@@ -329,7 +329,12 @@ overrides the binary** (`complete_geometry`):
 - A lone **short detection** in a row with ≥2 full-height anchors is
   extended to the row's top edge and median height (pages share their top
   edge within a row; verified on the fasit). Worst case is empty film in
-  the crop, so extensions are exempt from the invented-cap.
+  the crop, so extensions are exempt from the invented-cap — **and that
+  argument only holds for one page's width**, so since 2026-09-08 nothing
+  wider than `EXTEND_MAX_WIDTH_RATIO` (1.25 pages) is extended at all. Card
+  612130000623_00012 turned a 4110×450 sliver into a 4110×2780 *double*
+  page at 84 % invented that way. Such a box keeps its raw geometry so the
+  impossible-geometry guard names it for what it is.
 - Repaired pages are marked **blue** in both visualizations, counted in the
   banner, and logged per page (`N pages geometry-completed`, with invented
   share). Never silent repair.
@@ -494,6 +499,12 @@ a page and card 203, which shipped **empty crops**, runs 0.5–8.5 %. They
 overlap almost completely. So this contract measures and logs; it decides
 nothing. The calibration comes from the field, where the empty cells of
 short rows are the control that analysis never had.
+
+**The control lives in the short bottom row** (steg 10D). Every row is
+enumerated across the width the *card* spans, not its own: card 098's row 5
+holds 6 pages where the rows above hold 12, and those six cells are real
+card area with no page in them. Rows rarely have holes in the middle, so
+without this there is almost no control population at all.
 
 **The empty cells must be empty CELLS, not the card margin** (steg 9F). The
 first version enumerated on to the image edge, and healthy card
