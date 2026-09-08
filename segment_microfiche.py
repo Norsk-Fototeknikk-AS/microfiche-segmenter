@@ -227,7 +227,8 @@ def otsu_excluding(thumb, mask):
 # own - the trigger is that the first pass demonstrably did not find the
 # card, AND that what foreground it did find is essentially all frame.
 STEP2_BORDER_TRIGGER = 0.40      # lowest triggering field card: 62.4 %
-STEP2_BORDER_MUST_HALVE = 0.5    # proof: the share must at least halve
+# Kept for the log only: the border share is reported before and after,
+# but it does not decide (steg 9C - it punished small cards).
 
 
 def frame_mask(thumb, thresh, header_px):
@@ -2889,24 +2890,29 @@ def main(otsu_override=None, step2=False, step1_border=None):
     # format prior rather than a per-card estimate. Otherwise the card is
     # refused with the reason it actually had.
     if step2:
+        # Step two proves itself by the card passing every guard on its own
+        # (steg 9C) - not by a number about the frame. The border share is
+        # a FRACTION of total foreground, so a card with few pages reads
+        # high however well the threshold worked: 612130000609_00036 was
+        # refused at border 100% -> 61% while shipping 17 clean pages in
+        # 12+5 at quality 94.2. Border is logged, and decides nothing.
         first_border = step1_border if step1_border is not None else 1.0
-        proved = border_share <= STEP2_BORDER_MUST_HALVE * first_border
         _pw, _ph, size_note = resolve_page_size(boxes_fullres)
-        # Only a fall to the per-card ESTIMATE counts against step two: a
-        # single-witness note means the prior DID match, just thinly.
         off_prior = bool(size_note and size_note.startswith("Page-size prior"))
-        if not proved or off_prior:
+        if off_prior:
             card_refusals = card_refusals + [
-                f"threshold found only the frame; re-threshold failed "
-                f"(border {first_border:.0%} -> {border_share:.0%}, needed "
-                f"{STEP2_BORDER_MUST_HALVE * first_border:.0%} or less"
-                + ("" if not off_prior else "; page size still off-prior")
-                + ")"]
+                "threshold found only the frame; re-threshold failed "
+                f"(border {first_border:.0%} -> {border_share:.0%}; the page "
+                "size still does not match the format prior)"]
             print(f"\nERROR: {card_refusals[-1]}", file=sys.stderr)
+        elif card_refusals or fragment_groups or refused_groups or snap_refused:
+            print(f"\nStep 2 ran (border {first_border:.0%} -> "
+                  f"{border_share:.0%}) but the card fails a guard on its "
+                  "own - see the reason above", file=sys.stderr)
         else:
             print(f"\nStep 2 proved itself: border {first_border:.0%} -> "
                   f"{border_share:.0%}, {len(boxes_fullres)} pages on the "
-                  "format prior")
+                  "format prior, every guard passed")
 
     # Per-cell evidence (steg 8A): measurement only, nothing decides on it.
     # One machine-readable line per cell, empty cells included, so the

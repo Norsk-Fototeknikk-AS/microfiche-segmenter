@@ -4710,3 +4710,45 @@ def test_a_fused_top_row_is_not_header_content():
     boxes = fused + [(2230 + k * 2180, 5000, PW, PH) for k in range(12)]
     dropped, note = header_zone_detections(boxes, PW, PH, HDR)
     assert dropped == [], (dropped, note)
+
+
+# --- Steg 9C (2026-09-08): step two proves itself on its own legs ---------
+# Card 612130000609_00036 was REFUSED with "re-threshold failed" while
+# producing 17 pages in 12+5 at quality 94.2 with regular coordinates. The
+# border-halving rule punished it for having few pages: border is a fraction
+# of total foreground, so a small card reads high however well the threshold
+# worked (100 -> 61 there). The proof is not a number about the frame - it
+# is whether the card passes every guard on its own.
+
+def test_step_two_is_judged_by_the_guards_not_by_the_border(tmp_path):
+    """A card step two recovers cleanly must pass, whatever the border
+    share does. The staircase earns nothing and is excused nothing."""
+    src = tmp_path / "612130000012_00012.jpg"
+    _tri_modal_card(src)
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    out = proc.stdout + proc.stderr
+
+    assert "Step 2 threshold:" in out, out
+    assert proc.returncode == 0, out
+    assert "re-threshold failed" not in out, out
+    assert re.search(r"Step 2 proved itself.*border \d+% -> \d+%", out), out
+
+
+def test_a_step_two_card_that_fails_a_guard_says_which(tmp_path):
+    """And when it does fail, it fails with the reason it HAD - the guard's
+    own words - not with a number about the frame."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.full((5200, 6940), 226, np.uint8)
+    a[:150, :] = 2; a[-150:, :] = 2; a[:, :150] = 2; a[:, -150:] = 2
+    pyvips.Image.new_from_memory(a.tobytes(), 6940, 5200, 1,
+                                 'uchar').write_to_file(str(src))
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 2, (proc.returncode, out)
+    assert "re-threshold failed" in out, out
+    assert "no pages detected" not in out, out

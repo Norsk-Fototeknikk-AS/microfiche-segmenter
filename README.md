@@ -553,11 +553,16 @@ threshold lands at 2 (frame against everything) and finds no page; masked,
 it lands at 195 and finds every one. On a healthy card both give 33 — step
 two is a no-op if it ever runs.
 
-**It proves itself or the card is refused.** The border share must at least
-halve (`STEP2_BORDER_MUST_HALVE`) and the page size must come from the
-format prior rather than a per-card estimate. Then the *whole* pass runs
-again from the new threshold — same code, no exemptions — and the card must
-satisfy every guard on its own.
+**It proves itself or the card is refused** — and the proof is that the card
+**passes every guard on its own**, not a number about the frame. The *whole*
+pass runs again from the new threshold (same code, no exemptions), and the
+page size must come from the format prior rather than a per-card estimate.
+
+The border share is logged before and after, and decides nothing. It used to
+have to at least halve, which punished cards for having few pages: border is
+a fraction of *total* foreground, so a small card reads high however well
+the threshold worked. Card 612130000609_00036 was refused at 100 % → 61 %
+while shipping 17 clean pages in 12+5 at quality 94.2 (steg 9C).
 
 **Consequence worth knowing:** step two can only prove itself on a card in
 the journal format, since the proof requires the page-size prior. A faded
