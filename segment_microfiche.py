@@ -1639,6 +1639,17 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
             f"detection(s) (minimum {EVIDENCE_MIN_DETECTIONS}) AND "
             f"{len(boxes) - detections_in} page(s) invented on top of them")
 
+    # Layout invariants (steg 6B): a physical card holds at most MAX_ROWS
+    # rows of at most MAX_PAGES_PER_ROW pages. These were warnings until
+    # 612130000432_00024 shipped 60 pages in SIX rows at quality 71.1.
+    layout_rows = group_boxes_into_rows(boxes)
+    if len(layout_rows) > MAX_ROWS:
+        refusals.append(f"{len(layout_rows)} rows detected - a card holds at "
+                        f"most {MAX_ROWS}")
+    for i, row in enumerate(layout_rows, 1):
+        if len(row) > MAX_PAGES_PER_ROW:
+            refusals.append(f"{len(row)} pages in one row (row {i}) - a card "
+                            f"holds at most {MAX_PAGES_PER_ROW}")
     for reason in refusals:
         out.append((2, f"\nERROR: {reason}"))
 
@@ -2562,15 +2573,6 @@ def main():
     snap_refused = chain.snap_refused
     geo_overload = chain.geo_overload
     card_refusals = chain.card_refusals
-    layout_rows = group_boxes_into_rows(boxes_fullres)
-    if len(layout_rows) > MAX_ROWS:
-        print(f"Warning: {len(layout_rows)} rows detected - real cards hold "
-              f"at most {MAX_ROWS}. Likely misdetection.")
-    for i, row in enumerate(layout_rows, 1):
-        if len(row) > MAX_PAGES_PER_ROW:
-            print(f"Warning: {len(row)} pages in one row (row {i}) - real "
-                  f"cards hold at most {MAX_PAGES_PER_ROW}. Likely "
-                  "misdetection.")
     if chain.quality is not None:
         quality = chain.quality
 

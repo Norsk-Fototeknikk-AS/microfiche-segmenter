@@ -475,6 +475,21 @@ happens to stay low. It bites only when something *was* invented (pages out
 > detections in): the real journal fasit card in `testdata/` has 2
 detections and 2 pages and composes nothing.
 
+### C20. The layout invariants refuse, they do not warn
+
+A physical card holds at most `MAX_ROWS` (5) rows of at most
+`MAX_PAGES_PER_ROW` (13) pages — a fasit from Trond, measured on the real
+cards, not a heuristic. Exceeding either was a printed *warning* until
+612130000432_00024 shipped **60 pages in six rows at quality 71.1 GOOD** in
+the 88-card production run. A warning nobody reads is not a guard: the card
+now exits 3 with the count in the message.
+
+Judged on the repaired geometry (steg 5B), inside `repair_and_snap` with
+the other geometry decisions, so a report can be replayed through it.
+Measured across all 88 field cards: one new refusal in the archive
+(432_00024, six rows) and four cards that already failed. Cards 517_00012
+(12×5) and 227_00024 (12+13+11) pass — thirteen is the limit, not over it.
+
 ### C18. Full width is not enough — a stripe must prove itself
 
 `remove_structure_rows` used to delete every full-width run thinner than a

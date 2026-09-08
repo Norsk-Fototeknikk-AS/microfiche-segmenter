@@ -232,7 +232,7 @@ def test_card_limits_match_the_physical_cards():
     assert MAX_PAGES_PER_ROW == 13
 
 
-def test_too_many_pages_in_a_row_warns(tmp_path):
+def test_too_many_pages_in_a_row_fails_the_card(tmp_path):
     """One page beyond the limit fails the card (steg 6B; it was a warning
     until 612130000432_00024 shipped 60 pages in six rows at 71.1 GOOD).
     Derived from the constant so a raised limit keeps this test honest."""
@@ -246,11 +246,11 @@ def test_too_many_pages_in_a_row_warns(tmp_path):
     out = tmp_path / "card"
     proc = run_segmenter("-i", str(src), "-O", str(out),
                          "--skip-extraction", "--no-invert")
-    assert proc.returncode == 0, proc.stderr
-    assert f"{n} pages in one row" in proc.stdout, proc.stdout
+    assert proc.returncode == 3, (proc.returncode, proc.stderr)
+    assert f"{n} pages in one row" in proc.stdout + proc.stderr, proc.stderr
 
 
-def test_too_many_rows_warns(tmp_path):
+def test_too_many_rows_fails_the_card(tmp_path):
     src = tmp_path / "612130000012_00012.jpg"
     a = np.zeros((3000, 1200), 'uint8')
     for r in range(6):
@@ -260,8 +260,8 @@ def test_too_many_rows_warns(tmp_path):
     out = tmp_path / "card"
     proc = run_segmenter("-i", str(src), "-O", str(out),
                          "--skip-extraction", "--no-invert", "--header-skip", "0")
-    assert proc.returncode == 0, proc.stderr
-    assert "6 rows" in proc.stdout, proc.stdout
+    assert proc.returncode == 3, (proc.returncode, proc.stderr)
+    assert "6 rows" in proc.stdout + proc.stderr, proc.stderr
 
 
 # --- End-to-end on a synthetic card ----------------------------------------
@@ -3873,3 +3873,39 @@ def test_the_evidence_ratio_is_logged_even_when_it_passes():
         chain.output
 
 
+def test_more_rows_than_a_card_can_hold_is_refused():
+    """432_00024 shipped 60 pages in SIX rows at 71.1 GOOD. A card holds at
+    most five - that is a fasit from Trond, not a heuristic."""
+    boxes = []
+    for r in range(MAX_ROWS + 1):
+        boxes += _row_of(4, y=3300 + r * 3400)
+
+    chain = repair_and_snap(boxes, (), (), 29071)
+
+    assert chain.card_refusals, chain.output
+    assert any("rows" in r for r in chain.card_refusals), chain.card_refusals
+
+
+def test_five_rows_of_twelve_is_a_normal_card():
+    """517_00012 is exactly this and must keep passing."""
+    boxes = []
+    for r in range(MAX_ROWS):
+        boxes += _row_of(12, y=3300 + r * 3400)
+    chain = repair_and_snap(boxes, (), (), 29071)
+    assert chain.card_refusals == [], chain.card_refusals
+    assert len(chain.boxes) == 60
+
+
+def test_more_pages_in_a_row_than_a_card_can_hold_is_refused():
+    boxes = _row_of(MAX_PAGES_PER_ROW + 1)
+    chain = repair_and_snap(boxes, (), (), 29071 + 2180)
+    assert chain.card_refusals, chain.output
+    assert any("in one row" in r for r in chain.card_refusals), \
+        chain.card_refusals
+
+
+def test_a_full_row_at_the_limit_still_passes():
+    """227_00024 ships 12+13+11 - thirteen is the limit, not over it."""
+    boxes = _row_of(MAX_PAGES_PER_ROW)
+    chain = repair_and_snap(boxes, (), (), 29071 + 2180)
+    assert chain.card_refusals == [], chain.card_refusals
