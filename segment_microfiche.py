@@ -362,8 +362,19 @@ STRIPE_MERGE_GAP = 60 / STRIPE_REF_HEIGHT    # card 074's stripe is cut in
                                              # two 40 px apart; real stripes
                                              # sit 3400 px apart
 STRIPE_RASTER_TOL = 150 / STRIPE_REF_HEIGHT  # false runs sit 400-600 px off
-STRIPE_SOLID_COVERAGE = 0.95                 # fasit stripes measure
-                                             # 0.99-1.00; a 12-page row 0.846
+# Solidity floor. First set to 0.95 from the fasit cards alone (their
+# stripes measure 0.99-1.00 against 0.846 for a 12-page row). The A/B run of
+# e18e143 logged coverage per run in the field for the first time and showed
+# 0.95 was too high: 17 REAL stripes on cards 135 and 142 measure 0.92-0.95
+# at 100-160 px and were refused, which cost those cards every row slot they
+# had (142 standard ended with one structure run, 135 with two) - the cards
+# still passed because clear_border_connected removes what survives here.
+# False runs measure 0.85-0.89 across all 32 card runs, highest 0.89, so the
+# floor belongs in that gap. Replayed over both modes: 0.95 leaves 28 of 32
+# cards with their seven structure runs, 0.92 and below leaves 32 of 32.
+# The raster is the deciding test regardless - a solid run in the wrong
+# place is page content.
+STRIPE_SOLID_COVERAGE = 0.90
 # A stripe raster is one page row plus a stripe: the field pitch is
 # 3360-3470 against a 2780 px page, i.e. 1.21-1.25 page heights. Capping at
 # 1.6 makes DOUBLE pitch (2.5x) impossible - without the cap, a card with

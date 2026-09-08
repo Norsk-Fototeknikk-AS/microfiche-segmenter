@@ -3128,11 +3128,11 @@ def test_a_cut_stripe_is_coalesced_into_one(nothing=None):
 
 
 def test_classify_rejects_a_run_that_is_not_solid_enough():
-    """A page row creeping over the run threshold is not a stripe: the fasit
-    measures real stripes at 0.99-1.00, a 12-page row at 0.846."""
+    """A page row creeping over the run threshold is not a stripe: the field
+    measures real stripes at 0.92-1.00, false runs at 0.85-0.89."""
     runs = [(2810, 3050), (4000, 4300), (6250, 6510), (9680, 9960),
             (13140, 13400), (16600, 16860), (20040, 20370), (20690, 21510)]
-    cov = [1.0, 0.88] + [1.0] * 6
+    cov = [1.0, 0.87] + [1.0] * 6
     stripes, rejected = classify_structure_runs(runs, cov, CARD_H,
                                                 CARD_MIN_PAGE_H, CARD_HEADER)
     assert (4000, 4300) not in stripes, stripes
@@ -3402,3 +3402,77 @@ def test_the_prior_fall_reaches_the_report(tmp_path):
                          "--skip-extraction")
     assert "Page-size prior" in proc.stdout, proc.stdout
     assert "detections" in proc.stdout, proc.stdout
+
+
+# --- Steg 5A (2026-09-08): the solidity floor was too high ------------------
+# Measured on the A/B run of e18e143, which logs coverage per run for the
+# first time: real stripes on cards 135 and 142 measure 0.92-0.95 at
+# 100-160 px and were refused as "not solid enough". The cards still passed
+# (clear_border_connected removes stripes that survive here) but their row
+# SLOTS vanished - 142 standard ended with one structure run, 135 with two.
+# False runs measure 0.85-0.89 without exception across both modes, so the
+# floor belongs at 0.90. The raster remains the deciding test either way.
+
+STRIPE_FASIT_COV = REPO / "testdata" / "stripe_fasit_dekning_2026-09-08.txt"
+
+
+def _stripe_fasit_with_coverage():
+    """[(mode, card, [(start, end)], [coverage])] measured in the field."""
+    out = []
+    for line in STRIPE_FASIT_COV.read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        head, runs = line.split("] ", 1)
+        pairs = [r.split(":") for r in runs.split(", ")]
+        out.append((head.split()[0], head.split()[1],
+                    [tuple(int(v) for v in p[0].split("-")) for p in pairs],
+                    [float(p[1]) for p in pairs]))
+    return out
+
+
+def test_the_coverage_fasit_covers_both_modes():
+    fasit = _stripe_fasit_with_coverage()
+    assert len(fasit) == 32, len(fasit)
+    assert all(len(runs) == len(covs) for _, _, runs, covs in fasit)
+
+
+def test_every_field_card_classifies_with_its_measured_coverage():
+    """The whole classifier against real numbers: thickness, solidity and
+    raster together must still leave exactly the seven structure runs."""
+    for mode, card, runs, covs in _stripe_fasit_with_coverage():
+        stripes, rejected = classify_structure_runs(
+            runs, covs, CARD_H, CARD_MIN_PAGE_H, CARD_HEADER)
+        assert len(stripes) == 7, (mode, card, stripes, rejected)
+
+
+def test_a_thin_real_stripe_at_92_percent_is_a_stripe():
+    """Card 142 standard, real geometry: five 100-130 px stripes at
+    0.92-0.94 were refused, and the card lost every row slot it had."""
+    runs = [(2880, 2990), (6320, 6450), (9760, 9870), (13200, 13320),
+            (16670, 16770), (20140, 20260), (20730, 21510)]
+    covs = [0.94, 0.95, 0.94, 0.94, 0.92, 0.93, 1.0]
+    stripes, rejected = classify_structure_runs(
+        runs, covs, CARD_H, CARD_MIN_PAGE_H, CARD_HEADER)
+    assert len(stripes) == 7, (stripes, rejected)
+
+
+def test_a_run_at_89_percent_is_still_refused_on_solidity():
+    """The highest false run measured anywhere is 0.89 - the floor sits in
+    the gap between that and the thinnest real stripe at 0.92."""
+    runs = _raster_runs() + [(20690, 21510)]
+    covs = [0.99, 0.89, 0.99, 0.99, 0.99, 0.99, 1.0]
+    stripes, rejected = classify_structure_runs(
+        runs, covs, CARD_H, CARD_MIN_PAGE_H, CARD_HEADER)
+    assert _raster_runs()[1] not in stripes, stripes
+    assert any("not solid enough" in why for _, why in rejected), rejected
+
+
+def test_a_solid_run_off_the_raster_is_still_refused_on_position():
+    """Solidity never overrides position: 0.92 in the wrong place is page
+    content (card 104's 260 and 280 px runs measured 0.89 there)."""
+    runs = _raster_runs() + [(4000, 4300), (20690, 21510)]
+    covs = [0.99] * 6 + [0.92, 1.0]   # solid enough, wrong place
+    stripes, rejected = classify_structure_runs(
+        runs, covs, CARD_H, CARD_MIN_PAGE_H, CARD_HEADER)
+    assert (4000, 4300) not in stripes, stripes
+    assert any("off-raster" in why for r, why in rejected if r == (4000, 4300))

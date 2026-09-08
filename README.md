@@ -464,7 +464,7 @@ if it is the top band (starts at or above the header mask), the bottom band
 | test | value | what it is measured against |
 |---|---|---|
 | thickness | ≥ `STRIPE_MIN_H` (80 px full-res) | real stripes are 100–420 px; the false slivers 10–20 px (029, 111, 050) |
-| solidity | ≥ `STRIPE_SOLID_COVERAGE` (0.95) | fasit stripes measure 0.99–1.00, a 12-page row 0.846 |
+| solidity | ≥ `STRIPE_SOLID_COVERAGE` (0.90) | field stripes measure 0.92–1.00, false runs 0.85–0.89 |
 | position | within `STRIPE_RASTER_TOL` (150 px) of the card's stripe raster | the thick false runs (104's 260 and 280 px, 050's 340 px) sit 400–600 px off |
 
 Thickness alone convicts nothing — **position is what convicts**. The raster
@@ -491,8 +491,12 @@ a real stripe as "not solid enough". A raster position with no candidate is
 logged as a MISSING stripe — its slot then spans two rows, and the C15
 invariants still hold.
 
-Every run is logged either way, thickness and coverage included, so the next
-A/B calibrates against real numbers rather than against these first ones.
+Every run is logged either way, thickness and coverage included — and the
+first A/B that carried those numbers moved the solidity floor from 0.95
+(calibrated on the fasit cards alone, where stripes measure 0.99–1.00) to
+**0.90**: in the field, 17 real stripes on cards 135 and 142 measure
+0.92–0.95 at 100–160 px, while false runs never exceed 0.89. At 0.95 those
+two cards lost every row slot they had, on cards that still passed.
 Constants are defined in full-res px and stored as ratios of image height, so
 they hold at detect scale too.
 
