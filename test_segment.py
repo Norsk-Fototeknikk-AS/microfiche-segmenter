@@ -5336,3 +5336,73 @@ def test_the_calibration_numbers_are_recorded():
     assert "0.758" in text, "the outlier empty cell must be recorded"
     assert "609_00024" in text, "...and where it came from"
     assert "0.047" in text, "the faintest page must be recorded"
+
+
+# --- Steg 8C-1 (2026-09-08): pages laid out cell by cell -----------------
+# Card 609_00024 after step two has the whole raster (6 stripes + header)
+# and 101 detections, but its pages are SPLINTERED - 26 near-page blobs, 23
+# of 1500x500, 13 of 1000x500, 8 of 1500x1000 - so it ships 81 pages in
+# 21+13+15+14+18 and exits 3. Measured: all 60 of its raster cells clear the
+# floor, including the one labelled empty. Laid out cell by cell it is
+# 5x12 = 60, which is what its sibling 609_00012 holds.
+
+from segment_microfiche import pages_from_cells
+
+
+def _cells(n, y=3300, x0=2010, pitch=2180, row=1):
+    return [{"row": row, "x": x0 + k * pitch, "y": y, "page": 1}
+            for k in range(n)]
+
+
+def test_every_cell_with_evidence_becomes_a_page():
+    cells = _cells(12)
+    evidence = [(0.86, 0.32)] * 12
+
+    boxes, notes = pages_from_cells(cells, evidence, 2030, 2780)
+
+    assert boxes == [(c["x"], c["y"], 2030, 2780) for c in cells], boxes
+    assert len(notes) == 12, notes
+    assert all("fg=" in n and "edge=" in n for n in notes), notes
+
+
+def test_a_cell_below_the_floor_gets_nothing_but_is_logged():
+    """The leader's addition: the cells that did NOT clear the floor are
+    logged with their numbers, so round 5 gives us the population of empty
+    cells on FADED cards - which the calibration does not have."""
+    cells = _cells(4)
+    evidence = [(0.86, 0.32), (0.02, 0.01), (0.86, 0.32), (0.15, 0.30)]
+
+    boxes, notes = pages_from_cells(cells, evidence, 2030, 2780)
+
+    assert len(boxes) == 2, boxes
+    assert len(notes) == 4, ("every cell must be logged, placed or not",
+                             notes)
+    skipped = [n for n in notes if "no page" in n]
+    assert len(skipped) == 2, skipped
+    assert "0.02" in " ".join(skipped) and "0.15" in " ".join(skipped)
+
+
+def test_the_pages_come_out_in_raster_order():
+    cells = _cells(3) + _cells(3, y=6740, row=2)
+    evidence = [(0.86, 0.32)] * 6
+    boxes, _notes = pages_from_cells(cells, evidence, 2030, 2780)
+    assert [b[1] for b in boxes] == [3300, 3300, 3300, 6740, 6740, 6740]
+    assert [b[0] for b in boxes[:3]] == [2010, 4190, 6370]
+
+
+def test_an_empty_raster_gives_nothing():
+    assert pages_from_cells([], [], 2030, 2780) == ([], [])
+
+
+def test_a_half_empty_raster_is_flagged_in_the_notes():
+    """The leader's second addition: fewer than half the cells placed means
+    the card is either half full or the floor is too high, and we want to
+    see which. A warning, never a refusal."""
+    cells = _cells(12)
+    evidence = [(0.86, 0.32)] * 5 + [(0.01, 0.00)] * 7
+
+    boxes, notes = pages_from_cells(cells, evidence, 2030, 2780)
+
+    assert len(boxes) == 5, boxes
+    warning = [n for n in notes if "WARNING" in n]
+    assert warning and "5" in warning[0] and "12" in warning[0], notes

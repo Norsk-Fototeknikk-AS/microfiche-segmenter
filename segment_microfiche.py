@@ -2025,6 +2025,36 @@ def is_cell_occupied(fg, edge):
     return fg >= CELL_OCCUPIED_FG and edge >= CELL_OCCUPIED_EDGE
 
 
+def pages_from_cells(cells, evidence, page_w, page_h):
+    """([page boxes], [notes]) - the card laid out cell by cell (steg 8C).
+
+    A cell whose evidence clears the floor becomes a full page box; one that
+    does not gets nothing. EVERY cell is logged either way, with its
+    numbers: the cells that fail are the population the calibration lacks -
+    it was measured on short bottom rows of healthy cards, and we do not yet
+    know how an empty cell on a FADED card reads.
+
+    Placing fewer than half the raster's cells is warned about, never
+    refused: the card is then either half full or the floor is too high, and
+    the log is where we find out which.
+    """
+    boxes, notes = [], []
+    for cell, (fg, edge) in zip(cells, evidence):
+        if is_cell_occupied(fg, edge):
+            boxes.append((cell["x"], cell["y"], page_w, page_h))
+            notes.append(f"cell page at ({cell['x']}, {cell['y']}) "
+                         f"fg={fg:.3f} edge={edge:.3f}")
+        else:
+            notes.append(f"cell ({cell['x']}, {cell['y']}) no page: "
+                         f"fg={fg:.3f} edge={edge:.3f} (floor "
+                         f"{CELL_OCCUPIED_FG:.2f}/{CELL_OCCUPIED_EDGE:.2f})")
+    if cells and len(boxes) * 2 < len(cells):
+        notes.append(f"WARNING: only {len(boxes)} of {len(cells)} raster "
+                     "cells hold a page - the card is half empty or the "
+                     "floor is too high")
+    return boxes, notes
+
+
 CELL_EDGE_LEVEL = 40.0   # Sobel magnitude counted as an edge (steg 8A,
                          # measurement only - nothing decides on it yet)
 
