@@ -5224,3 +5224,60 @@ def test_summary_marks_a_manual_card():
     line = rapport.summary_line("kort_a", 0, 12, 0, manual=True)
     assert "MANUELL" in line, line
     assert "MANUELL" not in rapport.summary_line("kort_a", 0, 12, 0)
+
+
+# --- Steg 10E (2026-09-08): the header remnant below the reach ------------
+# Round 4 left one defect, identical on both 623 cards: the splitter cut the
+# header blob horizontally, 9B dropped the top half, and the BOTTOM half
+# stayed as a raw sliver - 623_00012 (17110, 3490) 4110x450 and 623_00024
+# (7240, 3545) 5800x435. It starts 1770 px below the mask, so the reach rule
+# cannot see it. But it lies ENTIRELY above the first page row, and a box
+# that is two to three pages wide and a sixth of a page tall is no page in
+# any row.
+
+def test_a_wide_remnant_entirely_above_the_first_row_is_dropped():
+    """Both 623 geometries, real numbers."""
+    for sliver, row_y in (((17110, 3490, 4110, 450), 4380),
+                          ((7240, 3545, 5800, 435), 4200)):
+        boxes = [sliver] + [(2230 + k * 2180, row_y, 2030, 2770)
+                            for k in range(12)]
+        dropped, note = header_zone_detections(boxes, 2030, 2770, HDR)
+        assert dropped == [sliver], (sliver, dropped, note)
+
+
+def test_a_short_first_row_of_page_width_is_still_kept():
+    """The guard the leader asked for: page width saves it."""
+    short = [(2230 + k * 2180, 3400, 2030, 800) for k in range(12)]
+    boxes = short + [(2230 + k * 2180, 6840, 2030, 2770) for k in range(12)]
+    dropped, note = header_zone_detections(boxes, 2030, 2770, HDR)
+    assert dropped == [], (dropped, note)
+
+
+def test_a_row_of_narrow_strips_above_the_anchor_is_not_dropped():
+    """The danger the wide-only rule guards against: a first row that
+    survived as narrow strips lies entirely above the anchor row too, and
+    matches the page prior in NEITHER dimension. It is still a row of
+    pages, and only the requirement that a remnant be WIDER than a page
+    keeps it."""
+    strips = [(2230 + k * 2180, 3400, 700, 900) for k in range(12)]
+    boxes = strips + [(2230 + k * 2180, 6840, 2030, 2770) for k in range(12)]
+
+    dropped, note = header_zone_detections(boxes, 2030, 2770, HDR)
+
+    assert dropped == [], (dropped, note)
+
+
+def test_the_chain_drops_the_remnant_and_lands_on_the_fasit():
+    """623_00024 must come out at 12+11 = 23 pages, which is Trond's
+    physical count."""
+    sliver = [(7240, 3545, 5800, 435)]
+    row1 = [(2230 + k * 2180, 4200, 2030, 2770) for k in range(12)]
+    row2 = [(2230 + k * 2180, 7640, 2030, 2770) for k in range(11)]
+
+    chain = repair_and_snap(sliver + row1 + row2, (), (), 29071, 21505,
+                            header_px=HDR)
+
+    assert len(chain.boxes) == 23, len(chain.boxes)
+    assert chain.card_refusals == [], chain.card_refusals
+    assert compute_card_quality(chain.boxes, None)["grid"] == \
+        "2 rows: 12+11", compute_card_quality(chain.boxes, None)["grid"]

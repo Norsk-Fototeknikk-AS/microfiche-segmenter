@@ -544,6 +544,15 @@ detection is header content only if **all** of these hold:
   impossible-geometry guard (C12) fails the card loudly. The eight field
   blobs run 1.3–4.8 page widths at 0.46–0.81 page heights and match neither.
 
+**Or** it lies *entirely* above the first page row and is **wider than a
+page** (steg 10E). The splitter can cut the header blob horizontally and
+leave its bottom half far below the reach — cards 623_00012 (17110, 3490)
+4110×450 and 623_00024 (7240, 3545) 5800×435, both 1770 px below it. A box
+two to three pages wide and a sixth of a page tall is no page in any row.
+The **width** requirement is what keeps a first row that survived as narrow
+*strips* from being eaten: those lie entirely above the anchor row too and
+match the prior in neither dimension, but they are narrower than a page.
+
 It runs inside `repair_and_snap`, so a report replays through it, and
 **before** anything counts detections, so the evidence guard (C19) judges
 pages against pages. Every dropped detection is logged with its size and

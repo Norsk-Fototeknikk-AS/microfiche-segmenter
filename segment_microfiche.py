@@ -1812,6 +1812,15 @@ def header_zone_detections(boxes, page_w, page_h, header_px):
         this is what keeps a SHORT first row from being eaten),
       - its centre lies above the topmost row carrying at least two
         full-height boxes (no such row: no anchor, so nothing is dropped),
+      - ...or it lies ENTIRELY above the first page row and is WIDER than
+        a page. The splitter can cut the header blob horizontally and leave
+        its bottom half far below the mask - 623_00012 (17110, 3490)
+        4110x450, 623_00024 (7240, 3545) 5800x435, both 1770 px below the
+        reach. A box two to three pages wide and a sixth of a page tall is
+        no page in any row. The width requirement is what keeps a first row
+        that survived as narrow STRIPS from being eaten: those lie entirely
+        above the anchor row too and match the prior in neither dimension,
+        but they are narrower than a page, not wider.
       - it matches the page prior in NEITHER dimension. Width alone is
         enough to save it: a first page row that crosses the mask keeps its
         page WIDTH while the mask cuts its top (that fixture exists). So is
@@ -1836,7 +1845,9 @@ def header_zone_detections(boxes, page_w, page_h, header_px):
     dropped = []
     for b in boxes:
         x, y, w, h = b
-        if y >= reach:
+        wholly_above = (y + h <= anchor_top
+                        and w > EXTEND_MAX_WIDTH_RATIO * page_w)
+        if y >= reach and not wholly_above:
             continue
         if y + h / 2 >= anchor_top:
             continue
@@ -1845,8 +1856,9 @@ def header_zone_detections(boxes, page_w, page_h, header_px):
             continue          # page-shaped in either dimension: not header
         dropped.append(b)
     note = (f"header zone: first page row at y={anchor_top}, dropping "
-            f"{len(dropped)} detection(s) starting above "
-            f"{int(reach)} (mask {header_px})" if dropped else
+            f"{len(dropped)} detection(s) - above {int(reach)} (mask "
+            f"{header_px}) or wholly above the first row and wider than a "
+            "page" if dropped else
             f"header zone: first page row at y={anchor_top}, nothing above it")
     return dropped, note
 
