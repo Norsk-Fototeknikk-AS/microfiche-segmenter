@@ -1594,6 +1594,11 @@ class ChainResult(NamedTuple):
     quality: dict          # None when nothing changed the boxes
     output: list           # (stream, text) in the order they were printed
     card_refusals: list    # reasons this card must not ship (steg 6A/6B)
+    layout_refused: bool   # ...and whether a LAYOUT invariant was broken:
+                           # impossible layout is its own evidence that the
+                           # threshold is wrong (steg 9E), and it can happen
+                           # at a LOW border share when detection splinters
+                           # instead of vanishing (card 647: border 26 %).
     evidence_refused: bool # ...and whether the EVIDENCE guard was one of
                            # them. An explicit flag, not a search for words
                            # in a human sentence: the staircase's trigger
@@ -1747,24 +1752,28 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None,
             f"{len(boxes) - detections_in} page(s) invented on top of them")
 
     refusals.extend(evidence_refusals)
+    layout_refusals = []
 
     # Layout invariants (steg 6B): a physical card holds at most MAX_ROWS
     # rows of at most MAX_PAGES_PER_ROW pages. These were warnings until
     # 612130000432_00024 shipped 60 pages in SIX rows at quality 71.1.
     layout_rows = group_boxes_into_rows(boxes)
     if len(layout_rows) > MAX_ROWS:
-        refusals.append(f"{len(layout_rows)} rows detected - a card holds at "
-                        f"most {MAX_ROWS}")
+        layout_refusals.append(f"{len(layout_rows)} rows detected - a card "
+                               f"holds at most {MAX_ROWS}")
     for i, row in enumerate(layout_rows, 1):
         if len(row) > MAX_PAGES_PER_ROW:
-            refusals.append(f"{len(row)} pages in one row (row {i}) - a card "
-                            f"holds at most {MAX_PAGES_PER_ROW}")
+            layout_refusals.append(f"{len(row)} pages in one row (row {i}) - "
+                                   f"a card holds at most "
+                                   f"{MAX_PAGES_PER_ROW}")
+    refusals.extend(layout_refusals)
     for reason in refusals:
         out.append((2, f"\nERROR: {reason}"))
 
     return ChainResult(boxes, geo_indices, fragment_groups, refused_groups,
                        snap_refused, geo_overload, substantial, quality, out,
-                       refusals, bool(evidence_refusals))
+                       refusals, bool(layout_refusals),
+                       bool(evidence_refusals))
 
 
 # How far below the header mask a detection may start and still be the
@@ -2304,7 +2313,8 @@ def run_mode(args):
     return "bakgrunn-foerst" if args.background_first else "standard"
 
 
-def main(otsu_override=None, step2=False, step1_border=None):
+def main(otsu_override=None, step2=False, step1_border=None,
+         step1_reasons=()):
     parser = argparse.ArgumentParser(description='Segment microfiche pages')
     # Not argparse-required: a missing input must exit 1 (generic failure),
     # while argparse errors exit 2 and would collide with EXIT_NO_PAGES.
@@ -2596,10 +2606,10 @@ def main(otsu_override=None, step2=False, step1_border=None):
     # ONE second threshold with the frame and the known structure taken out
     # of the histogram - then run the whole pass again on its result. Step
     # two earns nothing: the card must pass every guard on its own.
-    def try_step_two(why):
+    def try_step_two(why, require_border=True):
         if step2 or otsu_override is not None or args.background_first:
             return None
-        if border_share <= STEP2_BORDER_TRIGGER:
+        if require_border and border_share <= STEP2_BORDER_TRIGGER:
             return None
         header_px_thumb = int(thumb.shape[0] * args.header_skip)
         mask = frame_mask(thumb, first_pass_thresh, header_px_thumb)
@@ -2633,6 +2643,28 @@ def main(otsu_override=None, step2=False, step1_border=None):
         # C9: after a step-two attempt the card must be told the reason it
         # actually had. "no pages detected" would blame the card for a
         # threshold's mistake - the staircase ran and did not recover it.
+        if not boxes and step2 and step1_reasons:
+            # Step two made it WORSE: the first pass found pages and failed
+            # a guard, the second found nothing. Report the diagnosis the
+            # card actually had - losing it would trade a real reason for a
+            # threshold's excuse (steg 9E).
+            print(f"\nStep 2 (threshold {otsu_thresh:.0f}) found no pages "
+                  "at all - keeping the first pass's diagnosis",
+                  file=sys.stderr)
+            for r in step1_reasons:
+                print(f"\nERROR: {r}", file=sys.stderr)
+            print(f"\nERROR: suspected split pages in {input_file} - "
+                  "not extracting.", file=sys.stderr)
+            print("  No _done sentinel written — this card will not be "
+                  "offered for import.", file=sys.stderr)
+            if not args.skip_extraction:
+                moved = move_without_clobber(input_path,
+                                             input_path.parent / "error")
+                print(f"  Source scan moved to {moved}", file=sys.stderr)
+            else:
+                print("  Source left in place (--skip-extraction is "
+                      "inspection-only).", file=sys.stderr)
+            return EXIT_SUSPECT_FRAGMENTS
         if not boxes and step2:
             reason = (f"threshold found only the frame; re-threshold failed "
                       f"(border {step1_border:.0%} -> {border_share:.0%}, "
@@ -2877,11 +2909,18 @@ def main(otsu_override=None, step2=False, step1_border=None):
     snap_refused = chain.snap_refused
     geo_overload = chain.geo_overload
     card_refusals = chain.card_refusals
-    if chain.evidence_refused:
-        retry = try_step_two("evidence guard refused the card")
+    if chain.evidence_refused or chain.layout_refused:
+        # A layout refusal needs no border condition (steg 9E): an
+        # impossible layout is itself evidence that the threshold is wrong,
+        # and card 647 splintered at a border share of only 26 %.
+        retry = try_step_two(
+            "evidence guard refused the card" if chain.evidence_refused
+            else "layout invariant broken",
+            require_border=chain.evidence_refused)
         if retry is not None:
             return main(otsu_override=retry, step2=True,
-                        step1_border=border_share)
+                        step1_border=border_share,
+                        step1_reasons=tuple(chain.card_refusals))
     if chain.quality is not None:
         quality = chain.quality
 

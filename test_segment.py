@@ -4752,3 +4752,76 @@ def test_a_step_two_card_that_fails_a_guard_says_which(tmp_path):
     assert proc.returncode == 2, (proc.returncode, out)
     assert "re-threshold failed" in out, out
     assert "no pages detected" not in out, out
+
+
+# --- Steg 9E (2026-09-08): a layout refusal is also a threshold symptom ---
+# Card 612130000647_00012 found 93 detections in 6 rows 14+16+18+16+16+1 in
+# standard mode and 12x5 at quality 99.2 in background-first: normal format,
+# wrong threshold. It never reached step two, because its border share is
+# 26 % - the detection SPLINTERED instead of vanishing, so the frame never
+# dominated. Impossible layout is its own evidence that the threshold is
+# wrong, and the card is failing anyway.
+
+def test_a_layout_refusal_marks_the_chain():
+    boxes = []
+    for r in range(MAX_ROWS + 1):
+        boxes += _row_of(4, y=3300 + r * 3400)
+    chain = repair_and_snap(boxes, (), (), 29071, 21505)
+    assert chain.layout_refused, chain.card_refusals
+    assert not chain.evidence_refused, chain.card_refusals
+
+
+def test_a_healthy_card_marks_neither():
+    chain = repair_and_snap(_row_of(12), (), (), 29071, 21505)
+    assert not chain.layout_refused and not chain.evidence_refused
+
+
+def test_a_splintered_card_reaches_step_two_without_the_border(tmp_path):
+    """647's shape: a threshold that splinters the pages gives an impossible
+    layout at a LOW border share. The layout refusal triggers step two on
+    its own."""
+    src = tmp_path / "612130000012_00012.jpg"
+    pw, ph, pitch = PAGE_SIZE_PRIOR[0], PAGE_SIZE_PRIOR[1], 2180
+    h, w = 8000, 400 + 3 * pitch
+    a = np.full((h, w), 226, np.uint8)
+    a[:150, :] = 2; a[-150:, :] = 2; a[:, :150] = 2; a[:, -150:] = 2
+    a[600:820, :] = 55
+    for r in range(2):                       # two rows of real pages
+        for c in range(3):
+            a[900 + r * 3400:900 + r * 3400 + ph,
+              300 + c * pitch:300 + c * pitch + pw] = 195
+    # ...and a faint band that the first threshold splinters into a row of
+    # its own, giving six rows in all
+    for r in range(4):
+        a[4400 + r * 400:4400 + r * 400 + 120, 300:300 + 3 * pitch] = 150
+    pyvips.Image.new_from_memory(a.tobytes(), w, h, 1,
+                                 'uchar').write_to_file(str(src))
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    out = proc.stdout + proc.stderr
+    if "rows detected" in out or "in one row" in out:
+        assert "Step 2 threshold:" in out, ("a layout refusal must reach "
+                                            "step two", out)
+
+
+def test_step_two_never_trades_a_real_diagnosis_for_its_own_excuse(tmp_path):
+    """A card with six genuine rows fails on layout. Step two runs (9E),
+    finds nothing, and must NOT convert 'six rows' into 'the re-threshold
+    failed' - that would hand the operator a threshold's excuse instead of
+    the card's actual fault."""
+    src = tmp_path / "612130000012_00012.jpg"
+    a = np.zeros((3000, 1200), 'uint8')
+    for r in range(6):
+        for c in range(2):
+            a[100 + r * 480:440 + r * 480, 100 + c * 500:500 + c * 500] = 255
+    pyvips.Image.new_from_memory(a.tobytes(), 1200, 3000, 1,
+                                 'uchar').write_to_file(str(src))
+
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction", "--no-invert",
+                         "--header-skip", "0")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 3, (proc.returncode, out)
+    assert "6 rows detected" in out, out
