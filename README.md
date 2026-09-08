@@ -499,6 +499,37 @@ Nothing may act on these numbers until they have been calibrated against a
 production run. Building a prior on an uncalibrated floor would be card
 203's mistake with a better explanation.
 
+### C23. Header content is not a page row
+
+After step two the card's top band is often gone from the structure list —
+three of the four affected field cards had only the *bottom* band left — and
+the header text that sits **below** the 8 % mask line (C11) then stands as
+detections and grows the card a sixth row.
+
+We know where the header is, so `header_zone_detections` uses it. A
+detection is header content only if **all** of these hold:
+
+- it **starts within `HEADER_ZONE_REACH`** (0.25 page heights) of the mask
+  line. Measured: the eight field blobs start 0–250 px below the mask, while
+  the first real page row starts 1690–2670 px below it. This is what keeps a
+  *short* first row from being eaten — a header blob continues the masked
+  band, a page row starts a row gap below it.
+- its **centre lies above** the topmost row carrying **at least two**
+  full-height boxes. One tall blob is not an anchor; it could be the mistake
+  itself. No such row at all: no anchor, nothing dropped, and the log says
+  so rather than guessing.
+- it matches the page prior in **neither** dimension. Width alone saves it:
+  a first row crossing the mask keeps its page *width* while the mask cuts
+  its top. Height alone saves it too: a fused row is several pages wide but
+  page-*high*, and dropping it would lose four pages silently where the
+  impossible-geometry guard (C12) fails the card loudly. The eight field
+  blobs run 1.3–4.8 page widths at 0.46–0.81 page heights and match neither.
+
+It runs inside `repair_and_snap`, so a report replays through it, and
+**before** anything counts detections, so the evidence guard (C19) judges
+pages against pages. Every dropped detection is logged with its size and
+position; nothing is dropped silently.
+
 ### C21. The staircase: one diagnosed second threshold
 
 C9 allows re-thresholding only as step two, after a measured trigger. This

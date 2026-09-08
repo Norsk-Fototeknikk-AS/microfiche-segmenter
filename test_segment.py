@@ -4590,3 +4590,123 @@ def test_a_rounding_sized_overshoot_is_just_clamped():
                                                 image_w=29071, image_h=21505)
     assert refused == [], notes
     assert all(b[1] + b[3] <= 21505 for b in snapped), snapped
+
+
+# --- Steg 9B (2026-09-08): header content is not a page row ---------------
+# After step two the top band is often missing from the structure list (three
+# of the four affected cards had ONLY the bottom band left), so the header
+# text below the 8 % mask line stood as detections and the card grew a sixth
+# row. Measured on all four: the blobs start at y 1720-1970 against a mask
+# line at 1720, while the first real page row starts at 3410-4390.
+
+from segment_microfiche import header_zone_detections
+
+HDR = 1720            # 0.08 * 21505, the mask line on a production card
+PW, PH = 2030, 2780
+
+
+def _card_with_header_blobs(blobs, row1_y=3410, rows=3):
+    boxes = list(blobs)
+    for r in range(rows):
+        boxes += [(2230 + k * 2180, row1_y + r * 3440, PW, PH)
+                  for k in range(12)]
+    return boxes
+
+
+def test_header_blobs_are_dropped_on_all_four_field_geometries():
+    field = {
+        "494_00012": ([(8490, 1720, 3330, 1320), (17080, 1720, 2610, 1280)],
+                      3410),
+        "494_00024": ([(7820, 1780, 5480, 2040), (16090, 1740, 5930, 1990)],
+                      4155),
+        "623_00012": ([(6280, 1970, 7410, 2260), (17110, 1950, 4110, 1990)],
+                      4390),
+        "609_00024": ([(4520, 1760, 900, 650), (5370, 1740, 9690, 2240)],
+                      4160),
+    }
+    for card, (blobs, row1) in field.items():
+        boxes = _card_with_header_blobs(blobs, row1_y=row1)
+        dropped, note = header_zone_detections(boxes, PW, PH, HDR)
+        assert sorted(dropped) == sorted(blobs), (card, dropped)
+        assert note and str(row1) in note, (card, note)
+
+
+def test_a_short_first_row_is_never_mistaken_for_header():
+    """The danger in the rule: if row 1 is short, the topmost FULL-height
+    row is row 2, and row 1 would look like header content. It is saved by
+    where it sits - a header blob starts at the mask line, a page row starts
+    a row gap below it."""
+    short = [(2230 + k * 2180, 3400, PW, 800) for k in range(12)]
+    boxes = short + [(2230 + k * 2180, 6840, PW, PH) for k in range(12)]
+
+    dropped, note = header_zone_detections(boxes, PW, PH, HDR)
+
+    assert dropped == [], (dropped, note)
+
+
+def test_a_page_sized_detection_is_never_header(): 
+    """Guard from the leader: whatever it sits on top of, a box that matches
+    the page prior is a page."""
+    page_high_up = [(2230, 1740, PW, PH)]
+    boxes = _card_with_header_blobs(page_high_up, row1_y=4600)
+    dropped, note = header_zone_detections(boxes, PW, PH, HDR)
+    assert dropped == [], (dropped, note)
+
+
+def test_without_a_full_height_row_nothing_is_dropped():
+    """No anchor, no rule - and the log says so rather than guessing."""
+    boxes = [(2230 + k * 2180, 1740, PW, 900) for k in range(6)]
+    dropped, note = header_zone_detections(boxes, PW, PH, HDR)
+    assert dropped == [], dropped
+    assert note and "no full-height row" in note.lower(), note
+
+
+def test_one_full_height_box_is_not_an_anchor():
+    """Two, per the order: a single tall blob could itself be the mistake."""
+    boxes = [(8490, 1720, 3330, 1320),
+             (2230, 3410, PW, PH),
+             (4410, 3410, PW, 900)]
+    dropped, note = header_zone_detections(boxes, PW, PH, HDR)
+    assert dropped == [], (dropped, note)
+
+
+def test_the_chain_drops_header_content_and_says_so():
+    """In the chain, so a report can be replayed through it - and before
+    anything counts detections, so the evidence guard judges pages against
+    pages."""
+    blobs = [(8490, 1720, 3330, 1320), (17080, 1720, 2610, 1280)]
+    boxes = _card_with_header_blobs(blobs)
+
+    chain = repair_and_snap(boxes, (), (), 29071, 21505, header_px=HDR)
+
+    assert len(chain.boxes) == 36, len(chain.boxes)
+    assert chain.card_refusals == [], chain.card_refusals
+    text = "\n".join(t for _s, t in chain.output)
+    assert "header zone" in text and "dropped header content" in text, text
+    assert group_boxes_into_rows(chain.boxes).__len__() == 3, chain.boxes
+
+
+def test_the_chain_leaves_a_normal_card_alone():
+    boxes = _card_with_header_blobs([])
+    chain = repair_and_snap(boxes, (), (), 29071, 21505, header_px=HDR)
+    assert len(chain.boxes) == 36
+    text = "\n".join(t for _s, t in chain.output)
+    assert "dropped header content" not in text, text
+
+
+def test_a_first_row_crossing_the_mask_keeps_its_page_width():
+    """The mask cuts the top off row 1, so its boxes are short - but they
+    keep page WIDTH at the card's pitch, and that is what saves them."""
+    cut_row = [(2230 + k * 2180, HDR, PW, 900) for k in range(12)]
+    boxes = cut_row + [(2230 + k * 2180, 5000, PW, PH) for k in range(12)]
+    dropped, note = header_zone_detections(boxes, PW, PH, HDR)
+    assert dropped == [], (dropped, note)
+
+
+def test_a_fused_top_row_is_not_header_content():
+    """Several pages wide but page-HIGH: dropping it would lose four pages
+    silently, where the impossible-geometry guard fails the card loudly."""
+    fused = [(2230, 1740, 4 * PW, PH)]
+    boxes = fused + [(2230 + k * 2180, 5000, PW, PH) for k in range(12)]
+    dropped, note = header_zone_detections(boxes, PW, PH, HDR)
+    assert dropped == [], (dropped, note)

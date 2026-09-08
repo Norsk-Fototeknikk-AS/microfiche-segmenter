@@ -1601,7 +1601,7 @@ class ChainResult(NamedTuple):
 
 
 def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None,
-                    image_h=None):
+                    image_h=None, header_px=0, page_prior=PAGE_SIZE_PRIOR):
     """The coordinate-only part of the chain: geometric completion, the
     over-repair judgement, the snap to the format page size, and the
     fragment guard's re-check.
@@ -1616,6 +1616,21 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None,
     out = []
     refusals = []
     evidence_refusals = []
+
+    # Header content is not a page row (steg 9B). Dropped BEFORE anything
+    # counts detections, so the evidence guard judges pages against pages.
+    if header_px:
+        hdr_w, hdr_h, _ = resolve_page_size(boxes)
+        header_boxes, header_note = header_zone_detections(
+            boxes, hdr_w, hdr_h, header_px)
+        if header_note:
+            out.append((1, f"\n{header_note}"))
+        for b in header_boxes:
+            out.append((1, f"  dropped header content at ({b[0]}, {b[1]}) "
+                           f"size {b[2]} x {b[3]}"))
+        if header_boxes:
+            boxes = [b for b in boxes if b not in header_boxes]
+
     detections_in = len(boxes)
 
     boxes, geo_flags, geo_notes, refused_groups = complete_geometry(boxes)
@@ -1749,6 +1764,67 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None,
     return ChainResult(boxes, geo_indices, fragment_groups, refused_groups,
                        snap_refused, geo_overload, substantial, quality, out,
                        refusals, bool(evidence_refusals))
+
+
+# How far below the header mask a detection may start and still be the
+# header's own content (steg 9B). Measured on all four affected cards: the
+# header blobs start 0-250 px below the mask line, while the first real page
+# row starts 1690-2670 px below it. A quarter of a page height sits in that
+# gap with room on both sides.
+HEADER_ZONE_REACH = 0.25
+
+
+def header_zone_detections(boxes, page_w, page_h, header_px):
+    """([detections that are header content, not pages], note).
+
+    After step two the top band is often gone from the structure list -
+    three of the four affected field cards had only the bottom band left -
+    and the header text below the mask line then stands as detections and
+    grows the card a sixth row. We know where the header is, so we use it.
+
+    A detection is header content only if all of these hold:
+      - it starts within HEADER_ZONE_REACH of the mask line (a header blob
+        continues the masked band; a page row starts a row gap below it -
+        this is what keeps a SHORT first row from being eaten),
+      - its centre lies above the topmost row carrying at least two
+        full-height boxes (no such row: no anchor, so nothing is dropped),
+      - it matches the page prior in NEITHER dimension. Width alone is
+        enough to save it: a first page row that crosses the mask keeps its
+        page WIDTH while the mask cuts its top (that fixture exists). So is
+        height alone: a fused row is several pages wide but page-high, and
+        dropping it would lose four pages silently instead of failing
+        loudly. Measured on all eight field blobs, none matches either -
+        they run 1.3-4.8 page widths at 0.46-0.81 page heights.
+    """
+    if not boxes or header_px <= 0:
+        return [], None
+    rows = group_boxes_into_rows(boxes)
+    anchor_top = None
+    for row in rows:
+        full = [b for b in row if b[3] >= 0.85 * page_h]
+        if len(full) >= 2:
+            anchor_top = min(b[1] for b in full)
+            break
+    if anchor_top is None:
+        return [], ("header zone: no full-height row to anchor on - nothing "
+                    "dropped")
+    reach = header_px + HEADER_ZONE_REACH * page_h
+    dropped = []
+    for b in boxes:
+        x, y, w, h = b
+        if y >= reach:
+            continue
+        if y + h / 2 >= anchor_top:
+            continue
+        if (abs(h - page_h) <= 0.10 * page_h
+                or abs(w - page_w) <= 0.10 * page_w):
+            continue          # page-shaped in either dimension: not header
+        dropped.append(b)
+    note = (f"header zone: first page row at y={anchor_top}, dropping "
+            f"{len(dropped)} detection(s) starting above "
+            f"{int(reach)} (mask {header_px})" if dropped else
+            f"header zone: first page row at y={anchor_top}, nothing above it")
+    return dropped, note
 
 
 def card_cells(boxes, page_w, page_h, image_w):
@@ -2787,7 +2863,8 @@ def main(otsu_override=None, step2=False, step1_border=None):
     print("RAW witnesses (full-res x,y,w,h): "
           + "; ".join(f"{x},{y},{w},{h}" for x, y, w, h in witnesses_fullres))
     chain = repair_and_snap(boxes_fullres, witnesses_fullres,
-                            stripes_fullres, original_width, original_height)
+                            stripes_fullres, original_width, original_height,
+                            header_px=int(original_height * args.header_skip))
     for stream, text in chain.output:
         print(text, file=sys.stdout if stream == 1 else sys.stderr)
     boxes_fullres = chain.boxes
