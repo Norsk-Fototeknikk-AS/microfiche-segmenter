@@ -1068,6 +1068,22 @@ SNAP_GROWTH_MARK = 0.05         # area growth share that marks a page blue
 # exemption (1.25) and this stay raw with their loud warning.
 SNAP_IMPOSSIBLE_RATIO = 1.5
 
+# Evidence guard (steg 6A, 2026-09-08, after the full production run of 88
+# cards). A card must be FOUND, not composed: card 612130000203_00012
+# shipped 41 empty crops built from 9 detections at quality 84.8 GOOD,
+# because witnesses and the raster laid out the rest. Counting witnesses,
+# snap growth and repairs as "invented" cannot separate that from a healthy
+# card - measured, it gives 95 % for 203 but also 85 % for 135 and 94 % for
+# 630, which are correct. Snap growth is normal operation (C15); those pages
+# exist. What separates is how many pages come out per detection that went
+# in: the sick cards run 2.0-4.6, the healthy ones 0.8-1.3.
+EVIDENCE_MAX_PAGES_PER_DETECTION = 1.5
+# ...and an explicit floor, so a card is never laid out from one or two
+# blobs even if the ratio happens to stay under the bound. It only bites
+# when something WAS invented: the real journal fasit card has 2 detections
+# and 2 pages and invents nothing.
+EVIDENCE_MIN_DETECTIONS = 3
+
 # Coverage guard (mandatory, 2026-09-09): field card 612130000036 scored
 # 100.0 with its whole first page row OUTSIDE every box. Foreground mass
 # outside all page boxes caps the quality score and warns loudly - in every
@@ -1498,6 +1514,7 @@ class ChainResult(NamedTuple):
     substantial: int       # substantial repairs, for the overload message
     quality: dict          # None when nothing changed the boxes
     output: list           # (stream, text) in the order they were printed
+    card_refusals: list    # reasons this card must not ship (steg 6A/6B)
 
 
 def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
@@ -1513,6 +1530,8 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
     collecting the lines rather than emitting them here.
     """
     out = []
+    refusals = []
+    detections_in = len(boxes)
 
     boxes, geo_flags, geo_notes, refused_groups = complete_geometry(boxes)
     repaired_count = sum(geo_flags)
@@ -1603,8 +1622,29 @@ def repair_and_snap(boxes, witnesses=(), stripes=(), image_w=None):
             coords = ", ".join(str(boxes[i]) for i in group)
             out.append((2, f"  pages {pages}: {coords}"))
 
+    # Evidence guard (steg 6A): a card must be found, not composed.
+    ratio = len(boxes) / max(1, detections_in)
+    out.append((1, f"\nEvidence: {len(boxes)} pages from {detections_in} "
+                   f"detections (ratio {ratio:.2f}, refused above "
+                   f"{EVIDENCE_MAX_PAGES_PER_DETECTION:g})"))
+    if ratio > EVIDENCE_MAX_PAGES_PER_DETECTION:
+        refusals.append(
+            f"{len(boxes)} pages laid out from only {detections_in} "
+            f"detections (ratio {ratio:.2f}, limit "
+            f"{EVIDENCE_MAX_PAGES_PER_DETECTION:g}) - the card was composed "
+            "from rests, not read")
+    if detections_in < EVIDENCE_MIN_DETECTIONS and len(boxes) > detections_in:
+        refusals.append(
+            f"too little evidence to lay out a card: {detections_in} "
+            f"detection(s) (minimum {EVIDENCE_MIN_DETECTIONS}) AND "
+            f"{len(boxes) - detections_in} page(s) invented on top of them")
+
+    for reason in refusals:
+        out.append((2, f"\nERROR: {reason}"))
+
     return ChainResult(boxes, geo_indices, fragment_groups, refused_groups,
-                       snap_refused, geo_overload, substantial, quality, out)
+                       snap_refused, geo_overload, substantial, quality, out,
+                       refusals)
 
 
 def make_anon_mask(shape, contours, dilate_radius):
@@ -2521,14 +2561,7 @@ def main():
     refused_groups = chain.refused_groups
     snap_refused = chain.snap_refused
     geo_overload = chain.geo_overload
-    if chain.quality is not None:
-        quality = chain.quality
-
-    # Validate against the physical card: more rows or more pages per row
-    # than any real card holds is a misdetection signal in itself. Judged on
-    # the REPAIRED geometry (steg 5B): before the move this counted raw
-    # detections and fired on 10 of 16 field cards, every one of which
-    # shipped 12 pages or fewer per row.
+    card_refusals = chain.card_refusals
     layout_rows = group_boxes_into_rows(boxes_fullres)
     if len(layout_rows) > MAX_ROWS:
         print(f"Warning: {len(layout_rows)} rows detected - real cards hold "
@@ -2538,6 +2571,8 @@ def main():
             print(f"Warning: {len(row)} pages in one row (row {i}) - real "
                   f"cards hold at most {MAX_PAGES_PER_ROW}. Likely "
                   "misdetection.")
+    if chain.quality is not None:
+        quality = chain.quality
 
     # Coverage guard: did the boxes cover what the threshold saw? The one
     # signal that survives any upstream mistake (row-banding collapse put a
@@ -2631,8 +2666,10 @@ def main():
         label += f"  |  {repaired_count} geometry-completed"
     if coverage_note:
         label += f"  |  {coverage_note}"
-    if fragment_groups or refused_groups or geo_overload or snap_refused:
-        n_suspect = len(fragment_groups) + len(refused_groups) + len(snap_refused)
+    if (fragment_groups or refused_groups or geo_overload
+            or snap_refused or card_refusals):
+        n_suspect = (len(fragment_groups) + len(refused_groups)
+                     + len(snap_refused) + len(card_refusals))
         label = f"SUSPECT FRAGMENTS ({n_suspect} group(s))  |  " + label
         banner_color = (0, 0, 200)
     cv2.putText(banner, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, banner_color, 2)
@@ -2661,7 +2698,8 @@ def main():
     # invisible to the re-run guard, whose lower bound is 0.8), or a card
     # geometry had to repair more of than the limit. The source goes to
     # error/ for review, like the no-pages failure.
-    if fragment_groups or refused_groups or geo_overload or snap_refused:
+    if (fragment_groups or refused_groups or geo_overload
+            or snap_refused or card_refusals):
         print(f"\nERROR: suspected split pages in {input_file} - "
               "not extracting.", file=sys.stderr)
         print("  No _done sentinel written — this card will not be offered "

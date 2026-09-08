@@ -233,8 +233,9 @@ def test_card_limits_match_the_physical_cards():
 
 
 def test_too_many_pages_in_a_row_warns(tmp_path):
-    """One page beyond the limit must warn; derived from the constant so a
-    raised limit keeps this test honest."""
+    """One page beyond the limit fails the card (steg 6B; it was a warning
+    until 612130000432_00024 shipped 60 pages in six rows at 71.1 GOOD).
+    Derived from the constant so a raised limit keeps this test honest."""
     n = MAX_PAGES_PER_ROW + 1
     src = tmp_path / "612130000012_00012.jpg"
     width = 120 + n * 520
@@ -2620,24 +2621,30 @@ def test_witnesses_in_occupied_cells_change_nothing():
 
 
 def test_half_a_row_of_rests_becomes_pages_end_to_end(tmp_path):
-    """The 098 scenario: right half of a row detects normally, left half
-    leaves only small rests. Every cell must come out as a page."""
+    """The 098 scenario: in one row the right half detects normally and the
+    left half leaves only small rests. Every cell must come out as a page.
+
+    The card carries a second, fully detected row (steg 6A): on the real
+    098 the witnessed cells are a few of forty-odd pages, and the evidence
+    guard judges the CARD - a single row that is half conjured would be
+    refused, and rightly so."""
     src = tmp_path / "612130000012_00016.jpg"
-    a = np.full((3000, 6400), 180, 'uint8')
+    a = np.full((4200, 6400), 180, 'uint8')
     for c in range(12):
         x = 100 + c * 520
         if c < 6:
             a[350:1050, x + 100:x + 300] = 110   # rests: survive erosion,
         else:                                     # fail min size
             a[350:1050, x:x + 400] = 110          # whole pages
-    pyvips.Image.new_from_memory(a.tobytes(), 6400, 3000, 1, 'uchar').write_to_file(str(src))
+        a[1600:2300, x:x + 400] = 110             # a fully detected row
+    pyvips.Image.new_from_memory(a.tobytes(), 6400, 4200, 1, 'uchar').write_to_file(str(src))
     out = tmp_path / "card"
 
     proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     rows_csv = [l for l in (out / "page_coordinates.csv").read_text().splitlines()[2:] if l]
-    assert len(rows_csv) == 12, (rows_csv, proc.stdout)
+    assert len(rows_csv) == 24, (rows_csv, proc.stdout)
     assert "position witness" in proc.stdout, proc.stdout
 
 
@@ -3743,15 +3750,17 @@ def _replay_inputs(text):
 
 def _rests_card(path):
     """Half a row detects normally, half leaves only small rests - the 098
-    shape, and the only fixture that exercises position witnesses."""
-    a = np.full((3000, 6400), 180, 'uint8')
+    shape, and the only fixture that exercises position witnesses. A second,
+    fully detected row keeps the card's evidence ratio sane (steg 6A)."""
+    a = np.full((4200, 6400), 180, 'uint8')
     for c in range(12):
         x = 100 + c * 520
         if c < 6:
             a[350:1050, x + 100:x + 300] = 110
         else:
             a[350:1050, x:x + 400] = 110
-    pyvips.Image.new_from_memory(a.tobytes(), 6400, 3000, 1,
+        a[1600:2300, x:x + 400] = 110
+    pyvips.Image.new_from_memory(a.tobytes(), 6400, 4200, 1,
                                  'uchar').write_to_file(str(path))
 
 
@@ -3812,3 +3821,55 @@ def test_the_replay_notices_a_missing_witness_line(tmp_path):
     assert repair_and_snap(pre, wit, stripes, width).boxes == shipped
     assert repair_and_snap(pre, (), stripes, width).boxes != shipped, (
         "dropping the witnesses changed nothing - the line is not load-bearing")
+
+
+# --- Steg 6A/6B (2026-09-08): a card must be found, not composed -----------
+# Full production run of 65223c2, 88 cards. A new failure class shipped as
+# OK: detection finds almost nothing, the witness and raster machinery lays
+# out a whole card from the rests, and the quality score rewards it.
+# 612130000203_00012 shipped 41 empty crops from 9 detections at 84.8 GOOD.
+#
+# Counting witnesses, snap growth and geometry repairs as "invented" does
+# not separate the sick from the healthy - measured over all 88 cards, that
+# metric gives 95 % for 203 but also 85 % for 135 and 94 % for 630, which
+# are correct cards. Snap growth is normal operation (C15): those pages
+# exist, they are only normalised to the format size. What separates
+# cleanly is how many pages come OUT per detection that went IN.
+
+def _row_of(n, y=3300, x0=2010, pitch=2180, w=2040, h=2780):
+    return [(x0 + k * pitch, y, w, h) for k in range(n)]
+
+
+def test_a_card_composed_from_almost_nothing_is_refused():
+    """203's shape: two real detections, the rest of the row conjured from
+    witnesses. Six pages from two detections is not a reading of the card."""
+    boxes = [(2010, 3300, 2040, 2780), (12910, 3300, 2040, 2780)]
+    witnesses = [(4300 + k * 2180, 4000, 900, 300) for k in range(4)]
+
+    chain = repair_and_snap(boxes, witnesses, (), 29071)
+
+    assert chain.card_refusals, chain.output
+    assert any("1.5" in r or "evidence" in r.lower()
+               for r in chain.card_refusals), chain.card_refusals
+
+
+def test_a_normal_card_is_not_refused_for_its_witnesses():
+    """135 and 630 pass: 23 detections to 27 pages, 28 to 35. A few
+    witnessed cells on a card that was genuinely detected is repair, not
+    composition."""
+    boxes = _row_of(12) + _row_of(11, y=6740)
+    witnesses = [(2010 + 11 * 2180 + 900, 7400, 900, 300)]
+
+    chain = repair_and_snap(boxes, witnesses, (), 29071)
+
+    assert chain.card_refusals == [], chain.card_refusals
+    assert len(chain.boxes) == 24, len(chain.boxes)
+
+
+def test_the_evidence_ratio_is_logged_even_when_it_passes():
+    """So the next report gives the distribution, not just the outliers."""
+    chain = repair_and_snap(_row_of(12), (), (), 29071)
+    assert any("evidence" in text.lower() for _s, text in chain.output), \
+        chain.output
+
+

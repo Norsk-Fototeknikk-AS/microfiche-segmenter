@@ -438,6 +438,43 @@ kind has no whole page left to anchor the expected height. The generous union
 band covers the measured fasit case (1.6×), but proportions beyond that
 escape the guard.
 
+### C19. A card must be FOUND, not composed
+
+Full production run of `65223c2`, 88 cards, 2026-09-08. A new failure class
+shipped as `OK`: detection finds almost nothing, the witness and raster
+machinery lays out a whole card from the rests, and the quality score
+rewards it. Card 612130000203_00012 shipped **41 empty crops built from 9
+detections at quality 84.8 GOOD**; 623_00012 shipped 2 pages from 1
+detection at 100.0.
+
+Counting witnesses, snap growth and geometry repairs as "invented" does
+**not** separate those from healthy cards — measured across all 88, that
+metric reads 95 % for 203 but also 85 % for card 135 and 94 % for card 630,
+both of which are correct. Snap growth is normal operation (C15): those
+pages exist, they are only normalised to the format size.
+
+What separates cleanly is **how many pages come out per detection that went
+in**:
+
+| card | detections → pages | ratio | |
+|---|---|---|---|
+| 203_00012 | 9 → 41 | 4.6 | refused |
+| 203_00024, 623_00012 | 1 → 2 | 2.0 | refused |
+| 494_00024 | 4 → 8 | 2.0 | refused |
+| 135_00012 | 23 → 27 | 1.17 | passes |
+| 425_00012 | 33 → 40 | 1.21 | passes |
+| 630_00012 | 28 → 35 | 1.25 | passes |
+
+`EVIDENCE_MAX_PAGES_PER_DETECTION` is 1.5, in the gap. Above it the card
+exits 3 with both numbers in the message. The ratio is logged on **every**
+card, passing ones included, so the next report gives the distribution
+rather than only the outliers.
+
+`EVIDENCE_MIN_DETECTIONS` (3) is a floor for the case where the ratio
+happens to stay low. It bites only when something *was* invented (pages out
+> detections in): the real journal fasit card in `testdata/` has 2
+detections and 2 pages and composes nothing.
+
 ### C18. Full width is not enough — a stripe must prove itself
 
 `remove_structure_rows` used to delete every full-width run thinner than a
