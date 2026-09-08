@@ -2749,3 +2749,21 @@ def test_a_speck_is_not_a_position_witness():
     snapped, flags, notes, refused = snap_pages(
         boxes, 2050, 2780, witnesses=[(4600, 7400, 20, 10)])
     assert len(snapped) == 3, snapped
+
+
+def test_a_double_height_merger_does_not_glue_two_rows():
+    """Review finding 2026-09-09: exempt boxes (>1.25 page) were computed
+    AFTER row clustering and could transitively glue two rows into one band
+    - the 036 collapse through the back door. The merger must stay out of
+    clustering entirely and pass through raw."""
+    row1 = [(2010 + k * 2180, 3300, 2040, 2780) for k in range(4)]
+    row2 = [(2010 + k * 2180, 6900, 2040, 2780) for k in range(4)]
+    merger = [(10730, 3300, 2040, 6380)]   # spans both rows, unsplittable
+
+    snapped, flags, notes, refused = snap_pages(row1 + row2 + merger,
+                                                2050, 2780)
+
+    assert refused == [], notes
+    assert (10730, 3300, 2040, 6380) in snapped, "merger must pass through raw"
+    ys = sorted({b[1] for b in snapped if b[3] == 2780})
+    assert ys == [3300, 6900], f"rows glued or re-anchored: {ys}"

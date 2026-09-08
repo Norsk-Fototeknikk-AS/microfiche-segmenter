@@ -964,7 +964,16 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=()):
         hi = min(a[1] + a[3], b[1] + b[3])
         return hi - lo
 
-    order = sorted(range(n), key=lambda i: boxes[i][1])
+    # Exempt BEFORE clustering (review finding 2026-09-09): a double-height
+    # unsplittable merger overlaps both neighbouring rows and would glue
+    # them into one band transitively - the 036 collapse through the back
+    # door. Exempt boxes take no part in rows, cells or consensus; they
+    # pass through raw further down.
+    exempt = {i for i in range(n)
+              if boxes[i][2] > 1.25 * page_w or boxes[i][3] > 1.25 * page_h}
+
+    order = sorted((i for i in range(n) if i not in exempt),
+                   key=lambda i: boxes[i][1])
     rows = []
     for i in order:
         placed = False
@@ -977,14 +986,6 @@ def snap_pages(boxes, page_w, page_h, flags=None, witnesses=()):
         if not placed:
             rows.append([i])
     rows.sort(key=lambda row: min(boxes[i][1] for i in row))
-
-    # A SINGLE detection spanning well over one page in either direction is
-    # merged content the split pass could not separate (bridged gaps, no
-    # valleys). It already carries the loud merged-pages warning; snapping
-    # would either shear real content or invent a split the binary gives no
-    # evidence for. Passed through untouched.
-    exempt = {i for i in range(n)
-              if boxes[i][2] > 1.25 * page_w or boxes[i][3] > 1.25 * page_h}
 
     # Pitch is a property of the physical jacket, shared by all rows (rows
     # start where they start, but the frame raster is one grid).
