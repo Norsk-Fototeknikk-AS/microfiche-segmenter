@@ -99,6 +99,15 @@ GEOMETRY_SHORT_RATIO = 0.7          # below this share of row height = short
 GEOMETRY_FULL_RATIO = 0.8           # at least this share = a full anchor
 GEOMETRY_MARK_COLOR = (255, 80, 0)  # blue boxes for geometry-completed pages
 
+# Vertical stripe merging (Trond's override, 2026-09-08): a page split into
+# full-height STRIPS has the outline of one page, and the format guarantees
+# uniform page sizes - same safety as the horizontal case. The union band is
+# TIGHTER than the horizontal one: two real neighbour pages union to ~2x the
+# page width plus a real gap (field pitch 2180 vs width 2040), so 1.2x
+# excludes them with a wide margin - that exclusion is the whole risk.
+STRIPE_UNION_MIN = 0.8
+STRIPE_UNION_MAX = 1.2
+
 # A card is pages on visible card background, so foreground can never be
 # ~everything. Above this share the threshold split is meaningless (blank or
 # washed-out scan) and the run fails loudly instead of emitting one giant
@@ -594,7 +603,8 @@ def _x_interval_iou(a, b):
     return (right - left) / union
 
 
-def find_fragment_groups(boxes):
+def find_fragment_groups(boxes, union_min=FRAGMENT_UNION_MIN,
+                         union_max=FRAGMENT_UNION_MAX):
     """Index groups of detections that look like ONE page cut horizontally.
 
     A seam-damaged page can come back as 2, 3 or 4 stacked fragments
@@ -652,9 +662,9 @@ def find_fragment_groups(boxes):
                 top_y = min(boxes[k][1] for k in window)
                 bot_y = max(boxes[k][1] + boxes[k][3] for k in window)
                 union_h = bot_y - top_y
-                if union_h > FRAGMENT_UNION_MAX * exp_h:
+                if union_h > union_max * exp_h:
                     break
-                if union_h >= FRAGMENT_UNION_MIN * exp_h:
+                if union_h >= union_min * exp_h:
                     best_end = j
             if best_end is None:
                 i += 1
@@ -662,6 +672,21 @@ def find_fragment_groups(boxes):
                 groups.append(tuple(sorted(comp[i:best_end + 1])))
                 i = best_end + 1
     return sorted(groups)
+
+
+def find_stripe_groups(boxes):
+    """Index groups of detections that look like ONE page cut vertically.
+
+    Transposing x<->y and w<->h turns vertical strips into the horizontal
+    stacking problem, so the whole chain machinery is reused: y-IoU >= 0.8,
+    horizontal gap <= 15% of expected page width (which expected_page_height
+    computes on the transposed boxes), union WIDTH in the tight stripe band.
+    Two separate half-width documents in neighbouring frames never link -
+    their frames put a real gap between them.
+    """
+    transposed = [(y, x, h, w) for (x, y, w, h) in boxes]
+    return find_fragment_groups(transposed, union_min=STRIPE_UNION_MIN,
+                                union_max=STRIPE_UNION_MAX)
 
 
 def complete_geometry(boxes):
@@ -712,6 +737,35 @@ def complete_geometry(boxes):
     entries = [[boxes[i], False, i in contested]
                for i in range(n) if i not in consumed]
     entries += [[b, True, False] for b in merged]
+
+    # Vertical stripes, on the horizontally-repaired boxes (a page split
+    # into quadrants heals fully: the two half-width columns from the merge
+    # above unite here). Contested fragments stay out.
+    stripe_groups = find_stripe_groups([e[0] for e in entries])
+    stripe_consumed = set()
+    stripe_entries = []
+    for g in stripe_groups:
+        if any(entries[i][2] for i in g):
+            continue
+        parts = [entries[i][0] for i in g]
+        x0 = min(b[0] for b in parts)
+        y0 = min(b[1] for b in parts)
+        x1 = max(b[0] + b[2] for b in parts)
+        y1 = max(b[1] + b[3] for b in parts)
+        union_area = (x1 - x0) * (y1 - y0)
+        invented = max(0.0, 1.0 - sum(b[2] * b[3] for b in parts) / union_area)
+        dets = "+".join(str(i + 1) for i in g)
+        if invented > GEOMETRY_MAX_INVENTED_SHARE:
+            refused.append(g)
+            notes.append(f"REFUSED merge of vertical stripes {dets}: "
+                         f"{invented:.0%} of the page would be invented")
+            continue
+        stripe_consumed.update(g)
+        stripe_entries.append([(x0, y0, x1 - x0, y1 - y0), True, False])
+        notes.append(f"merged {len(g)} vertical stripes (detections {dets}) "
+                     f"into one page at ({x0}, {y0}), {invented:.0%} invented")
+    entries = [e for i, e in enumerate(entries)
+               if i not in stripe_consumed] + stripe_entries
 
     # Short-document extension, per row (same y-chaining as
     # group_boxes_into_rows, kept on indices so the flags follow along).

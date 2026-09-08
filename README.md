@@ -267,6 +267,15 @@ overrides the binary** (`complete_geometry`):
   `GEOMETRY_MAX_INVENTED_SHARE` (30 %) of the page area is refused — that is
   fabrication, not repair. (Field calibration, 28 production groups: every
   one tiled its union exactly, ~0 % invented.)
+- **Vertical stripes** merge symmetrically (Trond's override, same day):
+  a page split into full-height strips has the outline of one page, and the
+  format guarantees uniform page sizes. The union band is tighter
+  (`STRIPE_UNION_MIN/MAX` = 0.8–1.2× the expected page width) because the
+  whole risk is merging two real neighbour pages — their union is ~2× a page
+  wide plus a real gap (field pitch 2180 vs width 2040), which the band
+  excludes with wide margin; a test pins that a full row at field pitch
+  produces no stripe groups. Two half-width documents in neighbouring
+  frames never link either — the frame spacing exceeds the gap criterion.
 - A lone **short detection** in a row with ≥2 full-height anchors is
   extended to the row's top edge and median height (pages share their top
   edge within a row; verified on the fasit). Worst case is empty film in

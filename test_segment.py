@@ -2029,3 +2029,76 @@ def test_anon_viz_marks_repaired_pages_in_blue_and_stays_clean():
     assert colors <= allowed, f"unexpected midtones leaked: {colors - allowed}"
     assert GEOMETRY_MARK_COLOR in colors, "repaired page not marked in blue"
     assert (0, 255, 0) in colors
+
+
+# --- Vertical stripe merging (Trond's override, 2026-09-08) -----------------
+# A page split into two full-height STRIPS has the outline of one page, and
+# the format guarantees uniform page sizes - same safety as horizontally.
+# The whole risk is merging two real neighbour pages; their union is ~2x the
+# page width PLUS a real gap, so the 0.8-1.2x width band excludes them.
+
+from segment_microfiche import find_stripe_groups
+
+
+def test_stripe_groups_finds_the_field_cards_split_page():
+    """Card 612130000135 detections 11+12 (real coordinates): one page as two
+    full-height strips, flanked by whole pages from the same row."""
+    boxes = [
+        (4190, 6680, 1350, 2760), (5540, 6680, 720, 2760),   # the strips
+        (12900, 6540, 2040, 2790), (17260, 6950, 2020, 2330),
+        (25970, 7100, 1730, 2050),
+    ]
+    assert find_stripe_groups(boxes) == [(0, 1)]
+
+
+def test_stripe_groups_never_merges_real_neighbour_pages():
+    """THE critical safety property: a full row of ordinary pages at field
+    pitch (2040 wide, 140px gaps) must produce no stripe groups - their
+    union is ~2x a page wide."""
+    boxes = [(2000 + i * 2180, 3000, 2040, 2790) for i in range(6)]
+    assert find_stripe_groups(boxes) == []
+
+
+def test_geometry_merges_vertical_stripes():
+    boxes = [
+        (4190, 6680, 1350, 2760), (5540, 6680, 720, 2760),
+        (12900, 6540, 2040, 2790), (17260, 6950, 2020, 2330),
+        (25970, 7100, 1730, 2050),
+    ]
+    new, flags, notes, refused = complete_geometry(boxes)
+
+    assert refused == []
+    repaired = [b for b, f in zip(new, flags) if f]
+    assert repaired == [(4190, 6680, 2070, 2760)]
+    assert any("vertical stripes" in n for n in notes)
+
+
+def test_geometry_leaves_a_real_page_row_untouched():
+    boxes = [(2000 + i * 2180, 3000, 2040, 2790) for i in range(6)]
+    new, flags, _, _ = complete_geometry(boxes)
+    assert sorted(new) == sorted(boxes)
+    assert not any(flags)
+
+
+def test_vertical_seam_card_is_geometry_completed_end_to_end(tmp_path):
+    """A jacket-level vertical seam through one page: the two strips merge
+    back into one page and the card completes."""
+    src = tmp_path / "612130000012_00016.jpg"
+    a = np.full((3000, 6400), 180, 'uint8')
+    for r in range(3):
+        for c in range(6):
+            y = 350 + r * 900
+            x = 100 + c * 1050
+            a[y:y + 700, x:x + 1000] = 110
+    seam_x = 100 + 1050 + 400   # through page (row 1, col 1)
+    a[350 + 900:350 + 900 + 700, seam_x:seam_x + 30] = 180
+    pyvips.Image.new_from_memory(a.tobytes(), 6400, 3000, 1, 'uchar').write_to_file(str(src))
+    out = tmp_path / "card"
+
+    proc = run_segmenter("-i", str(src), "-O", str(out), "--skip-extraction")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "vertical stripes" in proc.stdout, proc.stdout
+    assert "1 pages geometry-completed" in proc.stdout, proc.stdout
+    rows_csv = (out / "page_coordinates.csv").read_text().splitlines()[2:]
+    assert len(rows_csv) == 18, rows_csv

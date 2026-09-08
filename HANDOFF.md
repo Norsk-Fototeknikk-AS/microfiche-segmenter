@@ -379,9 +379,20 @@ excluded from extension: contested geometry must not be quietly repaired
 by the other mechanism. Contract change: seamed-card e2e tests flipped
 from exit-3 to completed-with-blue.
 
+### Vertical stripe merging (2026-09-08, late)
+
+Trond overrode the risk log: strips repair NOW. find_stripe_groups
+transposes x<->y and reuses the whole chain machinery; only the union band
+differs (0.8-1.2x expected page WIDTH - neighbours union ~2x plus a real
+gap, and THAT exclusion is the entire risk; pinned by a field-pitch row
+test). Runs on the horizontally-repaired boxes, so a quadrant-split page
+heals fully. Field fixture: card 135 detections 11+12 (1350+720 wide, gap
+0) merge to one 2070-wide page. Two half-width documents in neighbouring
+frames never link - frame spacing exceeds the 15% gap criterion.
+
 ### Tests
 
-132 tests, ~19 s (was 32 when this was written). Unit tests for box
+137 tests, ~19 s (was 32 when this was written). Unit tests for box
 geometry, folder lifecycle and band filtering; end-to-end tests drive the real
 CLI against a generated 4×3 card.
 
