@@ -2359,6 +2359,16 @@ def main():
             int(h * scale_back)
         ))
 
+    # Machine-readable geometry for the field regression (steg 5C).
+    # Coordinates only - no content - so the reports stay safe to carry off
+    # the air-gapped machine. RAW is what detection found BEFORE the split
+    # pass: it is diagnosis, not a replay input, because splitting reads the
+    # panorama and no coordinate-only replay can reproduce it. The
+    # difference between RAW and PRE-REPAIR is exactly what splitting did -
+    # which is where card 098 lied (sixteen single pages "split into 2-4").
+    print("RAW detections (full-res x,y,w,h): "
+          + "; ".join(f"{x},{y},{w},{h}" for x, y, w, h in boxes_fullres))
+
     # === STEP 4a: Split merged detections at projection valleys ===
     # Weak edges fuse touching pages into one detection; the gap between real
     # pages is a projection valley at scan scale. Scanned per box against the
@@ -2490,6 +2500,15 @@ def main():
         (int(x / detect_scale), int(y / detect_scale),
          int(w / detect_scale), int(h / detect_scale))
         for (x, y, w, h) in small_witnesses]
+    # PRE-REPAIR is the replay input: the last point where everything below
+    # is pure geometry. Feed these three lines (with the structure rows)
+    # back through repair_and_snap and the result is what shipped. With
+    # --refine it is not bit-exact - refine reads the image too - but
+    # production does not use it.
+    print("PRE-REPAIR detections (full-res x,y,w,h): "
+          + "; ".join(f"{x},{y},{w},{h}" for x, y, w, h in boxes_fullres))
+    print("RAW witnesses (full-res x,y,w,h): "
+          + "; ".join(f"{x},{y},{w},{h}" for x, y, w, h in witnesses_fullres))
     chain = repair_and_snap(boxes_fullres, witnesses_fullres,
                             stripes_fullres, original_width)
     for stream, text in chain.output:

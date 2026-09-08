@@ -574,6 +574,27 @@ never overwriting, suffixed on collision — so real pixel values can be
 measured with Digital Color Meter. Viewing copies contain journal data and
 stay on the machine; they are never report artifacts.
 
+### Replayable geometry in every report (2026-09-08)
+
+Every run logs the coordinates the coordinate-only part of the chain works
+on, so a report can be replayed without the panorama:
+
+| line | what it is |
+|---|---|
+| `RAW detections (full-res x,y,w,h): …` | what detection found **before** the split pass — diagnosis only. Splitting reads the panorama, so no coordinate-only replay can reproduce it; the difference against the next line is exactly what splitting did |
+| `PRE-REPAIR detections (full-res x,y,w,h): …` | the replay input: everything below it is pure geometry |
+| `RAW witnesses (full-res x,y,w,h): …` | the sub-min-size blobs the snap uses as position witnesses (C15) |
+| `Structure rows (full-res y): …` | the stripe runs, i.e. the row slots (C18) |
+
+Feed those four through `repair_and_snap()` and the result is what the run
+shipped. That function is the chain — `main()` only prints it and decides
+the exit code — so a replay exercises production code, not a copy of it.
+Coordinates only, no content, so the reports stay safe to carry off the
+air-gapped machine.
+
+With `--refine` the replay is not bit-exact (refine reads the image too);
+production does not use it.
+
 Every segmenter run starts with an `Env:` line (python/numpy/opencv/pyvips
 versions, the code's short git SHA or `ukjent`, and the mode — `standard`
 or `bakgrunn-foerst`) so each captured rapport.txt documents the environment

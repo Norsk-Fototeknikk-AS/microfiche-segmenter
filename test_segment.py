@@ -3682,3 +3682,133 @@ def test_the_physical_fasit_holds_the_counted_numbers():
     assert grids["612130000111_00012"] == "3 rows: 12+12+7", grids
     assert grids["612130000135_00012"] == "3 rows: 12+12+3", grids
 
+
+
+# --- Steg 5C (2026-09-08): the coordinate-only chain is replayable ----------
+# The physical-count pin showed how little a replay of SHIPPED geometry
+# catches (one of eight parameter changes): the input was already uniform
+# and on the grid. To get a real field regression the reports must carry the
+# INPUT to the coordinate-driven part of the chain, not just its output.
+
+from segment_microfiche import repair_and_snap
+
+
+def _parse_boxes_line(text, label):
+    m = re.search(rf"^{label} \(full-res x,y,w,h\): ?(.*)$", text, re.M)
+    if not m:
+        return None
+    body = m.group(1).strip()
+    if not body:
+        return []
+    return [tuple(int(v) for v in b.split(",")) for b in body.split("; ")]
+
+
+def _parse_shipped_boxes(text):
+    out = []
+    block = re.search(r"PAGE COORDINATES.*?\n(.*?)\n\n", text, re.S)
+    for line in (block.group(1).splitlines() if block else []):
+        p = [q.strip() for q in line.split(",")]
+        if len(p) == 5 and p[0].isdigit():
+            out.append(tuple(int(v) for v in p[1:]))
+    return out
+
+
+def test_the_report_carries_raw_and_pre_repair_detections(tmp_path):
+    """Two lines, each with its own name. RAW is what detection found before
+    the split pass; PRE-REPAIR is what enters the coordinate-only chain.
+    Their difference is exactly what the split pass did - which is where
+    card 098 lied in the previous round (sixteen single pages 'split into
+    2-4 pages')."""
+    proc = run_segmenter("-i", str(REPO / "testdata" / "real_card_10pct.jpg"),
+                         "-O", str(tmp_path / "card"), "--skip-extraction")
+    raw = _parse_boxes_line(proc.stdout, "RAW detections")
+    pre = _parse_boxes_line(proc.stdout, "PRE-REPAIR detections")
+    wit = _parse_boxes_line(proc.stdout, "RAW witnesses")
+    assert raw is not None and pre is not None and wit is not None, proc.stdout
+    assert all(len(b) == 4 for b in raw + pre + wit), (raw, pre, wit)
+    assert raw, "the fasit card detects the tape pages"
+
+
+def _replay_inputs(text):
+    """(pre-repair boxes, witnesses, stripes, image width) from a report."""
+    stripes = []
+    m = re.search(r"Structure rows \(full-res y\): (.+)", text)
+    if m:
+        stripes = [tuple(int(v) for v in r.split("-"))
+                   for r in m.group(1).split(", ")]
+    return (_parse_boxes_line(text, "PRE-REPAIR detections"),
+            _parse_boxes_line(text, "RAW witnesses"), stripes,
+            int(re.search(r"Image size: (\d+) x", text).group(1)))
+
+
+def _rests_card(path):
+    """Half a row detects normally, half leaves only small rests - the 098
+    shape, and the only fixture that exercises position witnesses."""
+    a = np.full((3000, 6400), 180, 'uint8')
+    for c in range(12):
+        x = 100 + c * 520
+        if c < 6:
+            a[350:1050, x + 100:x + 300] = 110
+        else:
+            a[350:1050, x:x + 400] = 110
+    pyvips.Image.new_from_memory(a.tobytes(), 6400, 3000, 1,
+                                 'uchar').write_to_file(str(path))
+
+
+def test_the_pre_repair_line_replays_to_what_shipped(tmp_path):
+    """The point of the line: run the production chain again from it and get
+    exactly the coordinates the run shipped - on cards that actually use
+    every argument, because the committed fasit card does not (2 pages, no
+    witnesses, and its stripes do not change its outcome).
+
+    What this proves: the four logged lines carry ENOUGH to reproduce the
+    coordinate-only chain. What it does not prove: that the chain is right -
+    a change inside repair_and_snap moves the shipped output and the replay
+    together. The value is that a future field report can be replayed at
+    all; correctness comes from the physical count.
+
+    RAW (before the split pass) is deliberately NOT replayable - splitting
+    reads the panorama - so it is logged as diagnosis only. With --refine
+    PRE-REPAIR is not bit-exact either, for the same reason; production does
+    not use it.
+    """
+    cards = {}
+    _rests_card(tmp_path / "612130000012_00001.jpg")      # witnesses
+    _row_probe_card(tmp_path / "612130000012_00002.jpg")  # repair + rows
+    make_journal_card(tmp_path / "612130000012_00003.jpg")
+    cards["rests"] = tmp_path / "612130000012_00001.jpg"
+    cards["rows"] = tmp_path / "612130000012_00002.jpg"
+    cards["journal"] = tmp_path / "612130000012_00003.jpg"
+
+    used_witnesses = False
+    for name, src in cards.items():
+        proc = run_segmenter("-i", str(src), "-O", str(tmp_path / name),
+                             "--skip-extraction")
+        assert proc.returncode == 0, (name, proc.stdout + proc.stderr)
+        text = proc.stdout + proc.stderr
+        pre, wit, stripes, width = _replay_inputs(text)
+        shipped = _parse_shipped_boxes(text)
+        assert pre and shipped, (name, text)
+
+        replayed = repair_and_snap(pre, wit, stripes, width)
+
+        assert replayed.boxes == shipped, (name, replayed.boxes, shipped)
+        used_witnesses = used_witnesses or bool(wit)
+    assert used_witnesses, "no fixture exercised the witness line"
+
+
+def test_the_replay_notices_a_missing_witness_line(tmp_path):
+    """Sensitivity check: if the witnesses were left out of the log, the
+    replay must NOT still match - otherwise the line proves nothing."""
+    src = tmp_path / "612130000012_00001.jpg"
+    _rests_card(src)
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    text = proc.stdout + proc.stderr
+    pre, wit, stripes, width = _replay_inputs(text)
+    shipped = _parse_shipped_boxes(text)
+    assert wit, "this fixture must produce witnesses"
+
+    assert repair_and_snap(pre, wit, stripes, width).boxes == shipped
+    assert repair_and_snap(pre, (), stripes, width).boxes != shipped, (
+        "dropping the witnesses changed nothing - the line is not load-bearing")
