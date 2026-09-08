@@ -59,6 +59,11 @@ def used_manual_boxes(output):
     return "MANUAL boxes:" in output
 
 
+def used_step_three(output):
+    """Was this card laid out cell by cell? (C25)"""
+    return "Step 3: the card fails" in output
+
+
 def used_step_two(output):
     """Did this card need the staircase's second threshold? (C9, steg 7 -
     a step-two run is never silent.)"""
@@ -71,7 +76,8 @@ def parse_grid(output):
 
 
 def summary_line(stem, exit_code, pages, fragment_groups, anon_missing=False,
-                 quality=None, grid=None, step2=False, manual=False):
+                 quality=None, grid=None, step2=False, manual=False,
+                 step3=False):
     if anon_missing:
         # Whatever the exit code said: without the anonymized image the card
         # cannot be inspected across the air gap, and a missing expected
@@ -87,6 +93,8 @@ def summary_line(stem, exit_code, pages, fragment_groups, anon_missing=False,
     detail += f"  {grid or '?':<20}"
     if step2:
         detail += "  TRINN2"
+    if step3:
+        detail += "  TRINN3"
     if manual:
         detail += "  MANUELL"
     if exit_code == 0:
@@ -181,7 +189,8 @@ def run_report(source_folder, report_dir, open_finder=True, extra_args=()):
                                      quality=parse_quality(output),
                                      grid=parse_grid(output),
                                      step2=used_step_two(output),
-                                     manual=used_manual_boxes(output)))
+                                     manual=used_manual_boxes(output),
+                                     step3=used_step_three(output)))
 
     ok = sum(1 for r in rows if r.startswith("OK"))
     svak = sum(1 for r in rows if r.startswith("SVAK"))

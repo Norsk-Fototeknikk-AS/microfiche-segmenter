@@ -5505,3 +5505,49 @@ def test_step_three_declines_rather_than_ship_a_card_with_pages_missing(
     assert proc.returncode == 3, (proc.returncode, out)
     assert "Step 3 declined" in out, out
     assert "impossible geometry" in out, out
+
+
+# --- Steg 8C-3 (2026-09-08): cell pages ARE detections -------------------
+# The coupling flagged back in the cell-prior groundwork: the evidence guard
+# counts pages out against detections in, and a cell prior adds pages with
+# no detection behind them - so it would refuse exactly the cards it is
+# meant to rescue. Resolved structurally rather than with an exception: the
+# placed cell pages are what step three feeds INTO the chain, so they are
+# the detections. A page measured on the graytone against a floor calibrated
+# on 61 known-empty cells is stronger evidence than a blob that survived a
+# threshold, so this is not a loophole.
+
+def test_a_card_laid_out_by_step_three_passes_the_evidence_guard():
+    placed = [(2010 + k * 2180, 3300 + r * 3440, 2030, 2780)
+              for r in range(5) for k in range(12)]
+
+    chain = repair_and_snap(placed, (), (), 29071, 21505)
+
+    assert chain.card_refusals == [], chain.card_refusals
+    assert not chain.evidence_refused
+    assert len(chain.boxes) == 60, len(chain.boxes)
+    ratio = [t for _s, t in chain.output if "Evidence:" in t]
+    assert ratio and "1.00" in ratio[0], ratio
+
+
+def test_a_half_laid_out_card_still_passes_the_guard_but_is_warned_about():
+    """Half a raster placed is a WARNING in the log, not a refusal - the
+    card may legitimately be half full, and the log is where we find out."""
+    cells = _cells(12)
+    evidence = [(0.86, 0.32)] * 5 + [(0.01, 0.00)] * 7
+    placed, notes = pages_from_cells(cells, evidence, 2030, 2780)
+
+    chain = repair_and_snap(placed, (), (), 29071, 21505)
+
+    assert chain.card_refusals == [], chain.card_refusals
+    assert any("WARNING" in n for n in notes), notes
+
+
+def test_summary_marks_a_step_three_card():
+    line = rapport.summary_line("kort_a", 0, 60, 0, quality=97.0,
+                                grid="5 rows: 12+12+12+12+12", step3=True)
+    assert "TRINN3" in line, line
+    assert "TRINN3" not in rapport.summary_line("kort_a", 0, 60, 0)
+    assert rapport.used_step_three(
+        "Step 3: the card fails but its raster is complete - laying out 60")
+    assert not rapport.used_step_three("Step 3 declined: 4 cell(s) hold")
