@@ -323,8 +323,14 @@ box: the blob gives position, `PAGE_SIZE_PRIOR` (2050×2780, measured across
 - **Prior resolution** (`resolve_page_size`): detections matching the prior
   ±10 % tune it (median); exactly one witness contributes its own clamped
   dimensions (using the raw prior was measured to shrink an edge-of-band
-  card's pages); zero witnesses → per-card estimate with a LOUD note, so an
-  off-format card is never silently forced into journal size. New format
+  card's pages) **and says so** — one witness out of many detections is a
+  thin basis for a whole card; zero witnesses → per-card estimate with a
+  LOUD note **naming the numbers** (how many detections, how many matched,
+  what the card actually measures and how far off it is), so an off-format
+  card is never silently forced into journal size. Card 029 in background
+  mode built a whole card on 2040×2400, 14 % shorter than the format, and
+  the log said only "not matched". The note now points upstream, which is
+  where the cause was: two 10 px structure runs had cut its pages (C18). New format
   one day? Measure a healthy card's PAGE COORDINATES the same way and
   update the prior.
 - **Cell assignment**: each detection belongs to the grid cell (row phase +

@@ -2400,7 +2400,12 @@ def test_snap_regression_against_both_field_reports():
                    "RAPPORT-2026-09-08-5"):
         for stem, boxes, was_ok, q_before in _field_cards(report):
             pw, ph, note = resolve_page_size(boxes)
-            assert note is None, (report, stem, "production card off-prior?")
+            # No production card may fall to a per-card estimate: a size the
+            # format does not have means the detections are short (steg 4C).
+            # A SINGLE-witness note is allowed and expected on the sickest
+            # cards - 135 in RAPPORT-3 has exactly one intact page left.
+            assert note is None or note.startswith("Page size from a SINGLE"), \
+                (report, stem, note)
             snapped, flags, notes, refused = snap_pages(boxes, pw, ph)
             if stem == "612130000111_00012":
                 # Row 2 survived as tops only; the reports carry no stripe
@@ -3047,6 +3052,7 @@ def test_witness_inside_the_raster_still_claims_its_page():
 # runs, 050's 340 px): POSITION on the card's raster is what convicts them.
 
 from segment_microfiche import (classify_structure_runs, coalesce_runs,
+                                PAGE_SIZE_PRIOR,
                                 fit_stripe_raster, STRIPE_RASTER_TOL,
                                 STRIPE_MAX_PITCH)
 
@@ -3348,3 +3354,51 @@ def test_log_says_when_no_raster_could_be_fitted():
         runs, [1.0, 1.0], CARD_H, CARD_MIN_PAGE_H, CARD_HEADER)
     assert len(stripes) == 2, stripes
     assert any("raster not fitted" in why for _, why in rejected), rejected
+
+
+# --- Steg 4C (2026-09-08): a prior fall must say why, with numbers ----------
+# Card 029 in background mode reported only "Page-size prior 2050x2780 not
+# matched by this card - using per-card estimate 2040x2400" and then built
+# the whole card on a page 14 % shorter than the format's. The cause was
+# upstream (4A: two 10 px runs at 4820 and 5520 cut its pages), but the log
+# gave nothing to see that with.
+
+def test_prior_fall_names_the_numbers_behind_it():
+    """029's shape: 11 detections, none within +-10 % of the prior."""
+    boxes = [(2230 + k * 2180, 3185, 2040, 2340) for k in range(11)]
+    pw, ph, note = resolve_page_size(boxes)
+    assert (pw, ph) != PAGE_SIZE_PRIOR
+    assert note is not None
+    assert "11" in note, note                    # how many detections
+    assert "0 " in note or "none" in note, note  # how many matched
+    assert "2040x2340" in note, note             # what the card measures
+    assert "2050x2780" in note, note             # what the prior says
+
+
+def test_a_single_witness_is_also_announced():
+    """One matching detection is a thin basis for a whole card - say so."""
+    boxes = [(2230, 3185, 2050, 2780)] + [
+        (4410 + k * 2180, 3185, 900, 1200) for k in range(4)]
+    pw, ph, note = resolve_page_size(boxes)
+    assert (pw, ph) == (2050, 2780), (pw, ph)
+    assert note is not None and "1" in note, note
+
+
+def test_a_healthy_card_says_nothing():
+    boxes = [(2230 + k * 2180, 3185, 2050, 2780) for k in range(11)]
+    pw, ph, note = resolve_page_size(boxes)
+    assert (pw, ph) == (2050, 2780) and note is None
+
+
+def test_the_prior_fall_reaches_the_report(tmp_path):
+    """Whatever the note says, the operator must see it in rapport.txt."""
+    src = tmp_path / "612130000012_00016.jpg"
+    a = np.full((1500, 2000), 200, 'uint8')
+    for c in range(4):
+        a[300:900, 100 + c * 480:100 + c * 480 + 400] = 60
+    pyvips.Image.new_from_memory(a.tobytes(), 2000, 1500, 1,
+                                 'uchar').write_to_file(str(src))
+    proc = run_segmenter("-i", str(src), "-O", str(tmp_path / "card"),
+                         "--skip-extraction")
+    assert "Page-size prior" in proc.stdout, proc.stdout
+    assert "detections" in proc.stdout, proc.stdout

@@ -1103,11 +1103,16 @@ def resolve_page_size(boxes):
         # into the prior band. Using the raw prior instead was measured to
         # SHRINK pages on a card whose true size sits at the band's edge
         # (bottom 200px of content cut) - the sickest cards are exactly
-        # where this matters.
+        # where this matters. Announced (steg 4C): one witness out of many
+        # detections is a thin basis for a whole card.
         lo_w, hi_w = pw0 * (1 - PAGE_SIZE_TOLERANCE), pw0 * (1 + PAGE_SIZE_TOLERANCE)
         lo_h, hi_h = ph0 * (1 - PAGE_SIZE_TOLERANCE), ph0 * (1 + PAGE_SIZE_TOLERANCE)
-        return (int(min(max(good[0][2], lo_w), hi_w)),
-                int(min(max(good[0][3], lo_h), hi_h)), None)
+        w1 = int(min(max(good[0][2], lo_w), hi_w))
+        h1 = int(min(max(good[0][3], lo_h), hi_h))
+        return w1, h1, (f"Page size from a SINGLE witness: 1 of "
+                        f"{len(boxes)} detections matches the prior "
+                        f"{pw0}x{ph0} (+-{PAGE_SIZE_TOLERANCE:.0%}); using "
+                        f"{w1}x{h1}")
     ph = int(expected_page_height(boxes))
     # Width fallback: median width of the FULL-HEIGHT boxes. The height
     # estimator can lean on "the tallest box is a whole page" (fragments are
@@ -1115,8 +1120,16 @@ def resolve_page_size(boxes):
     # so a max-anchored width is wrong in this direction.
     full_h = [b[2] for b in boxes if abs(b[3] - ph) <= 0.2 * ph]
     pw = int(np.median(full_h if full_h else [b[2] for b in boxes]))
-    return pw, ph, (f"Page-size prior {pw0}x{ph0} not matched by this card - "
-                    f"using per-card estimate {pw}x{ph}")
+    med_w = int(np.median([b[2] for b in boxes]))
+    med_h = int(np.median([b[3] for b in boxes]))
+    return pw, ph, (
+        f"Page-size prior {pw0}x{ph0} not matched by this card - "
+        f"0 of {len(boxes)} detections fall within "
+        f"{PAGE_SIZE_TOLERANCE:.0%} of it (this card measures a median "
+        f"{med_w}x{med_h}, {abs(med_h - ph0) / ph0:.0%} off in height); "
+        f"using per-card estimate {pw}x{ph}. A whole card built on a size "
+        "the format does not have means the DETECTIONS are short - look "
+        "upstream (structure rows cutting pages, washed content), not here")
 
 
 WITNESS_MIN_DIM_SHARE = 0.05    # of page width AND height: a 50 px sleeve
