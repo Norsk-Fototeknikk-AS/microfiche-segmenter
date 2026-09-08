@@ -1,0 +1,31 @@
+# Kalibrering av cellebeviset, maalt paa testrunde 4 (kode 7fa82c0,
+# standardmodus, 28 kort). Kun tall.
+#
+# Populasjon: 1082 celler med side, 63 kjente TOMME celler (korte bunnrader,
+# steg 10D). Persentiler p5/p50/p95, og ytterpunktene, som er det som
+# avgjoer om en terskel er trygg.
+#
+#                fg p5   p50   p95    min     max     edge p5  p50   p95    min    max
+sider            0.446  0.861  0.969  0.047   -       0.182   0.316  0.496  0.063  0.640
+tomme            0.000  0.000  0.031  0.000   0.758   0.001   0.006  0.035  0.001  0.153
+#
+# MERK at ytterpunktene overlapper, i motsetning til persentilene: en TOM
+# celle maaler fg 0.758, og den ligger paa 609_00024 - det ene kortet som
+# feiler med splintrede sider, der page=0-merkelappen selv ikke kan stoles
+# paa (cellen holder etter alt aa doemme en side deteksjonen mistet).
+#
+# Paa de 24 kortene som PASSERTE, der merkelappene er til aa stole paa:
+#                fg max  edge max         (tomme, n=61)
+tomme_paa_ok     0.135   0.125
+#                fg min  edge min         (sider, n=940)
+sider_paa_ok     0.047   0.063
+#
+# Valgt terskel: okkupert naar fg >= 0.20 OG edge >= 0.09.
+# Paa kortene som passerte: 0 falske positive av 61, 15 falske negative av
+# 940. Retningen er med vilje: en falsk POSITIV ville lagt ut en side i en
+# tom celle, som er 203-feilen. En falsk negativ betyr bare at vi lar vaere
+# aa legge til en side deteksjonen alt har funnet.
+#
+# De 15 falske negative ligger paa de fadede kortene 135, 630 og 425, med
+# fg helt ned i 0.047. Et celleprior vil altsaa ikke redde de svakeste
+# sidene paa de svakeste kortene - det maa vaere kjent naar det bygges.

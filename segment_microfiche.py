@@ -2003,6 +2003,28 @@ def cell_evidence(gray_small, cell, page_w, page_h, scale, threshold,
     return fg, edge
 
 
+# Cell floor, calibrated on testrunde 4 (steg 8B): 1082 page cells against
+# 63 known empty ones from short bottom rows. Pages run fg 0.45/0.86/0.97
+# and edge 0.18/0.32/0.50 (p5/p50/p95); empty cells 0.00/0.00/0.03 and
+# 0.001/0.006/0.035. On the 24 cards that PASSED - where the labels can be
+# trusted - this floor gives 0 false positives of 61 and 15 false negatives
+# of 940, and that direction is deliberate: a false positive lays a page
+# into an empty cell, which is card 203's error, while a false negative
+# only declines to add a page detection has already found. The full
+# population holds one empty cell at fg 0.758, on 609_00024 - the splintered
+# card whose page=0 labels cannot be trusted. Numbers in
+# testdata/celle_kalibrering_2026-09-08.txt. NOT used by the chain yet.
+CELL_OCCUPIED_FG = 0.20
+CELL_OCCUPIED_EDGE = 0.09
+
+
+def is_cell_occupied(fg, edge):
+    """Does this cell hold a page? Both measures must agree - either alone
+    lets something through (the worst empty cell clears the edge floor by
+    itself, and a faded page can clear fg with a weak edge)."""
+    return fg >= CELL_OCCUPIED_FG and edge >= CELL_OCCUPIED_EDGE
+
+
 CELL_EDGE_LEVEL = 40.0   # Sobel magnitude counted as an edge (steg 8A,
                          # measurement only - nothing decides on it yet)
 

@@ -514,8 +514,24 @@ measures 0.39–0.48 and means nothing. Only the raster a row itself spans is
 enumerated now; a cell the row *skips over* is the control we want. Extra
 cells are opt-in (`margin_cells`), and the count left out is logged.
 
-Nothing may act on these numbers until they have been calibrated against a
-production run. Building a prior on an uncalibrated floor would be card
+**Calibrated 2026-09-08 on test round 4** (steg 8B): 1082 page cells against
+63 known empty ones. Pages measure `fg` 0.45/0.86/0.97 and `edge`
+0.18/0.32/0.50 at p5/p50/p95; empty cells 0.00/0.00/0.03 and
+0.001/0.006/0.035. `is_cell_occupied` requires **both** `fg ≥ 0.20` and
+`edge ≥ 0.09` — either alone lets something through. On the 24 cards that
+*passed*, where the labels can be trusted, that is **0 false positives of 61
+and 15 false negatives of 940**, and the direction is deliberate: a false
+positive lays a page into an empty cell, which is card 203's error, while a
+false negative only declines to add a page detection has already found.
+
+Two things the percentiles hide, both recorded in
+`testdata/celle_kalibrering_2026-09-08.txt`: one "empty" cell measures
+fg 0.758, on the splintered card 609_00024 whose `page=0` labels cannot be
+trusted; and the 15 false negatives sit on the faded cards 135, 630 and 425
+with fg down to 0.047 — a cell prior built on this floor will **not** rescue
+the faintest pages on the faintest cards.
+
+Nothing in the chain acts on these numbers yet. Building a prior on an uncalibrated floor would be card
 203's mistake with a better explanation.
 
 ### C23. Header content is not a page row

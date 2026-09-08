@@ -5281,3 +5281,58 @@ def test_the_chain_drops_the_remnant_and_lands_on_the_fasit():
     assert chain.card_refusals == [], chain.card_refusals
     assert compute_card_quality(chain.boxes, None)["grid"] == \
         "2 rows: 12+11", compute_card_quality(chain.boxes, None)["grid"]
+
+
+# --- Steg 8B (2026-09-08): the cell floor, calibrated on round 4 ---------
+# 1082 page cells and 63 known empty ones (short bottom rows, steg 10D).
+# Pages measure fg 0.45/0.86/0.97 and edge 0.18/0.32/0.50 at p5/p50/p95;
+# empty cells 0.00/0.00/0.03 and 0.001/0.006/0.035. The chosen floor is
+# deliberately biased: a false POSITIVE would lay a page into an empty cell,
+# which is card 203's error. A false negative only means we decline to add
+# a page detection has already found.
+
+from segment_microfiche import (is_cell_occupied, CELL_OCCUPIED_FG,
+                                CELL_OCCUPIED_EDGE)
+
+
+def test_the_cell_floor_sits_between_the_measured_populations():
+    assert CELL_OCCUPIED_FG == 0.20, CELL_OCCUPIED_FG
+    assert CELL_OCCUPIED_EDGE == 0.09, CELL_OCCUPIED_EDGE
+    # above every empty cell on a card that passed (fg 0.135, edge 0.125)
+    assert CELL_OCCUPIED_FG > 0.135
+    # ...and below the median page by a wide margin (fg 0.861, edge 0.316)
+    assert CELL_OCCUPIED_FG < 0.446 and CELL_OCCUPIED_EDGE < 0.182
+
+
+def test_a_typical_page_cell_is_occupied():
+    assert is_cell_occupied(0.861, 0.316)
+    assert is_cell_occupied(0.446, 0.182)          # p5 of pages
+
+
+def test_a_typical_empty_cell_is_not():
+    assert not is_cell_occupied(0.000, 0.001)
+    assert not is_cell_occupied(0.031, 0.035)      # p95 of empty
+    assert not is_cell_occupied(0.135, 0.125)      # the worst empty cell
+                                                   # on a card that passed
+
+
+def test_both_measures_must_agree():
+    """Either alone lets something through: the worst empty cell clears the
+    edge floor on its own, and a faded page can clear fg while its edge is
+    weak."""
+    assert not is_cell_occupied(0.90, 0.02), "edge alone must not decide"
+    assert not is_cell_occupied(0.05, 0.40), "fg alone must not decide"
+
+
+def test_the_faded_cards_medians_clear_the_floor():
+    """135, 425 and 289 are the faintest cards that pass, at fg medians
+    0.44-0.47. A floor they did not clear would be useless."""
+    for fg in (0.44, 0.46, 0.47):
+        assert is_cell_occupied(fg, 0.30), fg
+
+
+def test_the_calibration_numbers_are_recorded():
+    text = (REPO / "testdata" / "celle_kalibrering_2026-09-08.txt").read_text()
+    assert "0.758" in text, "the outlier empty cell must be recorded"
+    assert "609_00024" in text, "...and where it came from"
+    assert "0.047" in text, "the faintest page must be recorded"
